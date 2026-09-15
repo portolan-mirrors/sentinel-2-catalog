@@ -22,6 +22,12 @@
       "title": "Sentinel-2 L2A scenes"
     },
     {
+      "rel": "child",
+      "href": "./stats/collection.json",
+      "type": "application/json",
+      "title": "MGRS coverage and cloud statistics"
+    },
+    {
       "rel": "describedby",
       "href": "./README.md",
       "type": "text/markdown",

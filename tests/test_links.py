@@ -6,9 +6,11 @@ directory it points at exists. Dependency-free and offline, so it runs in
 milliseconds on a clean checkout.
 
 CI clones the metadata and not the bytes, because .gitignore keeps data out of
-git. Set CI_LIGHT=1 there. It exempts asset hrefs with a data suffix, and
-nothing else. Every structural link still resolves. Leave CI_LIGHT unset
-locally, where the bytes are on disk, and the gate checks every href.
+git. Set CI_LIGHT=1 there. It exempts any href with a data suffix -- asset or
+link -- and nothing else (a rel:'pmtiles' or rel:'data' link can point at the
+same unpublished bytes an asset does). Every structural link still resolves.
+Leave CI_LIGHT unset locally, where the bytes are on disk, and the gate checks
+every href.
 
 Run: python3 tests/test_links.py
 """
@@ -76,6 +78,9 @@ for path in documents:
     for link in doc.get("links", []):
         href = link.get("href", "")
         if not href or is_remote(href):
+            continue
+        if is_unpublished_data(href):
+            skipped += 1
             continue
         checked += 1
         if not (path.parent / href).resolve().exists():

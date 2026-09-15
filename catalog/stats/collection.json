@@ -1,0 +1,199 @@
+{
+  "type": "Collection",
+  "stac_version": "1.1.0",
+  "stac_extensions": [
+    "https://schemas.portolan-sdi.org/portolan/v0.2.0/schema.json",
+    "https://stac-extensions.github.io/table/v1.2.0/schema.json",
+    "https://stac-extensions.github.io/web-map-links/v1.3.0/schema.json",
+    "https://stac-extensions.github.io/file/v2.1.0/schema.json"
+  ],
+  "id": "stats",
+  "title": "MGRS coverage and cloud statistics",
+  "description": "One row per MGRS tile per month, aggregated from the `sentinel-2-l2a` item index: scene count, minimum and median cloud cover, and the least-cloudy scene of the month. This is the timeline/choropleth backend for the explorer app and the cheap first stop for \"which month has a cloud-free scene here\" -- no need to scan the full item archive to answer it. A companion PMTiles carries one polygon per MGRS tile (the envelope of that tile's scene footprints) so the app can join tile-month statistics onto a fixed geometry by `mgrs_tile` without the tileset ever changing on a daily stat refresh. Scenes whose bbox spans more than 20 degrees of longitude (antimeridian wraps) are excluded from the footprint polygons only; they are still counted in the monthly statistics. Generated from a pilot slice of the mirrored archive (two days, 2026-09-12 to 2026-09-13) while the full historical backfill runs; both products are refreshed as more of the archive lands. Contains modified Copernicus Sentinel data.",
+  "license": "CC-BY-SA-3.0-IGO",
+  "keywords": [
+    "sentinel-2",
+    "mgrs",
+    "tile-grid",
+    "cloud-cover",
+    "statistics",
+    "pmtiles",
+    "choropleth",
+    "coverage"
+  ],
+  "updated": "2026-09-16T00:56:00Z",
+  "providers": [
+    {
+      "name": "European Space Agency (ESA)",
+      "description": "Operates the Sentinel-2 mission and produces the L2A surface reflectance products these statistics are aggregated from.",
+      "roles": [
+        "producer",
+        "licensor"
+      ],
+      "url": "https://sentinels.copernicus.eu/web/sentinel/missions/sentinel-2"
+    },
+    {
+      "name": "Element 84 (Earth Search)",
+      "description": "Runs the Earth Search STAC API whose sentinel-2-l2a item index this collection's statistics are aggregated from.",
+      "roles": [
+        "processor"
+      ],
+      "url": "https://earth-search.aws.element84.com/v1"
+    },
+    {
+      "name": "Portolan Mirrors",
+      "description": "Aggregates the mirrored item index into MGRS tile-month statistics and a tile-footprint PMTiles.",
+      "roles": [
+        "processor",
+        "host"
+      ],
+      "url": "https://github.com/portolan-mirrors/sentinel-2-catalog"
+    }
+  ],
+  "extent": {
+    "spatial": {
+      "bbox": [
+        [
+          -180,
+          -90,
+          180,
+          90
+        ]
+      ]
+    },
+    "temporal": {
+      "interval": [
+        [
+          "2026-09-12T00:16:10.622Z",
+          "2026-09-13T23:45:27.298Z"
+        ]
+      ]
+    }
+  },
+  "table:columns": [
+    {
+      "name": "mgrs_tile",
+      "type": "string",
+      "description": "MGRS tile id, e.g. 53HNV. Join key against the mgrs.pmtiles feature id."
+    },
+    {
+      "name": "year",
+      "type": "int16",
+      "description": "Year of acquisition (UTC)."
+    },
+    {
+      "name": "month",
+      "type": "int8",
+      "description": "Month of acquisition (UTC), 1-12."
+    },
+    {
+      "name": "scene_count",
+      "type": "int32",
+      "description": "Number of sentinel-2-l2a scenes for this tile and month."
+    },
+    {
+      "name": "min_cloud_cover",
+      "type": "double",
+      "description": "Lowest eo:cloud_cover among this tile's scenes for the month."
+    },
+    {
+      "name": "median_cloud_cover",
+      "type": "double",
+      "description": "Median eo:cloud_cover among this tile's scenes for the month."
+    },
+    {
+      "name": "best_item_id",
+      "type": "string",
+      "description": "Item id of the least-cloudy scene for this tile and month."
+    },
+    {
+      "name": "best_item_datetime",
+      "type": "timestamp[us, tz=UTC]",
+      "description": "Acquisition datetime of best_item_id."
+    }
+  ],
+  "table:row_count": 21040,
+  "assets": {
+    "data": {
+      "href": "./mgrs-monthly.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "MGRS tile x month statistics",
+      "roles": [
+        "data"
+      ]
+    },
+    "pmtiles": {
+      "href": "./mgrs.pmtiles",
+      "type": "application/vnd.pmtiles",
+      "title": "MGRS tile footprints",
+      "roles": [
+        "visual"
+      ],
+      "pmtiles:layers": [
+        "mgrs"
+      ]
+    },
+    "style-default": {
+      "href": "./styles/default.json",
+      "type": "application/vnd.mapbox.style+json",
+      "title": "Default MapLibre style",
+      "roles": [
+        "style",
+        "default"
+      ],
+      "file:size": 609,
+      "file:checksum": "1220571fcafce986dba9df8374e4d242548dd9247aa9b0cf1197d4b843fc60b19953"
+    },
+    "thumbnail": {
+      "href": "./thumbnail.png",
+      "type": "image/png",
+      "title": "Scene density, rendered from the published index",
+      "roles": [
+        "thumbnail"
+      ],
+      "file:size": 26757,
+      "file:checksum": "122072bc0e753fbcbec53b37699f99260cdc9e2379ad81e54b15ec9b7d21d6f65118"
+    }
+  },
+  "links": [
+    {
+      "rel": "root",
+      "href": "../catalog.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
+    },
+    {
+      "rel": "parent",
+      "href": "../catalog.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
+    },
+    {
+      "rel": "describedby",
+      "href": "./README.md",
+      "type": "text/markdown",
+      "title": "Collection README"
+    },
+    {
+      "rel": "agents",
+      "href": "./AGENTS.md",
+      "type": "text/markdown",
+      "title": "Collection agent guide"
+    },
+    {
+      "rel": "via",
+      "href": "https://element84.com/earth-search/",
+      "type": "text/html",
+      "title": "Earth Search by Element 84 (source item index)"
+    },
+    {
+      "rel": "pmtiles",
+      "href": "./mgrs.pmtiles",
+      "type": "application/vnd.pmtiles",
+      "title": "MGRS tile footprints",
+      "pmtiles:layers": [
+        "mgrs"
+      ]
+    }
+  ]
+}
