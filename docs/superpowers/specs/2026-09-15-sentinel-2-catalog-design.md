@@ -108,7 +108,7 @@ encoding, CRS, zstd level, row-group size) follow firms-catalog via
 | `tools/s2_fetch.py` | POST search against Earth Search for one datetime window; normalize features to the slim schema; write chunk Parquet. Resumable: existing chunks are skipped. |
 | `tools/s2_repartition.py` | One-time: slice the 7 GB seed archive into sorted `year=YYYY/items.parquet` files (runs locally, not in CI). |
 | `tools/s2_build.py` | Compact chunks into a sorted year or live part (shared by backfill, daily refresh, consolidation). |
-| `tools/s2_stats.py` | Aggregate MGRS tile × month → `mgrs-monthly.parquet`; emit MGRS footprints (union of item geometries per tile, or the nominal MGRS polygon) → tippecanoe → `mgrs.pmtiles`. Supports touching only affected months so the daily run is cheap. |
+| `tools/s2_stats.py` | Aggregate MGRS tile × month → `mgrs-monthly.parquet`; emit one footprint per MGRS tile (envelope of that tile's item bboxes — cheap, stable, and faithful to observed coverage) → tippecanoe → `mgrs.pmtiles`. Supports touching only affected months so the daily run is cheap. |
 | `tools/make_collection.py` | Regenerate collection extents, row counts, `updated` timestamps from the published parts (uploaded, not committed — firms pattern). |
 | `tools/publish.py`, `tools/upload_data.py` | From the template, unmodified. |
 
