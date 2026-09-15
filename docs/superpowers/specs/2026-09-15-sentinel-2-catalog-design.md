@@ -196,3 +196,32 @@ Static site, MapLibre GL + pmtiles + DuckDB-WASM. No server, no API.
 * H3/A5 spatial aggregation.
 * Item-level PMTiles of all 40M footprints (the 60-day footprint tileset was
   considered and deferred; MGRS stats won the aggregation question).
+
+## Amendment 1 — 2026-09-15, after Task 1 (approved by user)
+
+Task 1's self-review exposed a premise failure, confirmed by measurement:
+the seed parquet is **Planetary Computer** STAC, not Earth Search — ESA
+product ids, PC-API thumbnail URLs, and (pre-2019) scenes that have no AWS
+COGs at all. Deriving Earth Search ids from seed metadata is heuristic
+(sequence digit is a guess; high-latitude same-day passes collide).
+
+Decisions replacing the affected parts of this spec:
+
+1. **All data comes from Earth Search.** The full archive (51,254,668 items
+   measured 2026-09-15) is fetched via the month-slice backfill machinery,
+   2015-06 → present. The seed parquet is demoted to a cross-check and is
+   no longer a data source; the repartition step is replaced by a small
+   local pilot slice. Early years stay partial because that is what AWS
+   actually serves (no 2015-16, partial 2017 to late 2018).
+2. **Assets are included as a JSON-string column** (user decision): one
+   `assets VARCHAR` column holding the STAC assets object serialized as
+   JSON — a string, not a nested struct, because deep struct nesting made
+   the earlier parquets hard to open. Every asset key is kept; each asset
+   is stripped to `href, type, title, roles, gsd` (~17 KB/item raw
+   otherwise, dominated by per-item copies of static band metadata, which
+   belongs in collection-level `item_assets` instead).
+3. **COG href derivation is demoted** from public contract to nothing:
+   clients read hrefs from the `assets` column. `thumbnail_url` stays as a
+   convenience column (extracted from `assets.thumbnail.href`).
+4. Published schema is therefore 45 columns: the 42 prior data columns,
+   then `assets`, `_month`, `_hilbert`, `geometry`.
