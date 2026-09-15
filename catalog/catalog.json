@@ -7,7 +7,7 @@
   "id": "sentinel-2-catalog",
   "title": "Sentinel-2 L2A STAC-GeoParquet Mirror",
   "description": "An item index for the AWS Earth Search Sentinel-2 L2A archive (51.25 million items when Earth Search was counted on 2026-09-15), published as partitioned STAC-GeoParquet plus MGRS-tile aggregate stats. Coverage is partial before December 2018: nothing for 2015-2016 and part of 2017-2018, which is what Earth Search serves. The imagery stays on AWS in the sentinel-cogs bucket; every Cloud-Optimized GeoTIFF URL is carried verbatim in each item's `assets` column, so nothing has to be derived from a template. No STAC API sits in front of it: query the Parquet files directly. This is a mirror; Earth Search / Element 84 produces the item index this catalog republishes. Read the [agent guide](AGENTS.md) before you query it.",
-  "updated": "2026-09-15T21:54:03Z",
+  "updated": "2026-09-15T22:07:23Z",
   "links": [
     {
       "rel": "root",

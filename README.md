@@ -1,10 +1,11 @@
 # sentinel-2-catalog
 
 A [Portolan](https://www.portolan-sdi.org/) catalog mirroring the **AWS Earth
-Search Sentinel-2 L2A archive** (about 28 million scenes, 2015 to today) as
-partitioned STAC-GeoParquet, plus MGRS-tile aggregate stats. The imagery stays
-on AWS; this catalog carries only the item index, so a client queries the full
-archive with plain Parquet reads instead of a rate-limited STAC API.
+Search Sentinel-2 L2A archive** — 51.25 million items when Earth Search was
+counted on 2026-09-15 — as partitioned STAC-GeoParquet, plus MGRS-tile
+aggregate stats. The imagery stays on AWS; this catalog carries only the item
+index, so a client queries the archive with plain Parquet reads instead of a
+rate-limited STAC API.
 
 Catalog metadata lives in this repository. CI validates every change to it.
 The data itself lives in object storage next to the metadata, referenced by
@@ -19,32 +20,32 @@ URL and never committed.
 
 ## Status
 
-This repository currently holds the template scaffold only: a valid, empty
-catalog root and the gates that will validate everything added to it. No
-collection is published yet.
-
-Once built out, `catalog/` will hold two collections:
-
-| Collection | Will hold |
+| Collection | Holds |
 |---|---|
 | `sentinel-2-l2a` | The item index — Earth Search's Sentinel-2 L2A metadata, partitioned `year=YYYY/items.parquet` plus a `live.parquet` tail, sorted `(_month, _hilbert)` |
-| `stats` | MGRS tile × month aggregates (scene counts, cloud cover) and a tile-footprint PMTiles layer, for the explorer app and for query planning |
+| `stats` | MGRS tile × month aggregates (scene counts, cloud cover) and a tile-footprint PMTiles layer, for the explorer app and for query planning. Still to come. |
 
-Neither collection nor the pipeline that builds them (`tools/s2_fetch.py`,
-`tools/s2_build.py`, `tools/s2_stats.py`, and the GitHub Actions workflows that
-run them) exists yet. They land in later work; see the design spec for the
-full plan.
+The backfill fills `sentinel-2-l2a` year by year, so
+[`catalog/sentinel-2-l2a/collection.json`](catalog/sentinel-2-l2a/collection.json)
+is the authority on how much of the upstream record has landed: it carries the
+measured row count and time range, restamped by `tools/make_collection.py` on
+every run.
+
+`tools/s2_fetch.py` and `tools/s2_build.py` fetch and compact the parts;
+`tools/s2_stats.py` and the GitHub Actions workflows that run everything on a
+schedule land in later work. See the design spec for the full plan.
 
 ## Why no imagery, no API
 
 Sentinel-2 L2A Cloud-Optimized GeoTIFFs already live on AWS in the
-`sentinel-cogs` bucket, produced and hosted by Element 84. Re-hosting them
-here would duplicate petabytes of data this catalog does not need to own. A
-client derives each COG's URL from the item's MGRS tile and date instead —
-the derivation is documented on the `sentinel-2-l2a` collection once it
-exists. Serving the index as GeoParquet, rather than behind a STAC API, means
-a client filters ~28 million scenes with a Parquet range read against a
-public bucket: no server to rate-limit, no server to keep running.
+`sentinel-cogs` bucket. Re-hosting them here would duplicate petabytes of data
+this catalog does not need to own. Nothing has to be derived to reach them:
+each row carries the upstream `assets` object verbatim, so every COG URL for a
+scene is in the row that describes it — documented on the
+[`sentinel-2-l2a` collection](catalog/sentinel-2-l2a/AGENTS.md). Serving the
+index as GeoParquet, rather than behind a STAC API, means a client filters the
+whole archive with a Parquet range read against a public bucket: no server to
+rate-limit, no server to keep running.
 
 ## Three kinds of file
 
@@ -88,6 +89,15 @@ python3 tests/run_all.py
 | `test_upload_data.py` | Only staged files with an allowed suffix upload |
 | `test_stac_valid.py` | Valid STAC 1.1.0, via `stac-check` |
 | `test_conformance.py` | Portolan conformance, via `rashid` |
+
+Set `CI_LIGHT=1` when the data bytes are not on this machine, which is the
+normal case: it exempts asset hrefs with a data suffix from `test_links.py`,
+and nothing else. Every structural link is still checked.
+
+Unit tests for the tools (`test_fetch.py`, `test_build.py`, `test_schema.py`,
+`test_make_items.py`) run under `CI_LIGHT=1 python3 -m pytest tests/ -q`. They
+are not in `run_all.py` because they need `duckdb`, and the build test needs
+`geoparquet-io` on the PATH.
 
 CI runs `rashid`, `stac-check`, and `tests/run_all.py` on every pull request.
 `docs/conformance.md` records any accepted deviation, with the rule, why, and

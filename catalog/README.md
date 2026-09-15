@@ -15,10 +15,17 @@ underlying imagery source.
 This catalog carries no imagery. Sentinel-2 L2A Cloud-Optimized GeoTIFFs stay
 in the `sentinel-cogs` bucket on AWS, and every one of their URLs is carried
 verbatim in the item's `assets` column, so nothing has to be derived from a
-template. What publishes here is the *item index* — the STAC metadata for the
-51.25 million items Earth Search held when it was counted on 2026-09-15 — plus
-small aggregate products (scene counts and cloud cover per MGRS tile per month)
-that make it practical to plan a query before running it.
+template. What publishes here is the *item index* — Earth Search's STAC
+metadata for the Sentinel-2 L2A archive, which held 51.25 million items when it
+was counted on 2026-09-15 — plus small aggregate products (scene counts and
+cloud cover per MGRS tile per month) that make it practical to plan a query
+before running it.
+
+The mirror fills in year by year until it carries that whole record. The
+[`sentinel-2-l2a` collection](sentinel-2-l2a/collection.json) carries the row
+count and time range it holds right now, and each `year=YYYY/YYYY.json` item
+carries its year's. Those are the authority on what is here; this page
+describes what is mirrored and how to read it.
 
 Coverage is partial before December 2018: nothing for 2015-2016, part of
 2017-2018, complete after that. This mirror adds no items and drops none, so
@@ -57,7 +64,8 @@ patterns are documented on the
 
 ## Access
 
-No API, no key, no rate limit: DuckDB reads the Parquet over HTTP.
+No API, no key, no rate limit: a client reads the Parquet over HTTP, with
+range requests, straight from the bucket.
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
@@ -67,6 +75,9 @@ FROM read_parquet(
   'https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
   hive_partitioning=true);
 ```
+
+That measures the published files. The collection's `table:row_count` and
+temporal extent say the same thing without opening one.
 
 Filter on `year` first: it is a Hive partition key, so it skips whole files.
 The [collection README](sentinel-2-l2a/README.md) has the query that finds

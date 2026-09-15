@@ -40,9 +40,12 @@ limit.
 ```
 sentinel-2-l2a/
   collection.json
-  year=2015/items.parquet   … year=2026/items.parquet
+  year=2017/items.parquet   … year=2026/items.parquet
   year=2026/live.parquet       rolling tail since the last consolidation
 ```
+
+One directory per year Earth Search actually holds items for, so the listing
+starts where its record does — see Coverage below.
 
 `items.parquet` is the consolidated archive for a year. The current year also
 carries `live.parquet`, rebuilt daily from the Earth Search API and folded into
@@ -51,7 +54,8 @@ carries `live.parquet`, rebuilt daily from the Earth Search API and folded into
 
 Each `year=YYYY/YYYY.json` item states that year's measured row count, time
 range, footprint bounds and platforms, so a client can choose a year without
-opening a byte of Parquet.
+opening a byte of Parquet. Each data asset in the item states the same for the
+one part it names.
 
 ## Coverage
 
