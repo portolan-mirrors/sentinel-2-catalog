@@ -45,8 +45,13 @@ description per column; that is the authority.
 
 `best_item_id`/`best_item_datetime` name the scene with the lowest
 `eo:cloud_cover` for that tile and month — look it up in `sentinel-2-l2a` by
-`id` to get its footprint and asset hrefs. Ties are broken by DuckDB's
-`arg_min`, which returns one arbitrary tied row, not necessarily the earliest.
+`id` to get its footprint and asset hrefs. Both fields are read from a single
+`arg_min` over a packed `(id, datetime)` pair, so on a cloud-cover tie they
+always describe the same arbitrary tied scene, not necessarily the earliest
+one. A row with a NULL `eo:cloud_cover` or a NULL `s2:mgrs_tile` is still
+counted in `scene_count` — only `min_cloud_cover`, `median_cloud_cover` and
+the `best_item_*` pair (all driven by `eo:cloud_cover`) skip NULLs, per
+DuckDB's ordinary aggregate behavior.
 
 ## Antimeridian exclusion
 

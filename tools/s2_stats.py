@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import subprocess
-import sys
 from pathlib import Path
 
 import duckdb
@@ -46,17 +45,28 @@ def _sources_sql(sources: list[str]) -> str:
 
 
 STATS_SQL = """
-  SELECT "s2:mgrs_tile" AS mgrs_tile,
-         year(datetime)::SMALLINT AS year,
-         month(datetime)::TINYINT AS month,
-         count(*)::INTEGER AS scene_count,
-         min("eo:cloud_cover") AS min_cloud_cover,
-         median("eo:cloud_cover") AS median_cloud_cover,
-         arg_min(id, "eo:cloud_cover") AS best_item_id,
-         arg_min(datetime, "eo:cloud_cover") AS best_item_datetime
-  FROM read_parquet([{files}], union_by_name=true)
-  {where}
-  GROUP BY 1, 2, 3
+  SELECT mgrs_tile, year, month, scene_count, min_cloud_cover,
+         median_cloud_cover, best.id AS best_item_id,
+         best.dt AS best_item_datetime
+  FROM (
+    SELECT "s2:mgrs_tile" AS mgrs_tile,
+           year(datetime)::SMALLINT AS year,
+           month(datetime)::TINYINT AS month,
+           count(*)::INTEGER AS scene_count,
+           min("eo:cloud_cover") AS min_cloud_cover,
+           median("eo:cloud_cover") AS median_cloud_cover,
+           -- A single arg_min over a packed struct, not two independent
+           -- arg_min calls. Two independent arg_min(id, cc) / arg_min(dt, cc)
+           -- calls can each break a cloud-cover tie differently and return
+           -- the id of one scene alongside the datetime of another. Packing
+           -- them into one value makes the tiebreak a single decision, so
+           -- best_item_id and best_item_datetime always describe one scene.
+           arg_min(struct_pack(id := id, dt := datetime),
+                   "eo:cloud_cover") AS best
+    FROM read_parquet([{files}], union_by_name=true)
+    {where}
+    GROUP BY 1, 2, 3
+  )
 """
 
 
@@ -68,7 +78,15 @@ def build_stats(con, sources, out: Path, merge_years=None, existing=None):
         yrs = ",".join(str(y) for y in merge_years)
         con.execute(f"""
           COPY (
-            SELECT * FROM read_parquet('{existing}')
+            SELECT mgrs_tile::VARCHAR AS mgrs_tile,
+                   year::SMALLINT AS year,
+                   month::TINYINT AS month,
+                   scene_count::INTEGER AS scene_count,
+                   min_cloud_cover::DOUBLE AS min_cloud_cover,
+                   median_cloud_cover::DOUBLE AS median_cloud_cover,
+                   best_item_id::VARCHAR AS best_item_id,
+                   best_item_datetime::TIMESTAMPTZ AS best_item_datetime
+            FROM read_parquet('{existing}')
             WHERE year NOT IN ({yrs})
             UNION ALL BY NAME
             {STATS_SQL.format(files=files,
@@ -86,10 +104,13 @@ def build_stats(con, sources, out: Path, merge_years=None, existing=None):
     print(f"  mgrs-monthly.parquet: {n:,} tile-months")
 
 
-def build_footprints(con, sources, out: Path):
+def build_footprint_table(con, sources, dest: Path) -> None:
+    """Write the tile-envelope GeoParquet that feeds gpio pmtiles create.
+
+    Split out from build_footprints so the antimeridian exclusion can be
+    tested against plain DuckDB output, with no tippecanoe/gpio involved.
+    """
     files = _sources_sql(sources)
-    fp = (out / "mgrs-tiles.parquet").resolve()
-    pmtiles = (out / "mgrs.pmtiles").resolve()
     con.execute(f"""
       COPY (
         SELECT "s2:mgrs_tile" AS mgrs_tile,
@@ -97,8 +118,24 @@ def build_footprints(con, sources, out: Path):
         FROM read_parquet([{files}], union_by_name=true)
         WHERE bbox[3] - bbox[1] < 20
         GROUP BY 1
-      ) TO '{fp}' (FORMAT PARQUET, COMPRESSION zstd)
+      ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd)
     """)
+
+
+def pmtiles_command(fp: Path, pmtiles: Path) -> list[str]:
+    """The gpio invocation that turns the footprint table into PMTiles.
+
+    A separate function so a test can assert on the command (layer name,
+    input/output paths) without requiring tippecanoe to be on PATH.
+    """
+    return ["gpio", "pmtiles", "create", str(fp), str(pmtiles),
+            "--layer", "mgrs"]
+
+
+def build_footprints(con, sources, out: Path):
+    fp = (out / "mgrs-tiles.parquet").resolve()
+    pmtiles = (out / "mgrs.pmtiles").resolve()
+    build_footprint_table(con, sources, fp)
     # gpio drives tippecanoe straight from the GeoParquet, so no GeoJSONSeq
     # detour. Layer name must stay "mgrs" — the app's source-layer. gpio
     # rejects any path containing "..", so both paths above are resolved to
@@ -106,10 +143,7 @@ def build_footprints(con, sources, out: Path):
     # `pmtiles create` has no --force flag; remove a stale output first so a
     # rerun does not fail on an existing file.
     pmtiles.unlink(missing_ok=True)
-    subprocess.run(
-        ["gpio", "pmtiles", "create", str(fp), str(pmtiles),
-         "--layer", "mgrs"],
-        check=True)
+    subprocess.run(pmtiles_command(fp, pmtiles), check=True)
     fp.unlink()
     print(f"  mgrs.pmtiles written ({pmtiles.stat().st_size / 1e6:,.1f} MB)")
 

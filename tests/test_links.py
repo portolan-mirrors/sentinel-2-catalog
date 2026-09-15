@@ -8,9 +8,13 @@ milliseconds on a clean checkout.
 CI clones the metadata and not the bytes, because .gitignore keeps data out of
 git. Set CI_LIGHT=1 there. It exempts any href with a data suffix -- asset or
 link -- and nothing else (a rel:'pmtiles' or rel:'data' link can point at the
-same unpublished bytes an asset does). Every structural link still resolves.
-Leave CI_LIGHT unset locally, where the bytes are on disk, and the gate checks
-every href.
+same unpublished bytes an asset does). Every structural link, and every
+non-data href, is checked in every mode, CI_LIGHT or not.
+
+Data files are never placed under publish_dir at all -- they go straight to
+object storage (see catalog.publish.yaml) -- so a data href never resolves
+locally either, CI_LIGHT or not. CI_LIGHT is what tells this gate that
+absence there is expected rather than a build that forgot a file.
 
 Run: python3 tests/test_links.py
 """
