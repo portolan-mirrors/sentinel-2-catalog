@@ -247,6 +247,7 @@ COLUMNS = [
 ]
 
 SELECT_LIST = ", ".join(f'"{name}"' for name, _, _ in COLUMNS)
+```
 
 - [ ] **Step 4: Run the tests**
 
