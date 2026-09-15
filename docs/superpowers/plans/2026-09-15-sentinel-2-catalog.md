@@ -14,7 +14,7 @@
 
 - Published repo: `github.com/portolan-mirrors/sentinel-2-catalog`; bucket prefix `s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog`; public base `https://data.source.coop/portolan-mirrors/sentinel-2-catalog`.
 - Item schema = 45 columns (listed in Task 2): the 42 seed-era data columns, then `assets VARCHAR` (the complete upstream STAC assets object, verbatim, as a compact JSON **string** — never a nested struct; measured 179 B/row under zstd-22 with clustered ordering), then `_month TINYINT`, `_hilbert UINTEGER`, and `geometry` last.
-- Every published parquet follows the [GeoParquet distribution best practices](https://github.com/opengeospatial/geoparquet/blob/main/format-specs/distributing-geoparquet.md): GeoParquet 2.0 (native GEOMETRY, row-group geo statistics, no bbox covering column), spatial ordering, zstd — cranked to level 22 for EVERY part, `live.parquet` included (user decision 2026-09-15). Sort order inside every part file: `(_month, _hilbert)`; row groups 100,000 rows (~the doc's 128-256 MB byte target at our row width); written by `gpio sort column`.
+- Every published parquet follows the [GeoParquet distribution best practices](https://github.com/opengeospatial/geoparquet/blob/main/format-specs/distributing-geoparquet.md): GeoParquet 2.0 (native GEOMETRY, row-group geo statistics, no bbox covering column), spatial ordering, zstd — cranked to level 22 for EVERY part, `live.parquet` included (user decision 2026-09-15). Sort order inside every part file: `(_month, _hilbert)`; row groups 100,000 rows (~the doc's 128-256 MB byte target at our row width); written by `gpio sort column`. Use `geoparquet-io` (gpio) wherever it fits (user decision 2026-09-15): gpio writes the parts, `gpio check all` gates every built part, `gpio pmtiles create` builds the tileset.
 - Earth Search: `https://earth-search.aws.element84.com/v1/search`, collection `sentinel-2-l2a`, POST paging via `next` link, `limit=200` (500 returns HTTP 500 — measured 2026-09-15).
 - ALL data comes from Earth Search (spec Amendment 1): full-archive backfill 2015-06 → present, 51,254,668 items measured 2026-09-15. The old seed parquet (`…/cholmes/stac-geoparquet-public/slim/s2-stac.parquet`) is Planetary Computer STAC — cross-check only, never a data source.
 - Dedupe rule everywhere parts are built: keep one row per `id`, preferring highest `s2:generation_time` (NULLS LAST).
@@ -725,6 +725,14 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         if r.returncode != 0:
             print(r.stdout[-1500:], r.stderr[-1500:], file=sys.stderr)
             raise SystemExit(f"gpio sort failed for {year}")
+        # Best-practices gate on the artifact itself: compression, row
+        # groups, spatial order, bbox metadata. Failing the build here beats
+        # publishing a part that violates the distribution practices.
+        chk = subprocess.run(["gpio", "check", "all", str(final)],
+                             capture_output=True, text=True)
+        if chk.returncode != 0:
+            print(chk.stdout[-1500:], chk.stderr[-1500:], file=sys.stderr)
+            raise SystemExit(f"gpio check failed for {year}")
     print(f"  year={year}/{name}: {n:,} rows, "
           f"{final.stat().st_size / 1e6:,.0f} MB", flush=True)
     return n
@@ -1140,7 +1148,7 @@ and push.
 
 **Interfaces:**
 - Consumes: published/staged year parts (canonical schema).
-- Produces: `python3 tools/s2_stats.py --sources <parts...> --out ./staging/publish/stats [--footprints] [--merge-years Y --existing <url-or-path>]` writing `mgrs-monthly.parquet` (schema below) and, with `--footprints`, `mgrs-tiles.geojsonl` → `tippecanoe` → `mgrs.pmtiles`.
+- Produces: `python3 tools/s2_stats.py --sources <parts...> --out ./staging/publish/stats [--footprints] [--merge-years Y --existing <url-or-path>]` writing `mgrs-monthly.parquet` (schema below) and, with `--footprints`, a tile-envelope GeoParquet → `gpio pmtiles create` (tippecanoe under the hood) → `mgrs.pmtiles`.
 
 `mgrs-monthly.parquet` schema (plain parquet, zstd, sorted by `(mgrs_tile, year, month)`):
 `mgrs_tile VARCHAR, year SMALLINT, month TINYINT, scene_count INTEGER, min_cloud_cover DOUBLE, median_cloud_cover DOUBLE, best_item_id VARCHAR, best_item_datetime TIMESTAMPTZ`
@@ -1279,7 +1287,7 @@ def build_stats(con, sources, out: Path, merge_years=None, existing=None):
 
 def build_footprints(con, sources, out: Path):
     files = _sources_sql(sources)
-    gj = out / "mgrs-tiles.geojsonl"
+    fp = out / "mgrs-tiles.parquet"
     con.execute(f"""
       COPY (
         SELECT "s2:mgrs_tile" AS mgrs_tile,
@@ -1287,13 +1295,15 @@ def build_footprints(con, sources, out: Path):
         FROM read_parquet([{files}], union_by_name=true)
         WHERE bbox[3] - bbox[1] < 20
         GROUP BY 1
-      ) TO '{gj}' (FORMAT gdal, DRIVER 'GeoJSONSeq')
+      ) TO '{fp}' (FORMAT PARQUET, COMPRESSION zstd)
     """)
+    # gpio drives tippecanoe straight from the GeoParquet, so no GeoJSONSeq
+    # detour. Layer name must stay "mgrs" — the app's source-layer.
     subprocess.run(
-        ["tippecanoe", "-o", str(out / "mgrs.pmtiles"), "--force",
-         "-l", "mgrs", "-zg", "--coalesce-densest-as-needed", str(gj)],
+        ["gpio", "pmtiles", "create", str(fp), str(out / "mgrs.pmtiles"),
+         "--layer-name", "mgrs", "--force"],
         check=True)
-    gj.unlink()
+    fp.unlink()
     print("  mgrs.pmtiles written")
 
 
