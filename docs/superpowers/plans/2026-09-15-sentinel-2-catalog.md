@@ -506,7 +506,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests**
 
 ```bash
-python3 -m pytest tests/test_fetch.py tests/test_hrefs.py -v
+python3 -m pytest tests/test_fetch.py tests/test_schema.py -v
 ```
 Expected: all pass. If `test_fetch_window_writes_canonical_parquet` fails on a
 type mismatch, fix `normalize`/`_write` (never the canonical COLUMNS list) —
