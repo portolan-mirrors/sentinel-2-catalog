@@ -1107,6 +1107,7 @@ Model on `~/repos/firms-catalog/.github/workflows/publish-backfill.yml` (read
 it first), with these specifics:
 - `workflow_dispatch` with input `years` (blank default = every year found in the downloaded chunks).
 - `permissions: {contents: read, id-token: write}`; `concurrency: {group: catalog-write, cancel-in-progress: false}`.
+- ALSO: extend `.github/workflows/ci.yml` to run the pytest unit suite (`pip install --quiet duckdb geoparquet-io pytest` + `CI_LIGHT=1 python3 -m pytest tests/ -q`) alongside the template's `run_all.py` — the unit tests (fetch/build/make_items) currently never run in CI (discovered in Task 6).
 - FIRST: this repo's template `tools/upload_data.py` ships without the `--data-dir` CLI override that firms-catalog's version has (discovered in Task 4's fix round) — add it, mirroring `~/repos/firms-catalog/tools/upload_data.py`'s flag semantics (an explicit path overriding the config key), with a case in `tests/test_upload_data.py` proving the override wins over the (unset) config. Without this, every workflow upload step below fails.
 - Steps: checkout; setup-python 3.12; `pip install --quiet duckdb boto3 geoparquet-io 'rashid>=0.1.8,<0.2.0' stac-check`; download all `slice-*` artifacts (`actions/download-artifact@v4` with `pattern: slice-*`, `path: staging/chunks/api`, `merge-multiple: true`);
   `python3 tools/s2_build.py --sources staging/chunks/api --out staging/publish/sentinel-2-l2a --memory 12GB` (add `--years` only when the input is set);
