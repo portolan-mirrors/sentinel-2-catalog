@@ -42,3 +42,14 @@ jobs:
         env:
           CI_LIGHT: "1"
         run: python3 tests/run_all.py
+
+      # tests/run_all.py runs each test file as a script; it never runs them
+      # under pytest, so a test with actual pytest-style assertions or
+      # fixtures would silently never execute. This is the same tests/ suite,
+      # collected and run the other way, as a second gate over it.
+      - name: Unit test suite (pytest)
+        env:
+          CI_LIGHT: "1"
+        run: |
+          python -m pip install --quiet duckdb geoparquet-io pytest
+          python3 -m pytest tests/ -q

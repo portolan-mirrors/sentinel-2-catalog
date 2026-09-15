@@ -1,0 +1,142 @@
+name: publish-backfill
+
+# Turn the month-slice artifacts backfill.yml produced into the published,
+# year-partitioned GeoParquet index -- the first, credentialed publish of the
+# whole Earth Search record.
+#
+# Split from the fetch on purpose. backfill.yml runs for days and touches no
+# cloud credentials; this runs for an hour or two and needs the Source
+# Cooperative write role, so one assumed session covers the whole run.
+#
+# Disk: a bulk download of all ~135 month-slices plus a year's built parquet
+# would not fit a 14 GB runner. This job downloads every slice-* artifact
+# once (they are metadata-only Parquet, not imagery, so the whole set is
+# small next to a single year's worth of built COG references), then BUILDS,
+# UPLOADS and DELETES one year at a time: only one year's built parquet, and
+# only that year's raw month-chunks, are ever on disk together. If the bulk
+# download alone ever runs a runner out of space, replace it with a
+# per-year `actions/download-artifact@v4` call (`pattern: slice-<year>-*`)
+# inside the loop below instead of the single bulk step.
+#
+# tools/make_items.py writes one committed item per year as the loop goes,
+# so by the time every year has been built+uploaded+deleted, the small item
+# JSON files for the whole record already sit under catalog/ and
+# tools/make_collection.py can compute the collection's real extent and row
+# count from them without needing any of the (by then deleted) staged data.
+# tests/run_all.py validates that regenerated catalog/ tree before anything
+# is published. There is no second data-upload step after the loop: every
+# byte was already uploaded, year by year, as soon as it was built.
+
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: 'JSON list of years, e.g. [2015,2016]. Blank = every year with slice artifacts.'
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: catalog-write
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet duckdb boto3 geoparquet-io \
+            'rashid>=0.1.8,<0.2.0' stac-check
+
+      - name: Download every fetched month-slice
+        uses: actions/download-artifact@v4
+        with:
+          pattern: slice-*
+          path: staging/chunks/api
+          merge-multiple: true
+
+      - name: Pick the years to build
+        id: years
+        env:
+          YEARS_IN: ${{ inputs.years }}
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os, re
+          from pathlib import Path
+
+          found = sorted({
+              int(m.group(1))
+              for p in Path("staging/chunks/api").glob("*.parquet")
+              for m in [re.match(r"(\d{4})-\d{2}-\d{2}_", p.name)] if m
+          })
+          want = os.environ.get("YEARS_IN", "").strip()
+          years = json.loads(want) if want else found
+          years = [y for y in years if y in found]
+          if not years:
+              raise SystemExit("no slice-* artifacts found for the requested years")
+          print("years=" + json.dumps(years))
+          EOF
+
+      # Source Cooperative's bucket is reached by assuming a role it has
+      # approved, so there is no long-lived key to leak or rotate. One
+      # session, assumed before the loop, carries every year's upload below.
+      - name: Assume the Source Cooperative write role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-region: us-west-2
+
+      - name: Build, write items, upload and delete -- one year at a time
+        env:
+          YEARS: ${{ steps.years.outputs.years }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging/publish
+          for Y in $(python3 -c 'import json,os; print(*json.loads(os.environ["YEARS"]))'); do
+            echo "=== year $Y ==="
+            NONEMPTY=$(find staging/chunks/api -maxdepth 1 -name "${Y}-*.parquet" -size +0c | wc -l)
+            if [ "$NONEMPTY" -eq 0 ]; then
+              echo "  no non-empty chunks for $Y (Earth Search has none this early); skipping"
+              rm -f staging/chunks/api/"${Y}"-*.parquet
+              continue
+            fi
+
+            python3 tools/s2_build.py --sources staging/chunks/api --years "$Y" \
+              --out staging/publish/sentinel-2-l2a --memory 12GB
+
+            python3 tools/make_items.py --data-dir staging/publish/sentinel-2-l2a --years "$Y"
+
+            python3 tools/upload_data.py --confirm --data-dir staging/publish
+
+            # Free the disk before the next year: the built part is uploaded,
+            # and the committed item under catalog/ already carries this
+            # year's row count and extent, so neither is needed again.
+            rm -rf "staging/publish/sentinel-2-l2a/year=$Y"
+            rm -f staging/chunks/api/"${Y}"-*.parquet
+          done
+
+      - name: Regenerate the collection from the committed items
+        run: |
+          mkdir -p staging/publish/sentinel-2-l2a
+          python3 tools/make_collection.py --data-dir staging/publish/sentinel-2-l2a
+
+      - name: Validate the regenerated catalog
+        env:
+          CI_LIGHT: "1"
+        run: python3 tests/run_all.py
+
+      - name: Publish the catalog metadata
+        run: python3 tools/publish.py --confirm

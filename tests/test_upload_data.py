@@ -161,6 +161,38 @@ finally:
     sys.argv = argv
 check("data_dir" in message, f"the template exits on data_dir: {message!r}")
 
+# --- --data-dir overrides an unset config -------------------------------
+# CI builds into the checkout; catalog.publish.yaml's data_dir stays unset
+# there (the template contract tests/test_upload_data.py enforces above).
+# Without --data-dir, main() exits before it ever lists a file. With it, the
+# CLI value must win even though the config carries no data_dir at all.
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    write(root / "part-0.parquet")
+    no_data_dir_config = {
+        "write_prefix": "s3://a-bucket/a/prefix",
+        "public_base": "https://data.example.org/a/prefix",
+        "publish_dir": "catalog",
+        # no data_dir key here -- the exact shape of the unedited template.
+    }
+    out = io.StringIO()
+    argv = sys.argv
+    real_load = upload_data.load_config
+    upload_data.load_config = lambda *a, **k: no_data_dir_config
+    # --force skips the remote listing so the dry run needs no AWS access.
+    sys.argv = ["upload_data.py", "--force", "--data-dir", str(root)]
+    try:
+        with redirect_stdout(out):
+            code = upload_data.main()
+    finally:
+        upload_data.load_config = real_load
+        sys.argv = argv
+    check(code == 0, f"--data-dir lets the unset config's run succeed, got {code}")
+    check(
+        f"data_dir:    {root.resolve()}/" in out.getvalue(),
+        f"the CLI --data-dir wins over the unset config: {out.getvalue()!r}",
+    )
+
 # --- the sentinel guard ------------------------------------------------
 check(
     unedited_sentinels({

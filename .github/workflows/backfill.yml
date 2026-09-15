@@ -1,0 +1,94 @@
+name: backfill
+
+# Fetch the whole Earth Search record one month-slice at a time (the seed
+# parquet turned out to be Planetary Computer STAC — see spec Amendment 1 —
+# so everything comes from Earth Search). No published transaction budget,
+# but a whole-month slice is ~450k items / ~2.3k requests, so max-parallel 2
+# keeps us polite and each slice well inside the 6-hour job cap. Slices
+# publish workflow artifacts (no cloud credentials here);
+# publish-backfill.yml does the credentialed merge. Empty early months
+# (2015-16 have ~no AWS L2A) cost one request and a sentinel artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First month (YYYY-MM)"
+        default: "2015-06"
+      end:
+        description: "Last month (YYYY-MM), blank = current month"
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+        run: |
+          python3 - << 'EOF' >> "$GITHUB_OUTPUT"
+          import datetime as dt, json, os
+          start = os.environ["START"]
+          end = os.environ.get("END") or dt.date.today().strftime("%Y-%m")
+          y, m = map(int, start.split("-"))
+          ey, em = map(int, end.split("-"))
+          out = []
+          while (y, m) <= (ey, em):
+              last = (dt.date(y + (m == 12), m % 12 + 1, 1) - dt.timedelta(days=1))
+              out.append({"month": f"{y}-{m:02d}",
+                          "start": f"{y}-{m:02d}-01",
+                          "end": last.isoformat()})
+              y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+          print("matrix=" + json.dumps({"include": out}))
+          EOF
+
+  fetch:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip if this slice was already fetched
+        id: resume
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NAME="slice-${{ matrix.month }}"
+          FOUND=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100&name=$NAME" \
+                    --jq '[.artifacts[] | select(.expired==false)] | length' 2>/dev/null || echo 0)
+          if [ "${FOUND:-0}" -gt 0 ]; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$NAME already exists; skipping"
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.resume.outputs.done == 'false'
+        with:
+          python-version: "3.12"
+      - name: Fetch the month
+        if: steps.resume.outputs.done == 'false'
+        run: |
+          pip install --quiet duckdb
+          python3 tools/s2_fetch.py --start "${{ matrix.start }}" \
+            --end "${{ matrix.end }}" --out ./staging/chunks
+      - uses: actions/upload-artifact@v4
+        if: steps.resume.outputs.done == 'false'
+        with:
+          name: slice-${{ matrix.month }}
+          path: staging/chunks/api/
+          retention-days: 30
+          if-no-files-found: error
