@@ -41,4 +41,11 @@ publish_dir: catalog
 # Data files are too large for git, so keep this directory out of the
 # repository or ignored by it. Only the suffixes in PUBLISHABLE_SUFFIXES
 # upload. See the allow-list in tools/upload_data.py.
-data_dir: ../s2-staging/publish
+#
+# The shipped template leaves this unset: tests/test_upload_data.py enforces
+# that an unedited config exits with a message rather than uploading, and
+# this project's own s2_build.py/s2_fetch.py staging tree lives at
+# ../s2-staging locally, outside the repo. Set this key only when you
+# actually intend `python3 tools/upload_data.py` to walk a real staging
+# directory on this machine.
+# data_dir: ../s2-staging/publish
