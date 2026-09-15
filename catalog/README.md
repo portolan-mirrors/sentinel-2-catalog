@@ -1,32 +1,73 @@
-# Example Catalog
+# Sentinel-2 L2A STAC-GeoParquet Mirror
 
-TODO(setup): replace this file. It is the front door to the published catalog,
-the page people land on at the public base URL. It is not the same document as
-the README in the repository root, which is never published.
+An item index for the AWS Earth Search Sentinel-2 L2A archive, republished as
+cloud-native GeoParquet that you can query in place without downloading
+anything and without a rate-limited API in front of it.
+
+This is a **mirror**. Earth Search, run by
+[Element 84](https://element84.com/) on the
+[AWS Registry of Open Data](https://registry.opendata.aws/sentinel-2-l2a-cogs/),
+produces the item index this catalog republishes. Copernicus Sentinel-2 is the
+underlying imagery source.
 
 ## What is here
 
-TODO(setup): the datasets, in one paragraph. Say what each collection covers,
-the area and the time range, and what a reader can do with it.
+This catalog carries no imagery. Sentinel-2 L2A Cloud-Optimized GeoTIFFs stay
+in the `sentinel-cogs` bucket on AWS; a client derives each COG's URL from an
+item's MGRS tile and date rather than downloading it through this catalog.
+What publishes here is the *item index* — the STAC metadata for roughly 28
+million scenes from 2015 to today — plus small aggregate products (scene
+counts and cloud cover per MGRS tile per month) that make it practical to plan
+a query before running it.
+
+**No collection is published yet.** This repository currently ships the
+catalog skeleton only. Once built out, it will hold `sentinel-2-l2a` (the item
+index) and `stats` (the MGRS aggregates); check
+[`catalog.json`](catalog.json) for the current list of collections.
 
 ## License
 
-TODO(setup): the SPDX identifier, or `other` with a link to the terms. Say who
-holds the rights and what a reuser has to attribute.
+Sentinel-2 data and its derivatives carry the
+[Copernicus Sentinel Data Terms and Conditions](https://sentinels.copernicus.eu/documents/247904/690755/Sentinel_Data_Legal_Notice):
+free, full, and open access for any use. The
+[AWS Registry of Open Data entry](https://registry.opendata.aws/sentinel-2-l2a-cogs/)
+for the upstream COGs asks that you cite it as:
+
+> Sentinel-2 Cloud-Optimized GeoTIFFs, accessed on [DATE] from
+> https://registry.opendata.aws/sentinel-2-l2a-cogs.
+
+Cite this catalog itself as the item index derived from that archive.
 
 ## Provenance
 
-TODO(setup): where the data came from. Say whether this catalog is the official
-publication from the producing organization, or a mirror of someone else's data.
-If it is a mirror, link the upstream and say how often it syncs.
+Every item comes from the
+[Earth Search STAC API](https://earth-search.aws.element84.com/v1), collection
+`sentinel-2-l2a`. The initial archive (2015-07-04 through 2024-06-24, about 28
+million items) is a one-time repartition of a
+[pre-existing GeoParquet export](https://data.source.coop/cholmes/stac-geoparquet-public/slim/s2-stac.parquet)
+of that same collection; everything after that date is fetched from the API
+directly and normalized to the same schema, so the whole archive is one
+queryable table regardless of which side of that date a scene falls on.
+
+This catalog does not filter, reclassify, or interpolate anything Earth Search
+publishes. Column meanings and the two added sort-key columns will be
+documented on the `sentinel-2-l2a` collection once it exists.
 
 ## Access
 
-TODO(setup): one query someone can run without downloading anything, against a
-real published file. Run it before you paste it.
+The archive this catalog mirrors is queryable today, ahead of this catalog's
+own copy landing:
 
 ```sql
--- Example shape. Replace the URL and the columns with your own.
-INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;
-SELECT count(*) FROM 'https://example.invalid/prefix/collection/data.parquet';
+INSTALL httpfs; LOAD httpfs;
+
+SELECT count(*) AS scenes, min(datetime) AS earliest, max(datetime) AS latest
+FROM read_parquet(
+  'https://data.source.coop/cholmes/stac-geoparquet-public/slim/s2-stac.parquet');
+-- 28146662 scenes, 2015-07-04 through 2024-06-24
 ```
+
+Once `sentinel-2-l2a` publishes, the same query pattern applies against this
+catalog's own partitioned files under
+`https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/`,
+documented on that collection.

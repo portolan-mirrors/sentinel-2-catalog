@@ -1,36 +1,58 @@
-# Portolan Catalog Template
+# sentinel-2-catalog
 
-A starting point for a [Portolan](https://www.portolan-sdi.org/) catalog whose
-metadata lives in git. Click **Use this template**, work through
-[SETUP.md](SETUP.md), and you have a repository whose CI validates every change
-before it publishes.
+A [Portolan](https://www.portolan-sdi.org/) catalog mirroring the **AWS Earth
+Search Sentinel-2 L2A archive** (about 28 million scenes, 2015 to today) as
+partitioned STAC-GeoParquet, plus MGRS-tile aggregate stats. The imagery stays
+on AWS; this catalog carries only the item index, so a client queries the full
+archive with plain Parquet reads instead of a rate-limited STAC API.
 
-**`catalog/` is the published catalog.** Everything in it is published.
-Everything outside it never is. That boundary is the whole publish contract,
-and `tools/publish.py` has no flag or config key that widens it.
+Catalog metadata lives in this repository. CI validates every change to it.
+The data itself lives in object storage next to the metadata, referenced by
+URL and never committed.
+
+- **Published catalog (once populated)**: https://source.coop/portolan-mirrors/sentinel-2-catalog
+- **STAC root**: https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json
+- **Upstream**: https://earth-search.aws.element84.com/v1 (Earth Search, by
+  [Element 84](https://element84.com/), on the
+  [AWS Registry of Open Data](https://registry.opendata.aws/sentinel-2-l2a-cogs/))
+- **Design spec**: [`docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md`](docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md)
+
+## Status
+
+This repository currently holds the template scaffold only: a valid, empty
+catalog root and the gates that will validate everything added to it. No
+collection is published yet.
+
+Once built out, `catalog/` will hold two collections:
+
+| Collection | Will hold |
+|---|---|
+| `sentinel-2-l2a` | The item index — Earth Search's Sentinel-2 L2A metadata, partitioned `year=YYYY/items.parquet` plus a `live.parquet` tail, sorted `(_month, _hilbert)` |
+| `stats` | MGRS tile × month aggregates (scene counts, cloud cover) and a tile-footprint PMTiles layer, for the explorer app and for query planning |
+
+Neither collection nor the pipeline that builds them (`tools/s2_fetch.py`,
+`tools/s2_build.py`, `tools/s2_stats.py`, and the GitHub Actions workflows that
+run them) exists yet. They land in later work; see the design spec for the
+full plan.
+
+## Why no imagery, no API
+
+Sentinel-2 L2A Cloud-Optimized GeoTIFFs already live on AWS in the
+`sentinel-cogs` bucket, produced and hosted by Element 84. Re-hosting them
+here would duplicate petabytes of data this catalog does not need to own. A
+client derives each COG's URL from the item's MGRS tile and date instead —
+the derivation is documented on the `sentinel-2-l2a` collection once it
+exists. Serving the index as GeoParquet, rather than behind a STAC API, means
+a client filters ~28 million scenes with a Parquet range read against a
+public bucket: no server to rate-limit, no server to keep running.
 
 ## Three kinds of file
 
 | Kind | Where | Example |
 |---|---|---|
-| Tracked and published | inside `catalog/` | STAC JSON, `README.md`, `AGENTS.md`, thumbnails, logos |
+| Tracked and published | inside `catalog/` | STAC JSON, `README.md`, `AGENTS.md` |
 | Tracked, never published | outside `catalog/` | `tools/`, `tests/`, `docs/`, this README, `catalog.publish.yaml` |
 | Neither | gitignored | GeoParquet, COGs, PMTiles, credentials |
-
-The data lives in object storage next to the published metadata. The
-repository references it by URL and never stores it.
-
-## Layout
-
-| Path | What it is |
-|---|---|
-| `catalog/` | The published tree, synced 1:1 to object storage |
-| `catalog.publish.yaml` | Where it publishes, and under what public URL |
-| `tools/publish.py` | The sync. Dry run by default |
-| `tools/upload_data.py` | The data upload. Dry run by default |
-| `tests/` | The gates CI runs on every pull request |
-| `docs/conformance.md` | Any validator finding this catalog accepts, and why |
-| `SETUP.md` | The checklist. Delete it when you are done |
 
 ## Publish
 
@@ -44,19 +66,14 @@ delete the object yourself if that is what you meant.
 
 ## Upload the data
 
-The data is too large for git, so it lives outside `catalog/`.
-`tools/upload_data.py` carries it to the same bucket prefix. Set `data_dir` in
-`catalog.publish.yaml` to the directory that holds it.
+The data is too large for git, so it lives outside `catalog/`, staged at the
+`data_dir` set in `catalog.publish.yaml`. `tools/upload_data.py` carries it to
+the same bucket prefix.
 
 ```bash
 python3 tools/upload_data.py            # dry run: what would change
 python3 tools/upload_data.py --confirm  # upload; needs AWS credentials
 ```
-
-Both scripts share one set of rules. `upload_data.py` imports the sentinel
-guard, the content types, the change detection, and the upload pool from
-`publish.py`. It changes one thing, the directory it walks. Only the suffixes
-in its allow-list upload, so staged scratch files stay out of the bucket.
 
 ## Test
 
@@ -66,27 +83,20 @@ python3 tests/run_all.py
 
 | Gate | What it checks |
 |---|---|
-| `test_setup.py` | Template placeholders are all edited, or all untouched |
 | `test_links.py` | Every relative link and asset href resolves |
 | `test_publish.py` | Nothing outside `catalog/` can be uploaded |
 | `test_upload_data.py` | Only staged files with an allowed suffix upload |
 | `test_stac_valid.py` | Valid STAC 1.1.0, via `stac-check` |
 | `test_conformance.py` | Portolan conformance, via `rashid` |
 
-The two validator gates skip when their tools are absent, so a clean checkout
-runs with no setup. CI installs both and enforces them.
-
-## What this template does not decide
-
-How a published catalog points back at the repository that maintains it. Three
-encodings are in use across real catalogs and none is standardized, so this
-template ships none of them rather than freezing one in by default. The
-tradeoffs are in
-[portolan-spec#145](https://github.com/portolan-sdi/portolan-spec/issues/145)
-and in the
-[git-backed catalogs guidance](https://github.com/portolan-sdi/portolan-spec/blob/main/specs/best-practices/git-backed-catalogs.md).
+CI runs `rashid`, `stac-check`, and `tests/run_all.py` on every pull request.
+`docs/conformance.md` records any accepted deviation, with the rule, why, and
+the tracking issue — the allow-list in `tests/test_conformance.py` never
+widens without a matching row there.
 
 ## License
 
-Apache-2.0, covering the tooling in this repository. The data you catalog
-carries its own license, which belongs in `catalog/README.md`.
+Data: Sentinel-2 imagery and its derived products carry the
+[Copernicus Sentinel Data Terms and Conditions](https://sentinels.copernicus.eu/documents/247904/690755/Sentinel_Data_Legal_Notice) —
+free, full, and open. See `catalog/README.md` for the acknowledgement this
+requires once published. Repository code: see `LICENSE`.

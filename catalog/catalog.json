@@ -4,14 +4,15 @@
   "stac_extensions": [
     "https://schemas.portolan-sdi.org/portolan/v0.1.1/schema.json"
   ],
-  "id": "example-catalog",
-  "title": "Example Catalog",
-  "description": "TODO(setup): one or two sentences saying what this catalog holds, who produced the data, and who it is for. A person and an agent both read this first.",
+  "id": "sentinel-2-catalog",
+  "title": "Sentinel-2 L2A STAC-GeoParquet Mirror",
+  "description": "An item index for the AWS Earth Search Sentinel-2 L2A archive (about 28 million scenes, 2015 to today), published as partitioned STAC-GeoParquet plus MGRS-tile aggregate stats. The imagery stays on AWS in the sentinel-cogs bucket; this catalog carries no assets, so a client derives each Cloud-Optimized GeoTIFF URL from the item's MGRS tile and date. No STAC API sits in front of it: query the Parquet files directly. This is a mirror; Earth Search / Element 84 produces the item index this catalog republishes. Read the [agent guide](AGENTS.md) before you query it.",
   "links": [
     {
       "rel": "root",
       "href": "./catalog.json",
-      "type": "application/json"
+      "type": "application/json",
+      "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
     },
     {
       "rel": "describedby",
@@ -27,12 +28,12 @@
     },
     {
       "rel": "vcs",
-      "href": "https://github.com/TODO(setup)",
+      "href": "https://github.com/portolan-mirrors/sentinel-2-catalog",
       "title": "Source repository"
     },
     {
       "rel": "issues",
-      "href": "https://github.com/TODO(setup)/issues",
+      "href": "https://github.com/portolan-mirrors/sentinel-2-catalog/issues",
       "title": "Issue tracker"
     }
   ]
