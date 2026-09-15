@@ -12,18 +12,23 @@ answer, and nothing downstream catches it.
 
 Public root: `https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json`
 
-**No collection is published yet.** This repository is scaffolding for a
-catalog that will mirror the AWS Earth Search Sentinel-2 L2A item index —
-about 28 million scenes, 2015-07-04 to today — as partitioned
-STAC-GeoParquet, plus MGRS-tile aggregate stats. The
-[design spec](https://github.com/portolan-mirrors/sentinel-2-catalog/blob/main/docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md)
-in this repository has the planned schema, partition layout, and column
-meanings; once `sentinel-2-l2a` and `stats` publish, this section and
-`sentinel-2-l2a/AGENTS.md` carry the verified facts.
+One collection: `sentinel-2-l2a`, the AWS Earth Search Sentinel-2 L2A item
+index as year-partitioned STAC-GeoParquet. Earth Search held 51.25 million
+items when it was counted on 2026-09-15. A `stats` collection with MGRS-tile
+aggregates follows.
 
-This will be a **mirror**. Earth Search, run by
+Read [`sentinel-2-l2a/AGENTS.md`](sentinel-2-l2a/AGENTS.md) before you query.
+It carries the schema, the query pattern, the NULLs to expect, and the
+contract for the `assets` JSON-string column. Nothing here repeats it.
+
+Coverage is partial before December 2018: nothing for 2015-2016, part of
+2017-2018. That is Earth Search's record. Do not report a missing year as an
+observation about Sentinel-2 itself.
+
+This is a **mirror**. Earth Search, run by
 [Element 84](https://element84.com/) on the AWS Registry of Open Data,
-produces the item index this catalog republishes.
+produces the item index this catalog republishes. Nothing is filtered,
+reclassified or interpolated here.
 
 ## Structure
 

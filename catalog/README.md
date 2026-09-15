@@ -13,16 +13,19 @@ underlying imagery source.
 ## What is here
 
 This catalog carries no imagery. Sentinel-2 L2A Cloud-Optimized GeoTIFFs stay
-in the `sentinel-cogs` bucket on AWS; a client derives each COG's URL from an
-item's MGRS tile and date rather than downloading it through this catalog.
-What publishes here is the *item index* — the STAC metadata for roughly 28
-million scenes from 2015 to today — plus small aggregate products (scene
-counts and cloud cover per MGRS tile per month) that make it practical to plan
-a query before running it.
+in the `sentinel-cogs` bucket on AWS, and every one of their URLs is carried
+verbatim in the item's `assets` column, so nothing has to be derived from a
+template. What publishes here is the *item index* — the STAC metadata for the
+51.25 million items Earth Search held when it was counted on 2026-09-15 — plus
+small aggregate products (scene counts and cloud cover per MGRS tile per month)
+that make it practical to plan a query before running it.
 
-**No collection is published yet.** This repository currently ships the
-catalog skeleton only. Once built out, it will hold `sentinel-2-l2a` (the item
-index) and `stats` (the MGRS aggregates); check
+Coverage is partial before December 2018: nothing for 2015-2016, part of
+2017-2018, complete after that. This mirror adds no items and drops none, so
+that gap is Earth Search's record, not an artifact of the mirroring.
+
+[`sentinel-2-l2a`](sentinel-2-l2a/collection.json) holds the item index. The
+`stats` collection, with the MGRS aggregates, follows. Check
 [`catalog.json`](catalog.json) for the current list of collections.
 
 ## License
@@ -42,32 +45,29 @@ Cite this catalog itself as the item index derived from that archive.
 
 Every item comes from the
 [Earth Search STAC API](https://earth-search.aws.element84.com/v1), collection
-`sentinel-2-l2a`. The initial archive (2015-07-04 through 2024-06-24, about 28
-million items) is a one-time repartition of a
-[pre-existing GeoParquet export](https://data.source.coop/cholmes/stac-geoparquet-public/slim/s2-stac.parquet)
-of that same collection; everything after that date is fetched from the API
-directly and normalized to the same schema, so the whole archive is one
-queryable table regardless of which side of that date a scene falls on.
+`sentinel-2-l2a`, fetched from the API and normalized to one schema. The whole
+archive is therefore one queryable table, and a row means the same thing in
+2019 as it does today.
 
 This catalog does not filter, reclassify, or interpolate anything Earth Search
-publishes. Column meanings and the two added sort-key columns will be
-documented on the `sentinel-2-l2a` collection once it exists.
+publishes. Column meanings, the two added sort-key columns, and the query
+patterns are documented on the
+[`sentinel-2-l2a` collection](sentinel-2-l2a/README.md) and in its
+[agent guide](sentinel-2-l2a/AGENTS.md).
 
 ## Access
 
-The archive this catalog mirrors is queryable today, ahead of this catalog's
-own copy landing:
+No API, no key, no rate limit: DuckDB reads the Parquet over HTTP.
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
 
 SELECT count(*) AS scenes, min(datetime) AS earliest, max(datetime) AS latest
 FROM read_parquet(
-  'https://data.source.coop/cholmes/stac-geoparquet-public/slim/s2-stac.parquet');
--- 28146662 scenes, 2015-07-04 through 2024-06-24
+  'https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
+  hive_partitioning=true);
 ```
 
-Once `sentinel-2-l2a` publishes, the same query pattern applies against this
-catalog's own partitioned files under
-`https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/`,
-documented on that collection.
+Filter on `year` first: it is a Hive partition key, so it skips whole files.
+The [collection README](sentinel-2-l2a/README.md) has the query that finds
+cloud-free scenes over one field, and the COG URL for each of them.

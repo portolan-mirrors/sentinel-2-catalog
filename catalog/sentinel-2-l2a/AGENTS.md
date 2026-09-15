@@ -1,0 +1,178 @@
+# AGENTS.md — sentinel-2-l2a
+
+Guidance for AI agents and automated clients querying this collection.
+
+**One rule survives every edit to this file.** Every claim here is either
+quoted from a source or measured from the data. If you cannot point at where a
+fact came from, it does not belong in this file. An agent acting on an invented
+column name or an invented join key produces a confident wrong answer, and
+nothing downstream catches it.
+
+## What this is
+
+One row per Sentinel-2 L2A scene in the AWS Earth Search item index,
+republished as partitioned GeoParquet. The imagery is not here: it is in the
+public `sentinel-cogs` bucket on AWS, and every COG URL is already in the
+`assets` column of the row that describes it.
+
+```
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/items.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/live.parquet
+```
+
+`items.parquet` is the consolidated archive for the year. The current year also
+has `live.parquet`, the tail fetched daily since the last consolidation. They
+do not overlap, so glob both:
+
+```sql
+read_parquet('.../sentinel-2-l2a/year=*/*.parquet', hive_partitioning=true)
+```
+
+`hive_partitioning=true` exposes `year` as an INTEGER column that is not stored
+in the files. Filter on it first; it is the only filter that skips whole files.
+
+## Query pattern
+
+Filter in this order. Each step removes more data than the next one can.
+
+1. `year IN (…)` — partition pruning, skips whole files.
+2. `"s2:mgrs_tile" = '31UFU'` — the spatial join key, and the cheapest spatial
+   filter there is. A tile id is stable for the life of the mission.
+3. `_month = 8` or a `datetime` range — rows are sorted by month first, so a
+   month filter prunes row groups inside the file.
+4. `"eo:cloud_cover" < 10` — the usual last cut.
+
+```sql
+INSTALL spatial; LOAD spatial;
+SELECT id, datetime, "eo:cloud_cover",
+       json_extract_string(assets, '$.visual.href') AS visual_cog
+FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
+                  hive_partitioning=true)
+WHERE year = 2021
+  AND "s2:mgrs_tile" = '31UFU'
+  AND _month BETWEEN 8 AND 10
+  AND "eo:cloud_cover" < 10
+ORDER BY "eo:cloud_cover"
+LIMIT 20;
+```
+
+Column names with a colon are not identifiers. Quote them: `"eo:cloud_cover"`,
+not `eo:cloud_cover`.
+
+Use a `ST_Intersects` filter on `geometry` when you have a real polygon and no
+tile id. It works, and it is slower than the tile filter, because it has to
+decode geometries the tile filter never reads.
+
+`datetime` is TIMESTAMP WITH TIME ZONE and every value is UTC. DuckDB renders
+it in the session time zone, so run `SET TimeZone='UTC'` before you compare a
+rendered string to a date, or a scene acquired at 23:50 UTC reports the next
+day west of Greenwich and the previous day east of it.
+
+## Schema
+
+The published column list is `tools/s2_schema.py` in the source repository, and
+the collection's `table:columns` is generated from it. Both carry a description
+per column; that is the authority, and this section covers what a description
+cannot say on its own.
+
+**Spatial.** `geometry` is the scene footprint in CRS84. `bbox` is the same
+footprint as `[w, s, e, n]`. `s2:mgrs_tile` is the MGRS tile id, for example
+`31UFU`, and it is THE join key: scenes over one place share it across all
+years.
+
+**Time.** `datetime` is the acquisition instant, UTC. `s2:generation_time` is
+when ESA processed the product, not when the satellite looked.
+
+**Two added columns, and they are helpers, not STAC.** They exist so that
+readers can prune:
+
+- `_month` — `month(datetime)`, 1 to 12. The first sort key.
+- `_hilbert` — `ST_Hilbert(geometry, world bounds)`. The second sort key.
+
+Every part file is written sorted by `(_month, _hilbert)`: month first so that
+a month filter prunes row groups inside a year, Hilbert within month so that
+each row group's bounding box stays tight and a spatial filter prunes too.
+Nothing upstream publishes these two columns. Do not pass them on as STAC
+properties, and do not treat `_hilbert` as meaningful on its own — it is a
+position on a space-filling curve, not a measurement.
+
+**Everything else** is the upstream STAC property under its upstream name,
+unchanged. Two of them are reconstructed when Earth Search omits them, and
+never invented: `sat:relative_orbit` is parsed from the `_R(\d{3})_` group of
+`s2:product_uri`, and `s2:mean_solar_zenith` is computed as
+`90 - view:sun_elevation`.
+
+## NULLs you will meet
+
+`s2:granule_id` and `sat:orbit_state` are NULL on newer items. Earth Search
+stopped publishing those two properties, and this mirror leaves an absent value
+absent rather than inventing one. A query that requires either silently drops
+every recent scene. Use `s2:product_uri` in place of `s2:granule_id`, and
+derive the orbit direction from `sat:relative_orbit` if you truly need it.
+
+Several `s2:*_percentage` columns are NULL on some items for the same reason:
+the upstream item did not carry them.
+
+## Coverage
+
+Nothing for 2015-2016. Part of 2017-2018. Complete from about December 2018.
+
+That is what Earth Search and the `sentinel-cogs` bucket serve, not a gap
+introduced here. Do not report "no scenes in 2016" as an observation about
+Sentinel-2 — the mission was acquiring; this index does not carry those items.
+Check the per-year items (`year=YYYY/YYYY.json`) for each year's measured row
+count and time range before you conclude anything about a period.
+
+## The `assets` column
+
+`assets` is a VARCHAR holding the upstream STAC assets object verbatim, as a
+compact JSON string. It is a string on purpose: deeply nested structs make a
+Parquet file hard for some readers to open, and a string keeps every reader's
+schema flat. The cost is that you parse it.
+
+```sql
+json_extract_string(assets, '$.visual.href')   -- one href
+json_extract(assets, '$.red')                  -- one asset object
+json_keys(assets)                              -- every key on this scene
+```
+
+Keys present on a current L2A scene:
+
+| Group | Keys |
+| --- | --- |
+| Bands, COG | `coastal` `blue` `green` `red` `rededge1` `rededge2` `rededge3` `nir` `nir08` `nir09` `swir16` `swir22` |
+| Bands, JPEG 2000 | the same names with a `-jp2` suffix |
+| Derived rasters | `visual` (true colour), `scl` (scene classification), `aot`, `wvp`, `cloud`, `snow` |
+| Preview | `thumbnail` (also flat in the `thumbnail_url` column) |
+| Metadata | `granule_metadata`, `product_metadata`, `tileinfo_metadata` |
+
+Each asset object carries `href`, `type`, `title`, `roles`, and for the raster
+assets `gsd`, `eo:bands`, `raster:bands`, `proj:shape` and `proj:transform`.
+The `proj:*` values are per scene and correct only for that scene.
+
+The collection's `item_assets` block mirrors the stable part of this — the band
+metadata per key — for STAC clients that expect it at collection level. It is
+documentation. The per-item `assets` value is the authority, it is the only
+place the hrefs exist, and it carries keys (`cloud`, `snow`,
+`product_metadata`) that the upstream `item_assets` template omits.
+
+Do not build an asset URL from a template. Read the href.
+
+## Dedupe
+
+A scene can be fetched more than once: the daily refresh re-reads a five-day
+window, and a reprocessed product keeps its id. Rows are deduped by `id`,
+keeping the highest `s2:generation_time` (`NULLS LAST`), when each part is
+built. So `id` is unique within a part, and the parts of a year do not overlap,
+so `id` is unique within a year. Across the whole table, treat `id` as unique
+and report it if you ever find otherwise.
+
+## What this collection does not do
+
+It does not filter, reclassify or interpolate anything Earth Search publishes.
+It adds `_month`, `_hilbert` and the flat `thumbnail_url`, and nothing else.
+There is no STAC API in front of it: query the Parquet directly, over HTTP
+range requests, with no key and no rate limit.
+
+Structural links resolve relative to the object that carries them. Objects here
+carry no `self` link, so a client tracks its own location.
