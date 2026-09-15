@@ -61,7 +61,13 @@ def normalize(f: dict) -> dict:
     p = f["properties"]
     tile = p.get("s2:mgrs_tile")
     if not tile:
-        tile = f"{p['mgrs:utm_zone']}{p['mgrs:latitude_band']}{p['mgrs:grid_square']}"
+        try:
+            tile = (f"{p['mgrs:utm_zone']}{p['mgrs:latitude_band']}"
+                    f"{p['mgrs:grid_square']}")
+        except KeyError as e:
+            raise ValueError(
+                f"{f.get('id', '<unknown id>')}: missing mgrs field {e} "
+                "and no s2:mgrs_tile") from e
     rel = p.get("sat:relative_orbit")
     if rel is None and p.get("s2:product_uri"):
         m = _REL_ORBIT.search(p["s2:product_uri"])
@@ -115,6 +121,8 @@ def fetch_window(start: str, end: str, out_dir: Path,
     body = {"collections": ["sentinel-2-l2a"],
             "datetime": f"{start}T00:00:00Z/{end}T23:59:59Z",
             "limit": PAGE}
+    # Rows for a window are held in memory before being written; bounded
+    # because the CLI runs with --days-per-chunk=1 (~5k items/day).
     rows, pages, next_body = [], 0, body
     while True:
         resp = _post(next_body)
@@ -123,8 +131,20 @@ def fetch_window(start: str, end: str, out_dir: Path,
         nxt = [l for l in resp.get("links", []) if l.get("rel") == "next"]
         if not nxt or (limit_pages and pages >= limit_pages):
             break
-        # Earth Search paging: POST the next link's body verbatim.
-        next_body = nxt[0].get("body") or {**body, **nxt[0].get("merge", {})}
+        # STAC paging contract: merge=True means the link's body is a partial
+        # body to merge OVER the original request; merge=False/absent means
+        # the link's body is self-contained and used as-is. A next link with
+        # no body at all is a contract change we've never seen from Earth
+        # Search -- fail loudly rather than loop forever or stop silently.
+        link = nxt[0]
+        if link.get("merge"):
+            next_body = {**body, **(link.get("body") or {})}
+        elif link.get("body"):
+            next_body = link["body"]
+        else:
+            raise SystemExit(
+                f"{start}_{end}: next link with no body: "
+                "pagination contract changed")
     if not rows:
         dest.touch()          # sentinel: fetched, zero matches
         return 0
@@ -138,19 +158,21 @@ def _write(rows: list[dict], dest: Path) -> None:
         for r in rows:
             tf.write(json.dumps(r) + "\n")
         nd = tf.name
-    con = duckdb.connect()
-    con.execute("INSTALL spatial; LOAD spatial;")
-    cast = ", ".join(
-        f'CAST("{n}" AS {t}) AS "{n}"'
-        for n, t, _ in DATA_COLUMNS if n != "geometry")
-    con.execute(f"""
-        COPY (
-          SELECT {cast},
-                 ST_GeomFromGeoJSON(_geometry_json) AS geometry
-          FROM read_ndjson('{nd}', maximum_object_size=20000000)
-        ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
-    """)
-    Path(nd).unlink()
+    try:
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        cast = ", ".join(
+            f'CAST("{n}" AS {t}) AS "{n}"'
+            for n, t, _ in DATA_COLUMNS if n != "geometry")
+        con.execute(f"""
+            COPY (
+              SELECT {cast},
+                     ST_GeomFromGeoJSON(_geometry_json) AS geometry
+              FROM read_ndjson('{nd}', maximum_object_size=20000000)
+            ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
+        """)
+    finally:
+        Path(nd).unlink()
 
 
 def main() -> int:
