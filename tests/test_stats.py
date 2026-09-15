@@ -1,8 +1,10 @@
 """Aggregate a synthetic two-tile fixture and verify counts, medians,
 best-item selection (including cloud-cover ties), the merge path used by
-the daily refresh, the antimeridian exclusion from footprint polygons, and
-the gpio pmtiles command that builds the tileset.
+the daily refresh, the antimeridian exclusion from footprint polygons (and
+that the same scene is still counted in the stats table), and the real
+PMTiles archive gpio/tippecanoe produce.
 """
+import json
 import subprocess
 import sys
 import tempfile
@@ -13,7 +15,7 @@ import duckdb
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
-from s2_stats import build_footprint_table, connect, pmtiles_command  # noqa: E402
+from s2_stats import build_footprint_table, build_footprints, connect  # noqa: E402
 
 
 def _fixture(con, path):
@@ -121,11 +123,55 @@ def test_merge_replaces_only_named_years():
         assert after[1] != before[1]
 
 
-def test_antimeridian_excluded_from_footprints():
+def test_antimeridian_excluded_from_footprints_but_counted_in_stats():
     """A scene bbox wider than 20 degrees of longitude (an antimeridian
-    wrap, reported as [-180, ..., 180, ...]) must not contribute a polygon;
-    this is tested directly against the DuckDB output, with no tippecanoe
-    or gpio involved."""
+    wrap, reported as [-180, ..., 180, ...]) must not contribute a polygon
+    to the footprint table -- tested directly against DuckDB output, no
+    tippecanoe or gpio involved -- but the exclusion is a geometry-rendering
+    fix, not a data-quality filter: the same scene must still be counted in
+    mgrs-monthly.parquet's scene_count."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            ('N1', '31ABC', TIMESTAMPTZ '2024-08-01 00:00:00+00', 10.0,
+             [3.9, 51.9, 4.1, 52.1]::DOUBLE[],
+             ST_GeomFromText('POLYGON((3.9 51.9,4.1 51.9,4.1 52.1,3.9 52.1,3.9 51.9))')),
+            ('W1', '60ZZZ', TIMESTAMPTZ '2024-08-02 00:00:00+00', 20.0,
+             [-179.5, 10, 179.5, 11]::DOUBLE[],
+             ST_GeomFromText('POLYGON((-179.5 10,179.5 10,179.5 11,-179.5 11,-179.5 10))'))
+          ) t(id, "s2:mgrs_tile", datetime, "eo:cloud_cover", bbox, geometry)
+          ) TO '{src}' (FORMAT PARQUET)
+        """)
+
+        # Footprints: the antimeridian-wrapping tile is absent.
+        footprints = Path(td) / "mgrs-tiles.parquet"
+        build_footprint_table(con, [str(src)], footprints)
+        tiles = {r[0] for r in con.execute(
+            f"SELECT mgrs_tile FROM read_parquet('{footprints}')").fetchall()}
+        assert tiles == {"31ABC"}, (
+            "the antimeridian-wrapping tile must be excluded from footprints")
+
+        # Stats: the same scene is still counted.
+        out = Path(td) / "stats"
+        _run([src], out)
+        counts = dict(con.execute(
+            f"SELECT mgrs_tile, scene_count "
+            f"FROM read_parquet('{out}/mgrs-monthly.parquet')").fetchall())
+        assert counts.get("60ZZZ") == 1, (
+            "the antimeridian scene must still be counted in scene_count "
+            "even though it has no footprint polygon")
+        assert counts.get("31ABC") == 1
+
+
+def test_footprints_pmtiles_layer_is_mgrs():
+    """End to end: build a tiny fixture through build_footprints() (real
+    tippecanoe, via gpio pmtiles create -- no mocking) and confirm the
+    resulting archive's vector layer is really named "mgrs" and carries an
+    "mgrs_tile" field, the way the app's source-layer/promoteId expect. This
+    is the same check the original self-review did ad hoc with the pmtiles
+    package, now committed."""
     con = connect()
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "items.parquet"
@@ -134,32 +180,28 @@ def test_antimeridian_excluded_from_footprints():
             ('N1', '31ABC',
              [3.9, 51.9, 4.1, 52.1]::DOUBLE[],
              ST_GeomFromText('POLYGON((3.9 51.9,4.1 51.9,4.1 52.1,3.9 52.1,3.9 51.9))')),
-            ('W1', '60ZZZ',
-             [-179.5, 10, 179.5, 11]::DOUBLE[],
-             ST_GeomFromText('POLYGON((-179.5 10,179.5 10,179.5 11,-179.5 11,-179.5 10))'))
+            ('N2', '32DEF',
+             [8.9, 50.9, 9.1, 51.1]::DOUBLE[],
+             ST_GeomFromText('POLYGON((8.9 50.9,9.1 50.9,9.1 51.1,8.9 51.1,8.9 50.9))'))
           ) t(id, "s2:mgrs_tile", bbox, geometry)
           ) TO '{src}' (FORMAT PARQUET)
         """)
-        dest = Path(td) / "mgrs-tiles.parquet"
-        build_footprint_table(con, [str(src)], dest)
-        tiles = {r[0] for r in con.execute(
-            f"SELECT mgrs_tile FROM read_parquet('{dest}')").fetchall()}
-        assert tiles == {"31ABC"}, (
-            "the antimeridian-wrapping tile must be excluded from footprints")
+        out = Path(td) / "stats"
+        out.mkdir()
+        build_footprints(con, [str(src)], out)
+        archive = out / "mgrs.pmtiles"
+        assert archive.exists(), "build_footprints must write mgrs.pmtiles"
 
+        try:
+            from pmtiles.reader import MmapSource, Reader
+            with open(archive, "rb") as f:
+                metadata = Reader(MmapSource(f)).metadata()
+        except ImportError:
+            result = subprocess.run(
+                ["pmtiles", "show", str(archive)],
+                capture_output=True, text=True, check=True)
+            metadata = json.loads(result.stdout)
 
-def test_pmtiles_command_uses_layer_mgrs():
-    """gpio pmtiles create must be invoked with layer name "mgrs" -- the
-    app's fixed source-layer. Asserted on the constructed command rather
-    than a built .pmtiles file: CI's unit-test job installs duckdb and
-    geoparquet-io but not tippecanoe (see .github/workflows/ci.yml), so a
-    test that shells out to gpio pmtiles create would fail there even
-    though the command it builds is correct."""
-    fp = Path("/staging/out/mgrs-tiles.parquet")
-    pmtiles = Path("/staging/out/mgrs.pmtiles")
-    cmd = pmtiles_command(fp, pmtiles)
-    assert cmd[:3] == ["gpio", "pmtiles", "create"]
-    assert cmd[3] == str(fp)
-    assert cmd[4] == str(pmtiles)
-    assert "--layer" in cmd
-    assert cmd[cmd.index("--layer") + 1] == "mgrs"
+        layers = metadata["vector_layers"]
+        assert layers[0]["id"] == "mgrs"
+        assert "mgrs_tile" in layers[0]["fields"]
