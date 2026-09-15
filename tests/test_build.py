@@ -1,5 +1,6 @@
 """Build a year part from tiny synthetic chunks and verify dedupe, sort
 order, helper columns, and GeoParquet output."""
+import os
 import subprocess
 import sys
 import tempfile
@@ -56,3 +57,38 @@ def test_build_dedupes_and_sorts():
         months = con.execute(
             f"SELECT list(_month) FROM read_parquet('{f}')").fetchone()[0]
         assert months == sorted(months)                 # sorted by _month first
+
+
+def test_build_handles_dotdot_in_paths():
+    """gpio 1.3.0 rejects a path whose normalized form still starts with
+    '..' ("directory traversal detected") -- exactly the shape of the
+    project's `../s2-staging/...` staging convention when --out/--sources
+    are passed as relative paths. s2_build.py must resolve --sources and
+    --out to absolute paths before any gpio subprocess call so a
+    leading-'..' relative path (relative to the invocation cwd) still
+    builds successfully."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_chunk(con, chunks / "a.parquet", [
+            ("A", "2024-03-01 10:00:00+00", "2024-03-01T12:00:00Z", 4.0, 52.0),
+        ])
+        out = Path(td) / "publish"
+        # Relative to ROOT (the subprocess cwd below), so os.path.normpath
+        # leaves a leading ".." that gpio's own traversal check inspects --
+        # unlike an absolute path with an embedded ".." segment, which
+        # normpath collapses away before gpio ever sees it.
+        rel_sources = os.path.relpath(chunks.parent, ROOT)
+        rel_out = os.path.relpath(out, ROOT)
+        assert rel_sources.startswith("..") and rel_out.startswith("..")
+        subprocess.run(
+            [sys.executable, "tools/s2_build.py",
+             "--sources", rel_sources, "--years", "2024",
+             "--out", rel_out],
+            check=True, cwd=ROOT)
+        f = out / "year=2024" / "items.parquet"
+        r = con.execute(
+            f"SELECT id FROM read_parquet('{f}')").fetchall()
+        assert [x[0] for x in r] == ["A"]

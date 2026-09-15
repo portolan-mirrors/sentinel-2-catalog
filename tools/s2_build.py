@@ -46,10 +46,10 @@ def gather(sources: list[str]) -> list[str]:
     for s in sources:
         p = Path(s)
         if p.is_dir():
-            files += [str(f) for f in sorted(p.rglob("*.parquet"))
+            files += [str(f.resolve()) for f in sorted(p.rglob("*.parquet"))
                       if f.stat().st_size > 0]
         elif p.suffix == ".parquet" and p.stat().st_size > 0:
-            files.append(str(p))
+            files.append(str(p.resolve()))
     if not files:
         raise SystemExit(f"no non-empty parquet under {sources}")
     return files
@@ -112,8 +112,10 @@ def build_year(con, files: list[str], year: int, outdir: Path,
             print(r.stdout[-1500:], r.stderr[-1500:], file=sys.stderr)
             raise SystemExit(f"gpio sort failed for {year}")
         # Best-practices gate on the artifact itself: compression, row
-        # groups, spatial order, bbox metadata. Failing the build here beats
-        # publishing a part that violates the distribution practices.
+        # groups, spatial order, bbox metadata. Fails the build only on
+        # gpio's error-level violations (non-zero exit); WARNING-level
+        # findings (e.g. omitted geo-metadata CRS, which the GeoParquet
+        # spec defaults to OGC:CRS84) pass and are acceptable.
         chk = subprocess.run(["gpio", "check", "all", str(final)],
                              capture_output=True, text=True)
         if chk.returncode != 0:
@@ -134,7 +136,7 @@ def main() -> int:
     ap.add_argument("--memory", default="8GB")
     a = ap.parse_args()
 
-    outdir = Path(a.out)
+    outdir = Path(a.out).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     tmp = outdir.parent / ".duckdb-tmp"
     tmp.mkdir(exist_ok=True)
