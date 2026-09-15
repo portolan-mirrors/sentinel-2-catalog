@@ -13,16 +13,17 @@
 ## Global Constraints
 
 - Published repo: `github.com/portolan-mirrors/sentinel-2-catalog`; bucket prefix `s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog`; public base `https://data.source.coop/portolan-mirrors/sentinel-2-catalog`.
-- Item schema = the 42 columns of the seed file **exactly** (listed in Task 2), plus `_month TINYINT` and `_hilbert UINTEGER`, in that order (helpers before `geometry`, which stays last).
-- Sort order inside every part file: `(_month, _hilbert)`; row groups 100,000 rows; zstd level 22 for `items.parquet`, 15 for `live.parquet`; GeoParquet 2.0 written by `gpio sort column`.
+- Item schema = 45 columns (listed in Task 2): the 42 seed-era data columns, then `assets VARCHAR` (the complete upstream STAC assets object, verbatim, as a compact JSON **string** — never a nested struct; measured 179 B/row under zstd-22 with clustered ordering), then `_month TINYINT`, `_hilbert UINTEGER`, and `geometry` last.
+- Every published parquet follows the [GeoParquet distribution best practices](https://github.com/opengeospatial/geoparquet/blob/main/format-specs/distributing-geoparquet.md): GeoParquet 2.0 (native GEOMETRY, row-group geo statistics, no bbox covering column), spatial ordering, zstd — cranked to level 22 for EVERY part, `live.parquet` included (user decision 2026-09-15). Sort order inside every part file: `(_month, _hilbert)`; row groups 100,000 rows (~the doc's 128-256 MB byte target at our row width); written by `gpio sort column`.
 - Earth Search: `https://earth-search.aws.element84.com/v1/search`, collection `sentinel-2-l2a`, POST paging via `next` link, `limit=200` (500 returns HTTP 500 — measured 2026-09-15).
-- Seed: `https://data.source.coop/cholmes/stac-geoparquet-public/slim/s2-stac.parquet` (28,146,662 rows, 2015-07-04 → 2024-06-24).
+- ALL data comes from Earth Search (spec Amendment 1): full-archive backfill 2015-06 → present, 51,254,668 items measured 2026-09-15. The old seed parquet (`…/cholmes/stac-geoparquet-public/slim/s2-stac.parquet`) is Planetary Computer STAC — cross-check only, never a data source.
 - Dedupe rule everywhere parts are built: keep one row per `id`, preferring highest `s2:generation_time` (NULLS LAST).
 - CI gates from the template are law: `python3 tests/run_all.py`, `rashid`, `stac-check`. Never widen a conformance allow-list.
 - Workflows use OIDC role `arn:aws:iam::939788573396:role/source-coop-portolan-mirrors` (trust policy already admits every portolan-mirrors repo) — no new secrets.
 - Data files never enter git. Generated metadata (collection extents, year items) is committed once as a stable baseline; scheduled runs restamp and upload without committing (firms model).
-- Commit messages end with:
+- Commit messages end with these two trailer lines:
   `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
+  `Claude-Session: https://claude.ai/code/session_017HujiaQsbAPviGWJG16fuJ`
 
 ---
 
@@ -87,65 +88,60 @@ Confirm CI is green on GitHub before proceeding: `gh run watch`.
 
 ---
 
-### Task 2: `tools/s2_schema.py` — canonical schema and COG href derivation
+### Task 2: `tools/s2_schema.py` — canonical schema and asset stripping
 
 **Files:**
 - Create: `tools/s2_schema.py`
-- Test: `tests/test_hrefs.py`
+- Test: `tests/test_schema.py`
 
 **Interfaces:**
-- Produces: `COLUMNS: list[tuple[str, str, str]]` (name, duckdb_type, description) — 44 entries; `SELECT_LIST: str` (quoted, ordered column list for DuckDB); `cog_href(item_id: str, mgrs_tile: str, dt: datetime, asset: str) -> str`; `ASSET_FILES: dict[str, str]`; `parse_mgrs(tile: str) -> tuple[str, str, str]`.
+- Produces: `COLUMNS: list[tuple[str, str, str]]` (name, duckdb_type, description) — 45 entries; `SELECT_LIST: str` (quoted, ordered column list for DuckDB).
 
 - [ ] **Step 1: Write the failing test**
 
-`tests/test_hrefs.py`:
+`tests/test_schema.py`:
 ```python
-"""The COG href template is a public contract: the app and every README
-snippet derive asset URLs from it instead of storing an assets struct.
-These tests pin the derivation and prove it against the live bucket."""
-import datetime as dt
+"""The 45-column schema contract. The assets column is a verbatim JSON
+string of the upstream assets object; the live test proves its hrefs point
+at real objects."""
+import json
 import sys
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-from s2_schema import COLUMNS, SELECT_LIST, ASSET_FILES, cog_href, parse_mgrs
+from s2_schema import COLUMNS, SELECT_LIST
 
 
-def test_parse_mgrs():
-    assert parse_mgrs("53HNV") == ("53", "H", "NV")
-    assert parse_mgrs("7VEG") == ("7", "V", "EG")   # single-digit zone
-
-
-def test_cog_href_shape():
-    href = cog_href("S2C_53HNV_20260910_0_L2A", "53HNV",
-                    dt.datetime(2026, 9, 10), "red")
-    assert href == ("https://sentinel-cogs.s3.us-west-2.amazonaws.com/"
-                    "sentinel-s2-l2a-cogs/53/H/NV/2026/9/"
-                    "S2C_53HNV_20260910_0_L2A/B04.tif")
-
-
-def test_live_hrefs_resolve():
-    """HEAD two assets on the real bucket; month must be unpadded."""
-    for asset in ("visual", "thumbnail"):
-        href = cog_href("S2C_53HNV_20260910_0_L2A", "53HNV",
-                        dt.datetime(2026, 9, 10), asset)
-        req = urllib.request.Request(href, method="HEAD")
-        assert urllib.request.urlopen(req, timeout=30).status == 200
-
-
-def test_schema_is_44_columns_geometry_last():
-    assert len(COLUMNS) == 44
+def test_schema_shape():
+    assert len(COLUMNS) == 45
     assert COLUMNS[-1][0] == "geometry"
-    assert ("_month", "TINYINT") == COLUMNS[-3][:2]
     assert ("_hilbert", "UINTEGER") == COLUMNS[-2][:2]
+    assert ("_month", "TINYINT") == COLUMNS[-3][:2]
+    assert COLUMNS[-4][0] == "assets"
     assert SELECT_LIST.split(", ")[0] == '"thumbnail_url"'
+
+
+def test_live_assets_resolve():
+    """A live Earth Search item's assets, serialized the way s2_fetch will
+    store them, must parse back and point at real objects."""
+    body = json.dumps({"collections": ["sentinel-2-l2a"], "limit": 1}).encode()
+    req = urllib.request.Request(
+        "https://earth-search.aws.element84.com/v1/search", data=body,
+        headers={"Content-Type": "application/json"})
+    f = json.load(urllib.request.urlopen(req, timeout=60))["features"][0]
+    a = json.loads(json.dumps(f["assets"], separators=(",", ":")))
+    assert len(a) >= 30                       # full object, nothing stripped
+    assert a["red"]["eo:bands"][0]["name"] == "B04"
+    for key in ("red", "visual", "thumbnail"):
+        r = urllib.request.Request(a[key]["href"], method="HEAD")
+        assert urllib.request.urlopen(r, timeout=30).status == 200
 ```
 
 - [ ] **Step 2: Run it to make sure it fails**
 
 ```bash
-python3 -m pytest tests/test_hrefs.py -v
+python3 -m pytest tests/test_schema.py -v
 ```
 Expected: FAIL (`ModuleNotFoundError: s2_schema`).
 
@@ -153,45 +149,17 @@ Expected: FAIL (`ModuleNotFoundError: s2_schema`).
 
 ```python
 #!/usr/bin/env python3
-"""Canonical published schema and asset-href derivation.
+"""Canonical published schema.
 
-The item index carries no `assets` struct: Earth Search COG paths are
-deterministic, so clients derive them. This module is the single source of
-truth for both the column list (seed-file order, helpers before geometry)
-and the href template, and the collection metadata is generated from it.
+Assets ship as a JSON string column holding the upstream assets object
+verbatim, never a nested struct: deep struct nesting made earlier parquets
+hard to open, and a string keeps every reader's schema flat. Verbatim
+because it is nearly free — measured 179 B/row under zstd-22 with
+clustered ordering — and lossless beats clever. This module is the single
+source of truth for the column list; collection metadata is generated
+from it.
 """
 from __future__ import annotations
-
-import datetime as _dt
-import re
-
-COG_BASE = "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs"
-
-# Earth Search asset key -> filename inside the scene prefix.
-ASSET_FILES = {
-    "coastal": "B01.tif", "blue": "B02.tif", "green": "B03.tif",
-    "red": "B04.tif", "rededge1": "B05.tif", "rededge2": "B06.tif",
-    "rededge3": "B07.tif", "nir": "B08.tif", "nir08": "B8A.tif",
-    "nir09": "B09.tif", "swir16": "B11.tif", "swir22": "B12.tif",
-    "aot": "AOT.tif", "scl": "SCL.tif", "visual": "TCI.tif",
-    "wvp": "WVP.tif", "thumbnail": "preview.jpg",
-}
-
-_MGRS = re.compile(r"^(\d{1,2})([C-X])([A-Z]{2})$")
-
-
-def parse_mgrs(tile: str) -> tuple[str, str, str]:
-    m = _MGRS.match(tile)
-    if not m:
-        raise ValueError(f"not an MGRS tile id: {tile!r}")
-    return m.group(1), m.group(2), m.group(3)
-
-
-def cog_href(item_id: str, mgrs_tile: str, dt: _dt.datetime, asset: str) -> str:
-    zone, band, square = parse_mgrs(mgrs_tile)
-    # Month is unpadded in the bucket layout: .../2026/9/, never /09/.
-    return (f"{COG_BASE}/{zone}/{band}/{square}/{dt.year}/{dt.month}/"
-            f"{item_id}/{ASSET_FILES[asset]}")
 
 
 # (name, duckdb type, description). Order is the seed file's order with the
@@ -240,6 +208,9 @@ COLUMNS = [
     ("s2:reflectance_conversion_factor", "DOUBLE", "Sun-distance reflectance factor."),
     ("s2:medium_proba_clouds_percentage", "DOUBLE", "Scene classification percentage."),
     ("s2:saturated_defective_pixel_percentage", "DOUBLE", "Scene classification percentage."),
+    ("assets", "VARCHAR",
+     "The upstream STAC assets object, verbatim, as a compact JSON string. "
+     "Parse with json_extract or JSON.parse."),
     ("_month", "TINYINT", "month(datetime); first sort key. Query helper, not STAC."),
     ("_hilbert", "UINTEGER",
      "ST_Hilbert(geometry, world bounds); second sort key. Query helper, not STAC."),
@@ -252,16 +223,16 @@ SELECT_LIST = ", ".join(f'"{name}"' for name, _, _ in COLUMNS)
 - [ ] **Step 4: Run the tests**
 
 ```bash
-python3 -m pytest tests/test_hrefs.py -v
+python3 -m pytest tests/test_schema.py -v
 ```
-Expected: 4 passed (network required for `test_live_hrefs_resolve`; if the
-network is down, fix the network, don't skip the test).
+Expected: 2 passed (network required for `test_live_assets_resolve`;
+if the network is down, fix the network, don't skip the test).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tools/s2_schema.py tests/test_hrefs.py
-git commit -m "feat: canonical item schema and COG href derivation
+git add tools/s2_schema.py tests/test_schema.py
+git commit -m "feat: canonical item schema with assets as a JSON string
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
@@ -315,7 +286,10 @@ def test_normalize_covers_every_column():
     row = normalize(_one_feature())
     want = {c[0] for c in DATA_COLUMNS if c[0] != "geometry"} | {"_geometry_json"}
     assert set(row) == want
-    assert row["s2:mgrs_tile"] and row["thumbnail_url"].endswith("preview.jpg")
+    assert row["s2:mgrs_tile"] and row["thumbnail_url"].startswith("https://")
+    a = json.loads(row["assets"])
+    assert "red" in a and a["red"]["href"].startswith("https://")
+    assert "eo:bands" in a["red"]              # verbatim, nothing stripped
     assert row["sat:relative_orbit"] is not None      # parsed from product_uri
     assert isinstance(row["s2:mean_solar_zenith"], float)
 
@@ -421,6 +395,7 @@ def normalize(f: dict) -> dict:
         zen = 90.0 - p["view:sun_elevation"]
     azi = p.get("s2:mean_solar_azimuth", p.get("view:sun_azimuth"))
     row = {
+        "assets": json.dumps(f.get("assets", {}), separators=(",", ":")),
         "thumbnail_url": (f.get("assets", {}).get("thumbnail") or {}).get("href"),
         "type": "Feature",
         "stac_version": f.get("stac_version"),
@@ -556,7 +531,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: chunk parquet from `s2_fetch.py` (canonical minus helpers) and/or the seed file (same shape).
-- Produces: CLI `python3 tools/s2_build.py --sources <file-or-dir> [<...>] --years 2024,2025 --out ./staging/publish/sentinel-2-l2a [--name live.parquet] [--memory 8GB]` writing `year=<Y>/<name>` (default `items.parquet`), deduped by id (max `s2:generation_time` NULLS LAST), sorted `(_month, _hilbert)`, GeoParquet 2.0 via `gpio sort column`, zstd 22 (items) / 15 (live). Exposes `build_year(con, files, year, outdir, name) -> int`.
+- Produces: CLI `python3 tools/s2_build.py --sources <file-or-dir> [<...>] --years 2024,2025 --out ./staging/publish/sentinel-2-l2a [--name live.parquet] [--memory 8GB]` writing `year=<Y>/<name>` (default `items.parquet`), deduped by id (max `s2:generation_time` NULLS LAST), sorted `(_month, _hilbert)`, GeoParquet 2.0 via `gpio sort column`, zstd 22 for every part. Exposes `build_year(con, files, year, outdir, name) -> int`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -665,6 +640,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from s2_schema import COLUMNS
 
 ROW_GROUP = 100_000
+# 22 everywhere, live.parquet included: distribution best practices say go as
+# high as you have time for, and the user said crank it (2026-09-15). zstd
+# decompression cost is flat across levels, so clients pay nothing.
+ZSTD_LEVEL = 22
 WORLD = "ST_Extent(ST_MakeEnvelope(-180, -90, 180, 90))"
 
 
@@ -709,7 +688,7 @@ def _select(con, lst: str) -> str:
 
 
 def build_year(con, files: list[str], year: int, outdir: Path,
-               name: str = "items.parquet", zstd: int = 22) -> int:
+               name: str = "items.parquet") -> int:
     lst = ",".join(f"'{f}'" for f in files)
     dest = outdir / f"year={year}"
     dest.mkdir(parents=True, exist_ok=True)
@@ -740,7 +719,7 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         r = subprocess.run(
             ["gpio", "sort", "column", str(staged), str(final),
              "_month,_hilbert", "--geoparquet-version", "2.0",
-             "--compression", "zstd", "--compression-level", str(zstd),
+             "--compression", "zstd", "--compression-level", str(ZSTD_LEVEL),
              "--row-group-size", str(ROW_GROUP)],
             capture_output=True, text=True)
         if r.returncode != 0:
@@ -768,7 +747,6 @@ def main() -> int:
     con = connect(a.memory, tmp)
     files = gather(a.sources)
 
-    zstd = 15 if a.name == "live.parquet" else 22
     if a.years:
         years = [int(y) for y in a.years.split(",")]
     else:
@@ -780,7 +758,7 @@ def main() -> int:
 
     total = 0
     for y in years:
-        total += build_year(con, files, y, outdir, a.name, zstd)
+        total += build_year(con, files, y, outdir, a.name)
     print(f"TOTAL {total:,} rows across {len(years)} part(s)")
     if total == 0:
         print("no rows matched: nothing was written", file=sys.stderr)
@@ -810,75 +788,53 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 5: Repartition the seed archive locally
+### Task 5: Pilot slice — validate the pipeline end-to-end locally
 
 **Files:**
-- Create: `tools/s2_repartition.sh` (thin driver; the logic lives in `s2_build.py`)
-- Output (NOT committed): `../s2-staging/publish/sentinel-2-l2a/year=2015..2024/items.parquet`
+- Output (NOT committed): `../s2-staging/publish/sentinel-2-l2a/year=<current>/items.parquet` built from a two-day fetch
 
 **Interfaces:**
-- Consumes: `s2_build.py` CLI.
-- Produces: staged year parts 2015–2024 on local disk for Task 7's upload. 2024 is provisional (seed truncates at 2024-06-24) and is rebuilt in Task 8 when backfill chunks exist.
+- Consumes: `s2_fetch.py`, `s2_build.py` CLIs.
+- Produces: a real staged year part for Task 6's generator development; confidence that fetch → build → query works before committing 135 workflow slices to it.
 
-- [ ] **Step 1: Write `tools/s2_repartition.sh`**
-
-```bash
-#!/usr/bin/env bash
-# One-time: download the 7 GB seed and cut it into sorted year parts.
-# Runs locally (needs ~25 GB free disk and an hour or two), never in CI.
-set -euo pipefail
-STAGING="${1:-../s2-staging}"
-SEED="$STAGING/s2-stac.parquet"
-mkdir -p "$STAGING"
-if [ ! -s "$SEED" ]; then
-  curl -fSL --retry 5 -o "$SEED" \
-    "https://data.source.coop/cholmes/stac-geoparquet-public/slim/s2-stac.parquet"
-fi
-python3 "$(dirname "$0")/s2_build.py" \
-  --sources "$SEED" \
-  --out "$STAGING/publish/sentinel-2-l2a" \
-  --memory 12GB
-```
+- [ ] **Step 1: Fetch two recent days**
 
 ```bash
-chmod +x tools/s2_repartition.sh
+python3 tools/s2_fetch.py --start 2026-09-12 --end 2026-09-13 \
+  --out ../s2-staging/chunks
 ```
+Expected: two chunk files, ~4-6k rows each, no schema assertion failures.
 
-- [ ] **Step 2: Run it**
+- [ ] **Step 2: Build the pilot year part**
 
 ```bash
-./tools/s2_repartition.sh 2>&1 | tee ../s2-staging/repartition.log
+python3 tools/s2_build.py --sources ../s2-staging/chunks \
+  --out ../s2-staging/publish/sentinel-2-l2a
 ```
-Expected: ten `year=YYYY/items.parquet` lines (2015–2024), TOTAL 28,146,662
-rows (exact — dedupe should discard nothing from the seed; if the total is
-lower, count duplicates in the seed first and record the number in the commit
-message rather than assuming a bug).
+Expected: one `year=2026/items.parquet` (rows from the two days).
 
-- [ ] **Step 3: Spot-check pruning behaves**
+- [ ] **Step 3: Spot-check pruning and assets**
 
 ```bash
 python3 - << 'CHECK'
-import duckdb, time
-con = duckdb.connect(); con.execute("INSTALL spatial; LOAD spatial;")
-f = "../s2-staging/publish/sentinel-2-l2a/year=2021/items.parquet"
+import duckdb, json, time
+con = duckdb.connect(); con.execute("INSTALL spatial; LOAD spatial; SET TimeZone='UTC';")
+f = "../s2-staging/publish/sentinel-2-l2a/year=2026/items.parquet"
+tile = con.execute(f'SELECT "s2:mgrs_tile" FROM read_parquet(\'{f}\') LIMIT 1').fetchone()[0]
 t0 = time.time()
-n = con.execute(f"""
-  SELECT count(*) FROM read_parquet('{f}')
-  WHERE "s2:mgrs_tile" = '31UFU' AND _month BETWEEN 4 AND 6
-    AND "eo:cloud_cover" < 10""").fetchone()[0]
-print(n, "rows", round(time.time() - t0, 2), "s")
+row = con.execute(f"""
+  SELECT id, "eo:cloud_cover", assets FROM read_parquet('{f}')
+  WHERE "s2:mgrs_tile" = '{tile}' LIMIT 1""").fetchone()
+print(row[0], row[1], round(time.time() - t0, 2), "s")
+a = json.loads(row[2])
+assert a["red"]["href"].startswith("https://"), a["red"]
+print("assets ok:", len(a), "keys")
 CHECK
 ```
-Expected: a few dozen rows, well under 5 s.
+Expected: sub-second, assets parse with 30+ keys.
 
-- [ ] **Step 4: Commit the driver**
-
-```bash
-git add tools/s2_repartition.sh
-git commit -m "feat: seed archive repartition driver
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
-```
+- [ ] **Step 4: Ledger note** — record the pilot's row counts in the SDD
+ledger (no repo commit; the staging dir is git-ignored territory).
 
 ---
 
@@ -890,7 +846,8 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Modify: `catalog/catalog.json` (add `child` link `./sentinel-2-l2a/collection.json`)
 
 **Interfaces:**
-- Consumes: staged parts in `../s2-staging/publish/sentinel-2-l2a/` (Task 5), `s2_schema.COLUMNS`.
+- Consumes: the pilot-staged part in `../s2-staging/publish/sentinel-2-l2a/` (Task 5), `s2_schema.COLUMNS`.
+- Note: the committed collection/item baseline is generated from the PILOT part, so its extents/counts are provisional until the backfill publishes (Task 8 regenerates and recommits from the published record). Gates must still pass on the provisional baseline. Do NOT publish anything in this task.
 - Produces: `python3 tools/make_items.py --data-dir <staged>` and `python3 tools/make_collection.py --data-dir <staged>` regenerate the committed JSON; every scheduled workflow calls both then uploads.
 
 Both generators follow `~/repos/firms-catalog/tools/make_items.py` and
@@ -905,20 +862,22 @@ fully specified here:
 - `partition:scheme: "hive"`, `partition:strategy: "temporal"`, `partition:keys: [{"name": "year", "type": "int32", "description": "Year of acquisition (UTC)."}]`, `partition:glob: "<S3>/sentinel-2-l2a/year=*/*.parquet"` (the `*` part name covers `items.parquet` and `live.parquet`), `partition:file_count` counted from the staged/published parts.
 - `table:primary_geometry: "geometry"`, `table:row_count` summed from parquet footers, `table:columns` generated from `s2_schema.COLUMNS` (name/type/description — this is why descriptions live there).
 - `stac_extensions`: same five as firms' collection.json.
+- `item_assets`: generated once from a live fetch of `https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a` (documentation of the per-asset band metadata, mirrored for STAC clients that expect it at collection level; the per-item `assets` column is verbatim and self-sufficient); cache it as `tools/item_assets.json` committed to the repo so the generator never needs the network.
 - Links: root/parent `../catalog.json`, `describedby ./README.md`, `agents ./AGENTS.md`, `via https://earth-search.aws.element84.com/v1` and `via https://registry.opendata.aws/sentinel-2-l2a-cogs/`, `preview` → APP, one `item` link per `year=YYYY/YYYY.json`.
 - Extent: spatial `[-180, -90, 180, 90]`; temporal measured from the parts' datetime row-group stats (min of first year, max of last part including live).
 - No `self` link (Portolan forbids it; ignore the stac-check nag).
 
 **`make_items.py` requirements:** one item per year directory, id `"YYYY"`, `collection: "sentinel-2-l2a"`, geometry = bbox polygon of that year's parts (from GeoParquet metadata, no scan), `properties`: `title: "Sentinel-2 L2A scenes, YYYY"`, `start_datetime`/`end_datetime` from row-group stats, `table:row_count` from footers, `s2:platforms` from a `DISTINCT platform` scan of that year (cheap: one column). Assets: `data` → `./items.parquet` (`application/vnd.apache.parquet`, role `data`, `file:size`) and, when present, `live` → `./live.parquet` (roles `["data"]`, title "Rolling tail since the last consolidation, refreshed daily"). Current year's item spans both parts.
 
-**`AGENTS.md` must document** (agent-facing contract): the canonical schema incl. `_month`/`_hilbert` (what they are, that they are helpers, sort order `(_month,_hilbert)`); the dedupe rule; the COG href template with the unpadded-month warning, `ASSET_FILES` table, and a worked example; that `sat:orbit_state`/`s2:granule_id` are NULL on newer items and why; the DuckDB query pattern (filter `s2:mgrs_tile` + `_month`/`datetime` + `eo:cloud_cover`, hive-partition on year).
+**`AGENTS.md` must document** (agent-facing contract): the canonical schema incl. `_month`/`_hilbert` (what they are, that they are helpers, sort order `(_month,_hilbert)`); the dedupe rule; the `assets` JSON-string contract (every asset key, fields href/type/title/roles/gsd, band metadata in collection `item_assets`, parse with `json_extract_string`); that `sat:orbit_state`/`s2:granule_id` are NULL on newer items and why; that coverage is partial before Dec 2018 (no 2015-16, partial 2017-18) because that is what Earth Search/AWS serves; the DuckDB query pattern (filter `s2:mgrs_tile` + `_month`/`datetime` + `eo:cloud_cover`, hive-partition on year). Update `catalog/README.md`'s seed-era claims (28.1M rows / 2024-06-24 end) to the Earth Search record while in here.
 
 **`README.md` must include** the FTW-style snippet, verbatim:
 
 ```sql
 -- Cloud-free scenes over a field during harvest, no API, no rate limits.
 INSTALL spatial; LOAD spatial;
-SELECT id, datetime, "eo:cloud_cover", thumbnail_url
+SELECT id, datetime, "eo:cloud_cover", thumbnail_url,
+       json_extract_string(assets, '$.visual.href') AS visual_cog
 FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet', hive_partitioning=true)
 WHERE year IN (2021)
   AND "s2:mgrs_tile" = '31UFU'
@@ -926,7 +885,7 @@ WHERE year IN (2021)
   AND "eo:cloud_cover" < 10
 ORDER BY "eo:cloud_cover" LIMIT 20;
 ```
-plus the Python `cog_href` example building `B04.tif` from a result row.
+plus one line of prose: every asset href is in the `assets` JSON-string column — no URL templates, no API.
 
 - [ ] **Step 1: Write `tools/make_collection.py` and `tools/make_items.py`** per the requirements above (start from the firms versions; strip FIRMS availability/sensor logic; keep the footer-statistics approach and the Source Coop `User-Agent` workaround).
 
@@ -966,81 +925,95 @@ git push && gh run watch
 
 ---
 
-### Task 7: First publish — seed data + catalog (USER GATE)
+### Task 7: Access smoke test — prove CI can write the bucket
 
-**Files:** none (uploads only).
+**Files:**
+- Create: `.github/workflows/check-access.yml` (manual-dispatch only)
 
 **Interfaces:**
-- Consumes: staged parts, `tools/upload_data.py`, `tools/publish.py`.
-- Produces: live catalog at `https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json`.
+- Produces: verified OIDC write access from this repo to the Source Coop prefix, before a multi-day backfill depends on it. Credentials are the same as firms-catalog: role `arn:aws:iam::939788573396:role/source-coop-portolan-mirrors`, no repo secrets (user-confirmed 2026-09-15; the source.coop repository `portolan-mirrors/sentinel-2-catalog` exists).
 
-- [ ] **Step 1: USER GATE — ask the user to:**
-  1. Create the Source Cooperative repository `portolan-mirrors/sentinel-2-catalog` (they offered).
-  2. Confirm which local AWS profile can write the prefix (no `portolan-mirrors` profile exists locally; `source-coop` and `source-coop-uploader` do — the profile named in `catalog.publish.yaml` must match reality, or they export fresh creds).
-Do not proceed past this step without their answer.
+- [ ] **Step 1: Write `.github/workflows/check-access.yml`**
 
-- [ ] **Step 2: Upload the data (dry run first)**
+```yaml
+name: check-access
+
+# One-shot manual smoke test: assume the Source Cooperative role and write
+# + delete a marker object, so the multi-day backfill never discovers an
+# access problem on its final step.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Assume the Source Cooperative write role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: sentinel-2-catalog-access-check
+          aws-region: us-west-2
+      - name: Round-trip a marker object
+        run: |
+          set -euo pipefail
+          P=s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/_access-check
+          date -u | aws s3 cp - "$P"
+          aws s3 ls "$P"
+          aws s3 rm "$P"
+```
+
+- [ ] **Step 2: Commit, push, dispatch, verify**
 
 ```bash
-python3 tools/upload_data.py --data-dir ../s2-staging/publish
-python3 tools/upload_data.py --confirm --data-dir ../s2-staging/publish
+git add .github/workflows/check-access.yml
+git commit -m "feat: OIDC access smoke test for the publish role
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017HujiaQsbAPviGWJG16fuJ"
+git push
+gh workflow run check-access.yml && sleep 20 && gh run watch --exit-status
 ```
-Expected: ~10 objects, ~7 GB total. Re-runnable; template tool skips
-unchanged objects.
-
-- [ ] **Step 3: Publish the catalog**
-
-```bash
-python3 tools/publish.py            # dry run: review the file list
-python3 tools/publish.py --confirm
-```
-
-- [ ] **Step 4: Verify from the outside**
-
-```bash
-curl -fsSL https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json | python3 -m json.tool | head
-python3 - << 'CHECK'
-import duckdb
-con = duckdb.connect(); con.execute("INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
-print(con.execute("""
-  SELECT count(*) FROM read_parquet(
-    'https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=2021/items.parquet')
-  WHERE "s2:mgrs_tile" = '31UFU' AND _month = 6""").fetchone())
-CHECK
-```
-Expected: catalog JSON renders; the remote query returns in seconds.
-
-- [ ] **Step 5: Check the published catalog in the Portolan browser** —
-open `https://browser.portolan-sdi.org/#/external/data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json` and confirm the collection renders. Report the URL to the user.
+Expected: green. If the role assumption fails, STOP and report to the user
+(likely the role trust policy or the source.coop repository provisioning).
 
 ---
 
-### Task 8: Backfill workflows — close the 2024-06 → present gap
+### Task 8: Backfill workflows — fetch the whole Earth Search record
 
 **Files:**
 - Create: `.github/workflows/backfill.yml`, `.github/workflows/publish-backfill.yml`
 
 **Interfaces:**
 - Consumes: `s2_fetch.py`, `s2_build.py`, `make_items.py`, `make_collection.py`, `upload_data.py`, `publish.py`.
-- Produces: per-month-slice workflow artifacts named `slice-YYYY-MM`; published `year=2024..2026` parts covering the full record.
+- Produces: per-month-slice workflow artifacts named `slice-YYYY-MM` (2015-06 → current month, ~135 slices, ~51.25M items, roughly 2-3 days of wall clock at max-parallel 2); the FIRST publish of the catalog — all year parts plus regenerated metadata.
 
 - [ ] **Step 1: Write `.github/workflows/backfill.yml`**
 
 ```yaml
 name: backfill
 
-# Fetch the Earth Search record one month-slice at a time. Earth Search has
-# no published transaction budget, but a whole-month slice is ~450k items /
-# ~2.3k requests, so max-parallel 2 keeps us polite and each slice well
-# inside the 6-hour job cap. Slices publish workflow artifacts (no cloud
-# credentials here); publish-backfill.yml does the short credentialed merge.
+# Fetch the whole Earth Search record one month-slice at a time (the seed
+# parquet turned out to be Planetary Computer STAC — see spec Amendment 1 —
+# so everything comes from Earth Search). No published transaction budget,
+# but a whole-month slice is ~450k items / ~2.3k requests, so max-parallel 2
+# keeps us polite and each slice well inside the 6-hour job cap. Slices
+# publish workflow artifacts (no cloud credentials here);
+# publish-backfill.yml does the credentialed merge. Empty early months
+# (2015-16 have ~no AWS L2A) cost one request and a sentinel artifact.
 
 on:
   workflow_dispatch:
     inputs:
       start:
         description: "First month (YYYY-MM)"
-        default: "2024-06"
+        default: "2015-06"
       end:
         description: "Last month (YYYY-MM), blank = current month"
         default: ""
@@ -1124,12 +1097,12 @@ jobs:
 
 Model on `~/repos/firms-catalog/.github/workflows/publish-backfill.yml` (read
 it first), with these specifics:
-- `workflow_dispatch` with input `years` (default `2024,2025,2026`).
+- `workflow_dispatch` with input `years` (blank default = every year found in the downloaded chunks).
 - `permissions: {contents: read, id-token: write}`; `concurrency: {group: catalog-write, cancel-in-progress: false}`.
-- Steps: checkout; setup-python 3.12; `pip install --quiet duckdb boto3 geoparquet-io 'rashid>=0.1.8,<0.2.0' stac-check`; download all `slice-*` artifacts (`actions/download-artifact@v4` with `pattern: slice-*`, `path: staging/chunks/api`, `merge-multiple: true`); **also pull the published 2024 part into the build inputs** so seed rows merge with fetched rows:
-  `curl -fSL -o staging/seed-2024.parquet https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=2024/items.parquet`;
-  `python3 tools/s2_build.py --sources staging/chunks/api staging/seed-2024.parquet --years <years> --out staging/publish/sentinel-2-l2a --memory 12GB`;
+- Steps: checkout; setup-python 3.12; `pip install --quiet duckdb boto3 geoparquet-io 'rashid>=0.1.8,<0.2.0' stac-check`; download all `slice-*` artifacts (`actions/download-artifact@v4` with `pattern: slice-*`, `path: staging/chunks/api`, `merge-multiple: true`);
+  `python3 tools/s2_build.py --sources staging/chunks/api --out staging/publish/sentinel-2-l2a --memory 12GB` (add `--years` only when the input is set);
   `python3 tools/make_items.py --data-dir staging/publish/sentinel-2-l2a`; `python3 tools/make_collection.py --data-dir staging/publish/sentinel-2-l2a`; `python3 tests/run_all.py` (with the template's `CI_LIGHT` env if firms uses it); assume the OIDC role exactly as firms does (`role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors`, `aws-region: us-west-2`); `python3 tools/upload_data.py --confirm --data-dir staging/publish`; `python3 tools/publish.py --confirm`.
+  Disk: ~135 chunk artifacts + built years is large; use the `runs-on: ubuntu-latest` 14 GB free tier carefully — build and upload one year at a time in a loop (`for Y in $(seq 2015 2026)`), deleting each year's staged part after upload, and download artifacts per-year batches if space runs out.
 
 - [ ] **Step 3: Commit, push, and run**
 
@@ -1141,13 +1114,21 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 git push
 gh workflow run backfill.yml
 ```
-Monitor with `gh run list --workflow backfill.yml`. When all ~28 slices are
-green, `gh workflow run publish-backfill.yml`, then re-verify the published
-temporal extent reaches the current week:
+Monitor with `gh run list --workflow backfill.yml`. This runs for days;
+continue with later tasks meanwhile. When all ~135 slices are green,
+`gh workflow run publish-backfill.yml`, then verify the published temporal
+extent reaches the current week:
 ```bash
 curl -fsSL https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/collection.json \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['extent']['temporal'])"
 ```
+
+- [ ] **Step 4: Recommit the real baseline** — after publish-backfill is
+green, regenerate `make_items`/`make_collection` locally against the
+published record (the generators read parquet footers over HTTP; pass the
+public base as data source per their `--remote-baseline` support), replace
+the provisional pilot-derived metadata in `catalog/`, run the gates, commit
+and push.
 
 ---
 
@@ -1788,37 +1769,14 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `apps/explorer/app.js` (append), `apps/explorer/index.html` (already has the controls)
-- Create: `apps/explorer/hrefs.js`
 
 **Interfaces:**
 - Consumes: `window.S2.conn`, layer `mgrs-fill`, controls `#date0 #date1 #maxcloud #run`, containers `#results #api #sql`.
-- Produces: the working hero flow: click tile → date window → ranked scenes with thumbnails + COG links; `cogHref(id, tile, isoDatetime, asset)` in `hrefs.js` (mirror of `tools/s2_schema.py` — keep the two in sync, both cite each other in a comment).
+- Produces: the working hero flow: click tile → date window → ranked scenes with thumbnails + COG links, every href read straight from the row's `assets` JSON-string column (no URL templates anywhere in the app).
 
-- [ ] **Step 1: Write `apps/explorer/hrefs.js`**
-
-```js
-// Mirror of tools/s2_schema.py::cog_href — change both together.
-const COG_BASE = "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs";
-export const ASSET_FILES = {
-  coastal: "B01.tif", blue: "B02.tif", green: "B03.tif", red: "B04.tif",
-  rededge1: "B05.tif", rededge2: "B06.tif", rededge3: "B07.tif",
-  nir: "B08.tif", nir08: "B8A.tif", nir09: "B09.tif",
-  swir16: "B11.tif", swir22: "B12.tif", aot: "AOT.tif", scl: "SCL.tif",
-  visual: "TCI.tif", wvp: "WVP.tif", thumbnail: "preview.jpg",
-};
-export function cogHref(id, tile, iso, asset) {
-  const m = tile.match(/^(\d{1,2})([C-X])([A-Z]{2})$/);
-  const d = new Date(iso);
-  // Month is unpadded in the bucket layout.
-  return `${COG_BASE}/${m[1]}/${m[2]}/${m[3]}/${d.getUTCFullYear()}/${d.getUTCMonth() + 1}/${id}/${ASSET_FILES[asset]}`;
-}
-```
-
-- [ ] **Step 2: Append the query flow to `app.js`**
+- [ ] **Step 1: Append the query flow to `app.js`**
 
 ```js
-import { cogHref } from "./hrefs.js";
-
 let selectedTile = null;
 const CURRENT_YEAR = new Date().getUTCFullYear();
 
@@ -1845,8 +1803,7 @@ async function runQuery() {
   if (!selectedTile || !d0 || !d1) return;
   const urls = partUrls(Number(d0.slice(0, 4)), Number(d1.slice(0, 4)));
   const sql = `
-    SELECT id, datetime, "eo:cloud_cover" AS cloud, thumbnail_url,
-           "s2:mgrs_tile" AS tile
+    SELECT id, datetime, "eo:cloud_cover" AS cloud, thumbnail_url, assets
     FROM read_parquet([${urls.map(u => `'${u}'`).join(", ")}], union_by_name=true)
     WHERE "s2:mgrs_tile" = '${selectedTile}'
       AND _month BETWEEN ${Number(d0.slice(5, 7))} AND ${Number(d1.slice(5, 7))}
@@ -1878,17 +1835,18 @@ async function runQuery() {
   }
   rows.forEach((r, i) => {
     const iso = new Date(Number(r.datetime)).toISOString();
+    const assets = JSON.parse(r.assets);
     const card = document.createElement("div");
     card.className = "scene" + (i === 0 ? " best" : "");
     const img = Object.assign(document.createElement("img"),
       { src: r.thumbnail_url, loading: "lazy", alt: r.id });
     const cap = document.createElement("div");
+    const link = (key, label) => assets[key]
+      ? `<a href="${assets[key].href}">${label}</a>` : "";
     cap.innerHTML = `<b>${r.id}</b><br>${iso.slice(0, 10)} ·
       ${Number(r.cloud).toFixed(1)}% cloud<br>
-      <a href="${cogHref(r.id, r.tile, iso, "visual")}">TCI</a>
-      <a href="${cogHref(r.id, r.tile, iso, "red")}">B04</a>
-      <a href="${cogHref(r.id, r.tile, iso, "nir")}">B08</a>
-      <a href="${cogHref(r.id, r.tile, iso, "scl")}">SCL</a>`;
+      ${link("visual", "TCI")} ${link("red", "B04")}
+      ${link("nir", "B08")} ${link("scl", "SCL")}`;
     card.append(img, cap);
     box.append(card);
   });
@@ -1909,7 +1867,7 @@ returns rows (month predicate widened).
 
 ```bash
 git add apps/explorer
-git commit -m "feat: parquet-powered scene query with derived COG links
+git commit -m "feat: parquet-powered scene query, hrefs from the assets column
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
@@ -1975,8 +1933,10 @@ counts, and cadence to the user.
 
 - Tasks 1→7 are strictly ordered. Task 8 needs 7; Task 9 needs 8 published
   (stats over the full record); 10 needs 9; 11-13 need 9 published; 14 last.
-- USER GATES: Task 7 step 1 (Source Coop repo + creds). Task 1 stops if org
-  rights are missing. Backfill (Task 8) runs ~a day of wall clock across
-  slices — start it, then continue with Task 9 against the seed years and
-  re-run stats after publish-backfill lands.
-- Local disk needed: ~25 GB under `../s2-staging`.
+- Gates already cleared by the user (2026-09-15): source.coop repository
+  created; credentials = the firms-catalog OIDC role, no secrets. Task 7's
+  smoke test still runs before the backfill; stop only if it fails.
+- Backfill (Task 8) runs 2-3 days of wall clock. Start it, then develop
+  Task 9's stats tooling against the pilot staging; run the real stats
+  build and everything downstream after publish-backfill lands.
+- Local disk needed: ~2 GB under `../s2-staging` (pilot only).

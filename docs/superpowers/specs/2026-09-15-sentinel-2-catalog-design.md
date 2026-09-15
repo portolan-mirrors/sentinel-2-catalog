@@ -225,3 +225,20 @@ Decisions replacing the affected parts of this spec:
    convenience column (extracted from `assets.thumbnail.href`).
 4. Published schema is therefore 45 columns: the 42 prior data columns,
    then `assets`, `_month`, `_hilbert`, `geometry`.
+
+## Amendment 2 — 2026-09-15 (user + measurement)
+
+Amendment 1's asset stripping is dropped. Measured on 600 real items in
+zstd-22 parquet with tile-clustered ordering (the published files' regime),
+the **full** assets object costs 179 B/row compressed (~9 GB across 51M
+items) against 96-122 B/row for stripped variants — the savings do not pay
+for lossiness or client-side reconstruction. Decisions:
+
+1. `assets VARCHAR` stores the complete upstream assets object verbatim as
+   compact JSON. Clients get everything with one parse; nothing to merge.
+2. The `links` column keeps each item's non-paging links — including
+   `self` (Earth Search API item) and `canonical` (static item JSON on the
+   sentinel-cogs bucket) — so every row also points at its full source
+   STAC item.
+3. The collection still publishes `item_assets` (cached from Earth Search)
+   as documentation, not as a reconstruction dependency.
