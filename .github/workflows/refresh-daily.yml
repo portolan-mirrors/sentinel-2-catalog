@@ -1,0 +1,112 @@
+name: refresh-daily
+
+# Pull the last few days of Earth Search items into the current year's
+# live.parquet, splice the current year into the stats table, restamp
+# extents/counts, upload. Nothing is committed: the repository keeps only
+# the stable catalog definition (firms-catalog model).
+#
+# The 5-day lookback covers Sentinel-2's hours-to-days publication latency;
+# the dedupe rule in s2_build makes re-fetched days harmless.
+#
+# Bootstrap guard: on a fresh repo nothing is published yet (the backfill
+# and publish-backfill pipeline runs once, separately, to seed the catalog).
+# The first step here probes for catalog.json and every other step is
+# gated on that succeeding, so the scheduled cron is a green no-op --
+# not a daily red X -- until the first publish lands.
+
+on:
+  schedule:
+    - cron: "42 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: catalog-write
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check the catalog is published
+        id: guard
+        run: |
+          set -uo pipefail
+          if curl -fsI https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json > /dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::catalog not yet published; nothing to refresh"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.published == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.published == 'true'
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          pip install --quiet duckdb boto3 geoparquet-io \
+            'rashid>=0.1.8,<0.2.0' stac-check
+      - name: Fetch the lookback window
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          START=$(date -u -d "5 days ago" +%F)
+          END=$(date -u +%F)
+          python3 tools/s2_fetch.py --start "$START" --end "$END" \
+            --out ./staging/chunks
+      - name: Rebuild the live part
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          Y=$(date -u +%Y)
+          BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
+          # Merge with the existing live part so a fetch gap never truncates
+          # it; the year part is the floor the dedupe rule resolves against.
+          curl -fSL -o staging/live-prev.parquet "$BASE/year=$Y/live.parquet" \
+            || rm -f staging/live-prev.parquet
+          SRC="./staging/chunks"
+          [ -s staging/live-prev.parquet ] && SRC="$SRC staging/live-prev.parquet"
+          python3 tools/s2_build.py --sources $SRC --years "$Y" \
+            --out ./staging/publish/sentinel-2-l2a --name live.parquet
+      - name: Splice current year into stats
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          Y=$(date -u +%Y)
+          BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog
+          python3 tools/s2_stats.py \
+            --sources "$BASE/sentinel-2-l2a/year=$Y/items.parquet" \
+                      "./staging/publish/sentinel-2-l2a/year=$Y/live.parquet" \
+            --out ./staging/publish/stats \
+            --merge-years "$Y" --existing "$BASE/stats/mgrs-monthly.parquet"
+      - name: Restamp collection metadata
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          python3 tools/make_items.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
+          python3 tools/make_collection.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
+      - name: Validate before upload
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tests/run_all.py
+        env:
+          CI_LIGHT: "1"
+      - name: Assume the Source Cooperative write role
+        if: steps.guard.outputs.published == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-region: us-west-2
+      - name: Upload data
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tools/upload_data.py --confirm --data-dir ./staging/publish
+      - name: Publish catalog metadata
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tools/publish.py --confirm

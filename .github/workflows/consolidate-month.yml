@@ -1,0 +1,100 @@
+name: consolidate-month
+
+# Fold live.parquet into the year's items.parquet on the 3rd of each month
+# (the lookback has long since covered month-end by then). Rewrites one
+# year part (~a few hundred MB) and empties live.
+#
+# Bootstrap guard: same reasoning as refresh-daily.yml -- nothing is
+# published on a fresh repo until publish-backfill has run once, so the
+# first step probes for catalog.json and every other step is gated on that
+# succeeding. The monthly cron is a green no-op, not a red X, until then.
+
+on:
+  schedule:
+    - cron: "17 5 3 * *"
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Year to consolidate (blank = current)"
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: catalog-write
+  cancel-in-progress: false
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check the catalog is published
+        id: guard
+        run: |
+          set -uo pipefail
+          if curl -fsI https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json > /dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::catalog not yet published; nothing to refresh"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.published == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.published == 'true'
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        if: steps.guard.outputs.published == 'true'
+        run: pip install --quiet duckdb boto3 geoparquet-io 'rashid>=0.1.8,<0.2.0' stac-check
+      - name: Merge live into the year part
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          Y="${{ inputs.year }}"; [ -z "$Y" ] && Y=$(date -u +%Y)
+          BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
+          curl -fSL -o staging/items-prev.parquet "$BASE/year=$Y/items.parquet"
+          curl -fSL -o staging/live-prev.parquet "$BASE/year=$Y/live.parquet" \
+            || rm -f staging/live-prev.parquet
+          SRC="staging/items-prev.parquet"
+          [ -s staging/live-prev.parquet ] && SRC="$SRC staging/live-prev.parquet"
+          python3 tools/s2_build.py --sources $SRC --years "$Y" \
+            --out ./staging/publish/sentinel-2-l2a --memory 12GB
+          # Empty live: publish a zero-row live.parquet rather than deleting
+          # (publishing never deletes; a missing object would 404 in the glob
+          # clients already resolved).
+          Y="$Y" python3 - << 'EOF'
+          import duckdb, os
+          y = os.environ["Y"]
+          con = duckdb.connect(); con.execute("INSTALL spatial; LOAD spatial;")
+          src = f"staging/publish/sentinel-2-l2a/year={y}/items.parquet"
+          dst = f"staging/publish/sentinel-2-l2a/year={y}/live.parquet"
+          con.execute(f"COPY (SELECT * FROM read_parquet('{src}') LIMIT 0) TO '{dst}' (FORMAT PARQUET, COMPRESSION zstd)")
+          EOF
+      - name: Restamp collection metadata
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          python3 tools/make_items.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
+          python3 tools/make_collection.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
+      - name: Validate before upload
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tests/run_all.py
+        env:
+          CI_LIGHT: "1"
+      - name: Assume the Source Cooperative write role
+        if: steps.guard.outputs.published == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-region: us-west-2
+      - name: Upload data
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tools/upload_data.py --confirm --data-dir ./staging/publish
+      - name: Publish catalog metadata
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tools/publish.py --confirm
