@@ -2,17 +2,24 @@
   "type": "Catalog",
   "stac_version": "1.1.0",
   "stac_extensions": [
-    "https://schemas.portolan-sdi.org/portolan/v0.1.1/schema.json"
+    "https://schemas.portolan-sdi.org/portolan/v0.2.0/schema.json"
   ],
   "id": "sentinel-2-catalog",
   "title": "Sentinel-2 L2A STAC-GeoParquet Mirror",
-  "description": "An item index for the AWS Earth Search Sentinel-2 L2A archive (about 28 million scenes, 2015 to today), published as partitioned STAC-GeoParquet plus MGRS-tile aggregate stats. The imagery stays on AWS in the sentinel-cogs bucket; this catalog carries no assets, so a client derives each Cloud-Optimized GeoTIFF URL from the item's MGRS tile and date. No STAC API sits in front of it: query the Parquet files directly. This is a mirror; Earth Search / Element 84 produces the item index this catalog republishes. Read the [agent guide](AGENTS.md) before you query it.",
+  "description": "An item index for the AWS Earth Search Sentinel-2 L2A archive (51.25 million items when Earth Search was counted on 2026-09-15), published as partitioned STAC-GeoParquet plus MGRS-tile aggregate stats. Coverage is partial before December 2018: nothing for 2015-2016 and part of 2017-2018, which is what Earth Search serves. The imagery stays on AWS in the sentinel-cogs bucket; every Cloud-Optimized GeoTIFF URL is carried verbatim in each item's `assets` column, so nothing has to be derived from a template. No STAC API sits in front of it: query the Parquet files directly. This is a mirror; Earth Search / Element 84 produces the item index this catalog republishes. Read the [agent guide](AGENTS.md) before you query it.",
+  "updated": "2026-09-15T21:54:03Z",
   "links": [
     {
       "rel": "root",
       "href": "./catalog.json",
       "type": "application/json",
       "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
+    },
+    {
+      "rel": "child",
+      "href": "./sentinel-2-l2a/collection.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A scenes"
     },
     {
       "rel": "describedby",
