@@ -79,35 +79,51 @@ jobs:
           YEARS_IN: ${{ inputs.years }}
         run: |
           set -euo pipefail
-          if [ -n "$RUN_ID" ]; then
-            gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-              --jq --arg run "$RUN_ID" \
-              '[.artifacts[] | select(.expired==false and (.name|startswith("slice-"))
-                 and ((.workflow_run.id|tostring)==$run))]' \
-              > artifacts.json
-          else
-            gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.expired==false and (.name|startswith("slice-")))]' \
-              > artifacts.json
-          fi
-          echo "found $(python3 -c 'import json; print(len(json.load(open("artifacts.json"))))') slice artifact(s)"
+          # gh api --jq runs the filter PER PAGE, not over the whole
+          # --paginate'd result, so a filter that wraps each page in `[...]`
+          # concatenates several JSON arrays into one file and json.load()
+          # dies with "Extra data" as soon as there is more than one page
+          # (136 artifacts, 100 per page, is already two). Emitting one
+          # object per line instead -- no array brackets -- makes every
+          # page's output valid JSONL on its own, and pages concatenate into
+          # valid JSONL too. gh api also has no --arg; the run_id filter
+          # happens in the Python below instead of in the jq expression.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired==false and (.name|startswith("slice-")))
+                   | {name: .name, id: .id, run: .workflow_run.id}' \
+            > artifacts.jsonl
+          echo "found $(wc -l < artifacts.jsonl) slice artifact record(s)"
 
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json, os
 
-          artifacts = json.load(open("artifacts.json"))
-          # The API returns artifacts newest-created-first. setdefault keeps
-          # the first (newest) id seen for a slice name, so a slice re-fetched
-          # across two backfill runs uses the latest copy, never both.
+          records = []
+          with open("artifacts.jsonl") as f:
+              for line in f:
+                  line = line.strip()
+                  if line:
+                      records.append(json.loads(line))
+
+          run_id = os.environ.get("RUN_ID", "").strip()
+          if run_id:
+              records = [r for r in records if str(r["run"]) == run_id]
+
+          # The API returns artifacts newest-created-first, and --paginate
+          # preserves that order across pages, so setdefault keeps the first
+          # (newest) id seen for a slice name -- a slice re-fetched across
+          # two backfill runs uses the latest copy, never both.
           banked: dict[str, int] = {}
-          for a in artifacts:
-              banked.setdefault(a["name"], a["id"])
+          for r in records:
+              banked.setdefault(r["name"], r["id"])
 
           by_year: dict[int, list[int]] = {}
           for name, aid in banked.items():
               # slice-YYYY-MM
               _, y, _m = name.split("-")
               by_year.setdefault(int(y), []).append(aid)
+
+          if not by_year:
+              raise SystemExit("no slice artifacts found")
 
           want = os.environ.get("YEARS_IN", "").strip()
           if want:
