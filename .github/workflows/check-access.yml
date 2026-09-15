@@ -1,0 +1,31 @@
+name: check-access
+
+# One-shot manual smoke test: assume the Source Cooperative role and write
+# + delete a marker object, so the multi-day backfill never discovers an
+# access problem on its final step.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Assume the Source Cooperative write role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: sentinel-2-catalog-access-check
+          aws-region: us-west-2
+      - name: Round-trip a marker object
+        run: |
+          set -euo pipefail
+          P=s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/_access-check
+          date -u | aws s3 cp - "$P"
+          aws s3 ls "$P"
+          aws s3 rm "$P"
