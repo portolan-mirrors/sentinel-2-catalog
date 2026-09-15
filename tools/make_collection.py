@@ -259,7 +259,7 @@ def main() -> int:
         if year in items:
             continue
         for part in discover(year_dir, year, a.remote_baseline):
-            stats = part_stats(con, part["location"])
+            stats = part["stats"] or part_stats(con, part["location"])
             if stats is None:
                 raise SystemExit(f"year={year}: cannot read {part['location']}")
             years.add(year)

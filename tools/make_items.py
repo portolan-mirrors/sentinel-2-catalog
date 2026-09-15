@@ -29,6 +29,12 @@ things:
         be rewritten to describe the rolling tail alone and drop the millions
         of rows sitting in the published `items.parquet`.
 
+        A probe that fails is not a part that is missing. A 404 means the part
+        was never published; anything else -- a timeout, a 5xx, a broken link
+        -- means the question went unanswered, and the run falls back to what
+        the committed item recorded for that part rather than writing a
+        smaller year. See discover() for the three cases.
+
 Collection item links are not written here. make_collection.py globs the item
 files it finds and links every one, so the two tools cannot disagree about
 which items exist.
@@ -81,19 +87,35 @@ def ceil4(v: float) -> float:
     return math.ceil(v * 10**PLACES) / 10**PLACES
 
 
-def remote_size(url: str) -> int | None:
-    """Content-Length for a published part, without fetching the bytes.
+#: What a probe found. The third value is the point of the type: "I could not
+#: ask" is not the same answer as "it is not there", and collapsing the two is
+#: how a five-minute outage turns into a published record that lost a year.
+PRESENT, ABSENT, UNKNOWN = "present", "absent", "unknown"
 
-    Also the existence probe: None means "not published", which is how
-    --remote-baseline decides a year has no live part yet.
+# Source Cooperative answers a missing object with 404 (verified against
+# data.source.coop, 2026-09-16), so 404 and 410 are the only statuses that mean
+# "not published". A 403, a 5xx, a timeout, a DNS failure: those mean the
+# question was not answered.
+ABSENT_STATUSES = (404, 410)
+
+
+def remote_probe(url: str) -> tuple[str, int | None]:
+    """Ask whether a published part exists, and how big it is.
+
+    Returns (PRESENT, size), (ABSENT, None) or (UNKNOWN, None). A HEAD, so the
+    bytes are never fetched. Size is worth one round trip; a checksum would be
+    worth gigabytes of download, which is why published data assets carry
+    file:size and no file:checksum.
     """
+    request = urllib.request.Request(url, method="HEAD", headers=UA)
     try:
-        req = urllib.request.Request(url, method="HEAD", headers=UA)
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             length = response.headers.get("Content-Length")
-        return int(length) if length else None
+        return PRESENT, (int(length) if length else None)
+    except urllib.error.HTTPError as exc:
+        return (ABSENT, None) if exc.code in ABSENT_STATUSES else (UNKNOWN, None)
     except (urllib.error.URLError, OSError, ValueError):
-        return None
+        return UNKNOWN, None
 
 
 def connect() -> duckdb.DuckDBPyConnection:
@@ -177,32 +199,108 @@ def platforms(con: duckdb.DuckDBPyConnection, locations: list[str]) -> list[str]
     return [row[0] for row in rows]
 
 
-def discover(year_dir: Path, year: int, remote_baseline: bool) -> list[dict]:
-    """The parts that make up one year, local first, published as fallback."""
+def read_item(path: Path) -> dict | None:
+    """The item already on disk for a year, when there is a readable one."""
+    try:
+        item = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return item if isinstance(item, dict) and item.get("type") == "Feature" else None
+
+
+def year_platforms(con: duckdb.DuckDBPyConnection, parts: list[dict],
+                   committed: dict | None) -> list[str]:
+    """Platforms across a year's parts, keeping what a skipped part recorded."""
+    locations = [part["location"] for part in parts if part["location"]]
+    found = set(platforms(con, locations)) if locations else set()
+    if any(part["source"] == "committed" for part in parts) and committed:
+        found |= set((committed.get("properties") or {}).get("s2:platforms") or [])
+    return sorted(found)
+
+
+def recorded_part(committed: dict | None, key: str) -> dict | None:
+    """One part's own measurements, as the committed item recorded them.
+
+    Every data asset carries the row count and time range of the part it names,
+    which is what makes a part-level fallback possible at all: the item's
+    properties are the year's totals and cannot be decomposed back into parts.
+    """
+    if not committed:
+        return None
+    asset = (committed.get("assets") or {}).get(key)
+    if not asset or asset.get("table:row_count") is None:
+        return None
+    return {"rows": asset["table:row_count"],
+            # The committed item's bbox covers every part of the year, so using
+            # it for one part widens the result at worst. A bbox is allowed to
+            # be a superset of its geometry; it is never allowed to be short.
+            "bbox": committed.get("bbox"),
+            "t0": asset.get("start_datetime"),
+            "t1": asset.get("end_datetime"),
+            "size": asset.get("file:size")}
+
+
+def discover(year_dir: Path, year: int, remote_baseline: bool,
+             committed: dict | None = None, probe=remote_probe) -> list[dict]:
+    """The parts that make up one year: staged, published, or last recorded.
+
+    A part is read from --data-dir when it is staged there. Otherwise, and only
+    under --remote-baseline, the published copy is probed. What happens next
+    depends on which answer came back, and the three answers are not
+    interchangeable:
+
+    PRESENT  read the published part over HTTP.
+    ABSENT   it was never published (404). Skip it -- unless the committed item
+             names it, in which case the published record has lost a file and
+             this run must not paper over that by rewriting the year smaller.
+    UNKNOWN  the probe failed: a timeout, a 5xx, a broken link. Fall back to
+             what the committed item recorded for that part, so a bad minute on
+             the network cannot shrink the record. With nothing committed to
+             fall back to, stop: an item built from the parts that happened to
+             answer is worse than no new item at all.
+    """
     found = []
     for key, name, title, roles in PARTS:
+        common = {"key": key, "name": name, "title": title, "roles": roles}
         local = year_dir / name
         if local.is_file():
-            found.append({"key": key, "name": name, "title": title,
-                          "roles": roles, "location": str(local),
-                          "size": local.stat().st_size})
+            found.append({**common, "source": "local", "location": str(local),
+                          "size": local.stat().st_size, "stats": None})
             continue
         if not remote_baseline:
             continue
+
         url = f"{PUBLIC}/sentinel-2-l2a/year={year}/{name}"
-        size = remote_size(url)
-        if size is not None:
-            found.append({"key": key, "name": name, "title": title,
-                          "roles": roles, "location": url, "size": size})
+        state, size = probe(url)
+        recorded = recorded_part(committed, key)
+
+        if state == PRESENT:
+            found.append({**common, "source": "remote", "location": url,
+                          "size": size, "stats": None})
+        elif state == ABSENT:
+            if recorded is not None:
+                raise SystemExit(
+                    f"year={year}: {url} is gone (404), but the committed item "
+                    f"describes it as {recorded['rows']:,} rows. Refusing to "
+                    f"rewrite the year without it -- restore the file, or "
+                    f"delete the asset from the item on purpose.")
+        else:
+            if recorded is None:
+                raise SystemExit(
+                    f"year={year}: cannot reach {url}, and no committed item "
+                    f"records what it holds. Refusing to write an item from "
+                    f"the parts that answered.")
+            found.append({**common, "source": "committed", "location": None,
+                          "size": recorded["size"], "stats": recorded})
     return found
 
 
-def build_item(con: duckdb.DuckDBPyConnection, year: int,
-               parts: list[dict]) -> dict:
+def build_item(con: duckdb.DuckDBPyConnection, year: int, parts: list[dict],
+               committed: dict | None = None) -> dict:
     """One STAC item describing every part of a year."""
     stats = []
     for part in parts:
-        st = part_stats(con, part["location"])
+        st = part["stats"] or part_stats(con, part["location"])
         if st is None:
             raise SystemExit(f"year={year}: cannot read {part['location']}")
         stats.append(st)
@@ -217,14 +315,20 @@ def build_item(con: duckdb.DuckDBPyConnection, year: int,
     start = min((st["t0"] for st in stats if st["t0"]), key=as_dt)
     end = max((st["t1"] for st in stats if st["t1"]), key=as_dt)
 
+    # Each asset states what its own part holds, not just how big it is. The
+    # item's properties are the year's totals and cannot be split back up, so
+    # without this a part that cannot be read has nothing to fall back to.
     assets = {}
-    for part in parts:
+    for part, st in zip(parts, stats):
         assets[part["key"]] = {
             "href": f"./{part['name']}",
             "type": "application/vnd.apache.parquet",
             "title": part["title"].format(year=year),
             "roles": part["roles"],
-            "file:size": part["size"],
+            "start_datetime": st["t0"],
+            "end_datetime": st["t1"],
+            "table:row_count": st["rows"],
+            **({"file:size": part["size"]} if part["size"] else {}),
         }
 
     return {
@@ -248,8 +352,10 @@ def build_item(con: duckdb.DuckDBPyConnection, year: int,
             "start_datetime": start,
             "end_datetime": end,
             "table:row_count": rows,
-            "s2:platforms": platforms(
-                con, [part["location"] for part in parts]),
+            # A part that fell back to the committed item cannot be scanned, so
+            # its platforms come from what that item recorded. Dropping them
+            # would state that a platform stopped flying.
+            "s2:platforms": year_platforms(con, parts, committed),
         },
         "assets": assets,
         # No self link. Portolan forbids one: a static object that hardcodes
@@ -302,19 +408,22 @@ def main() -> int:
         load_httpfs(con)
 
     for year, year_dir in years:
-        parts = discover(year_dir, year, a.remote_baseline)
+        target = out / f"year={year}"
+        committed = read_item(target / f"{year}.json")
+        parts = discover(year_dir, year, a.remote_baseline, committed)
         if not parts:
             print(f"  {year}: no parts, skipped")
             continue
-        item = build_item(con, year, parts)
-        target = out / f"year={year}"
+        item = build_item(con, year, parts, committed)
         target.mkdir(parents=True, exist_ok=True)
         (target / f"{year}.json").write_text(json.dumps(item, indent=2) + "\n")
         props = item["properties"]
+        kept = [part["name"] for part in parts if part["source"] == "committed"]
+        note = f"   KEPT FROM LAST RUN: {','.join(kept)}" if kept else ""
         print(f"  {year}: {props['table:row_count']:>12,} rows  "
               f"{len(parts)} part(s)  {props['start_datetime']} .. "
               f"{props['end_datetime']}  "
-              f"{','.join(props['s2:platforms'])}")
+              f"{','.join(props['s2:platforms'])}{note}")
     print(f"\n  {len(years)} item(s) written under {out}")
     return 0
 

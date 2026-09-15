@@ -60,6 +60,9 @@
       "roles": [
         "data"
       ],
+      "start_datetime": "2026-09-12T00:16:10.622Z",
+      "end_datetime": "2026-09-13T23:45:27.298Z",
+      "table:row_count": 31264,
       "file:size": 12787344
     }
   },
