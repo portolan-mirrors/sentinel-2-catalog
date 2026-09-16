@@ -96,7 +96,7 @@ jobs:
         if: steps.resume.outputs.done != 'true'
         run: |
           pip install --quiet duckdb boto3
-          python3 tools/s2_repair.py --month "${{ matrix.month }}" --out ./staging/chunks
+          python3 tools/s2_repair.py --month "${{ matrix.month }}" --out ./staging/chunks --workers 48
 
       - uses: actions/upload-artifact@v4
         if: steps.resume.outputs.done != 'true'
