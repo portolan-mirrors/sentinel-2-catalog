@@ -76,7 +76,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq && sudo apt-get install -y -qq tippecanoe
-          pip install --quiet duckdb boto3 geoparquet-io pmtiles pytz
+          # geoparquet-io pinned on purpose: see ci.yml and gpio-fix-report.md.
+          pip install --quiet duckdb boto3 'geoparquet-io==1.5.0' pmtiles pytz
 
       # Resolve the "every published year part" glob by hand: probe each
       # year=YYYY/items.parquet from 2015 (Sentinel-2's launch year) through

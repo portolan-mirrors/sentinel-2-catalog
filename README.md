@@ -99,6 +99,13 @@ Unit tests for the tools (`test_fetch.py`, `test_build.py`, `test_schema.py`,
 are not in `run_all.py` because they need `duckdb`, and the build test needs
 `geoparquet-io` on the PATH.
 
+Install `geoparquet-io==1.5.0` — the version every workflow pins. Unpinned, it
+moved from 1.3.0 to 1.5.0 under this catalog without anyone noticing, and
+`gpio sort column`'s `--compression-level` went from a no-op to a flag that
+costs hours at zstd 22. `tools/s2_build.py` needs at least 1.4 for that flag
+and for `--write-memory`; testing against an older local install measures a
+tool CI does not run.
+
 CI runs `rashid`, `stac-check`, and `tests/run_all.py` on every pull request.
 `docs/conformance.md` records any accepted deviation, with the rule, why, and
 the tracking issue — the allow-list in `tests/test_conformance.py` never

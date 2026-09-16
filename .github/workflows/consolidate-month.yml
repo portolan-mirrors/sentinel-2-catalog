@@ -49,7 +49,8 @@ jobs:
           python-version: "3.12"
       - name: Install tooling
         if: steps.guard.outputs.published == 'true'
-        run: pip install --quiet duckdb boto3 geoparquet-io 'rashid>=0.1.8,<0.2.0' stac-check
+        # geoparquet-io pinned on purpose: see ci.yml and gpio-fix-report.md.
+        run: pip install --quiet duckdb boto3 'geoparquet-io==1.5.0' 'rashid>=0.1.8,<0.2.0' stac-check
       - name: Merge live into the year part
         if: steps.guard.outputs.published == 'true'
         run: |

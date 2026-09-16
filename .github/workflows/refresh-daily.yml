@@ -48,11 +48,12 @@ jobs:
         if: steps.guard.outputs.published == 'true'
         with:
           python-version: "3.12"
+      # geoparquet-io pinned on purpose: see ci.yml and gpio-fix-report.md.
       - name: Install tooling
         if: steps.guard.outputs.published == 'true'
         run: |
           set -euo pipefail
-          pip install --quiet duckdb boto3 geoparquet-io \
+          pip install --quiet duckdb boto3 'geoparquet-io==1.5.0' \
             'rashid>=0.1.8,<0.2.0' stac-check
       - name: Fetch the lookback window
         if: steps.guard.outputs.published == 'true'
