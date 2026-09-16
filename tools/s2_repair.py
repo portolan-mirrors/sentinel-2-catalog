@@ -64,6 +64,7 @@ import os
 import re
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -199,56 +200,88 @@ def group_scenes_by_day(scenes: list[tuple[str, str]]) -> dict[str, list[tuple[s
     return dict(by_day)
 
 
+class MissingItem(Exception):
+    """A scene's item JSON genuinely does not exist in the bucket (HTTP 404
+    or 410) -- a permanent condition, not a transient failure. Deliberately
+    NOT a subclass of urllib.error.URLError/HTTPError: with_retries()'s
+    except clause only matches those two plus TimeoutError, so raising this
+    instead makes it propagate out of with_retries() immediately, with zero
+    retries. (Production evidence, 2026-09-16, run 35090066508: some scenes
+    in 2018-12..2019-04 have no item JSON at all -- confirmed with direct
+    HEAD requests, not a URL-construction bug -- and retrying each one
+    burned the FULL 8-attempt/~11-minute ladder before the future's
+    unhandled exception killed the whole month.)"""
+
+
 def _get_json(url: str, tries: int = 8) -> dict:
     def call():
         req = urllib.request.Request(url, headers={"User-Agent": UA["User-Agent"]})
-        return json.load(urllib.request.urlopen(req, timeout=120))
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=120))
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                raise MissingItem(f"{url}: HTTP {e.code}") from e
+            raise          # 5xx, etc. -- let with_retries's ladder handle it
     return with_retries(call, tries)
 
 
 def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
-                    workers: int = 16) -> int:
+                    workers: int = 16) -> tuple[int, int]:
     """GET + normalize() every scene's item JSON, writing each row straight
     to the NDJSON file at `nd_path` as its future completes -- never holds
     more than one month's worth of in-flight requests in memory, unlike
     accumulating a Python list of ~450k rows. The writes happen in THIS
     thread as as_completed() yields (fetching is threaded, consuming is
     not), so no lock is needed even though GETs run in worker threads.
-    `get_fn(url)` returns the parsed item dict -- injected so this is
-    testable without S3, and swapped for a real HTTPS GET (with retry) in
-    production. Returns the row count written."""
+    `get_fn(url)` returns the parsed item dict, or raises MissingItem for a
+    scene with no item JSON in the bucket (permanent, logged and skipped --
+    NOT retried, NOT a failure) -- injected so this is testable without S3,
+    and swapped for a real HTTPS GET (with retry) in production. Returns
+    (rows written, scenes skipped as permanently missing)."""
     n = 0
+    missing = 0
     with open(nd_path, "w") as nd, ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(get_fn, url) for _, url in scenes]
+        futures = {pool.submit(get_fn, url): scene_id for scene_id, url in scenes}
         for f in as_completed(futures):
-            nd.write(json.dumps(normalize(f.result())) + "\n")
+            try:
+                item = f.result()
+            except MissingItem:
+                print(f"  skipping scene with missing item JSON: {futures[f]}",
+                     file=sys.stderr)
+                missing += 1
+                continue
+            nd.write(json.dumps(normalize(item)) + "\n")
             n += 1
-    return n
+    return n, missing
 
 
 def _fetch_one_day(day: str, day_scenes: list[tuple[str, str]], dest_dir: Path,
-                   get_fn, workers: int) -> int:
+                   get_fn, workers: int) -> tuple[int, int]:
     """Fetch+write one day's chunk (or a zero-byte sentinel), skipping if
     its destination already exists -- the unit of eviction resilience: this
     is the piece of work that either fully lands on disk or never starts,
     so an eviction mid-month never corrupts or loses an already-finished
-    day."""
+    day. Returns (rows written, scenes skipped as permanently missing)."""
     dest = dest_dir / f"{day}_{day}.parquet"
     if dest.exists():
         print(f"  {dest.name}: exists, skipping")
-        return 0
+        return 0, 0
     if not day_scenes:
         dest.touch()          # sentinel: fetched, zero matches
-        return 0
+        return 0, 0
     fd, nd = tempfile.mkstemp(suffix=".ndjson")
     os.close(fd)
     try:
-        n = fetch_and_write(day_scenes, get_fn, nd, workers)
-        copy_ndjson_to_parquet(nd, dest)
+        n, missing = fetch_and_write(day_scenes, get_fn, nd, workers)
+        if n:
+            copy_ndjson_to_parquet(nd, dest)
+        else:
+            dest.touch()      # every scene that day was permanently missing
     finally:
         Path(nd).unlink(missing_ok=True)
-    print(f"  {dest.name}: {n:,} rows", flush=True)
-    return n
+    if n:
+        print(f"  {dest.name}: {n:,} rows", flush=True)
+    return n, missing
 
 
 def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 16,
@@ -256,7 +289,11 @@ def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 
     """Discover one month's scenes with a single month-level LIST pass, then
     fetch and write ONE PARQUET CHUNK PER DAY (skip-if-exists per day, same
     resumability contract as s2_fetch.py) -- see the module docstring for
-    why: a mid-month eviction must not lose already-finished days."""
+    why: a mid-month eviction must not lose already-finished days. A scene
+    with no item JSON in the bucket (MissingItem, permanent) is skipped and
+    counted, never retried; the running total is printed as a month-end
+    summary so the shortfall is visible in the run log and comparable
+    against the inventory audit."""
     y, m_pad = month.split("-")
     m = str(int(m_pad))          # bucket path segment is not zero-padded
     last_day = calendar.monthrange(int(y), int(m_pad))[1]
@@ -274,9 +311,14 @@ def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 
     by_day = group_scenes_by_day(scenes)
 
     total = 0
+    total_missing = 0
     for day_num in range(1, last_day + 1):
         day = f"{y}-{m_pad}-{day_num:02d}"
-        total += _fetch_one_day(day, by_day.get(day, []), dest_dir, get_fn, workers)
+        n, missing = _fetch_one_day(day, by_day.get(day, []), dest_dir, get_fn, workers)
+        total += n
+        total_missing += missing
+    print(f"month {month}: {total:,} scenes fetched, "
+         f"{total_missing:,} missing item JSONs skipped")
     return total
 
 

@@ -8,10 +8,12 @@ month-file naming, and the audit's aggregation -- runs against injected
 listers/getters or local fixtures, no S3.
 """
 import csv
+import io
 import json
 import sys
 import tempfile
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -21,11 +23,12 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
+import s2_fetch  # noqa: E402  (module import: needed to monkeypatch s2_fetch.time.sleep)
 from s2_schema import COLUMNS  # noqa: E402
 from s2_fetch import copy_ndjson_to_parquet, normalize  # noqa: E402
 from s2_repair import (  # noqa: E402
-    _is_valid_zone, discover_scenes, fetch_and_write, group_scenes_by_day,
-    repair_month, scene_day)
+    MissingItem, _get_json, _is_valid_zone, discover_scenes, fetch_and_write,
+    group_scenes_by_day, repair_month, scene_day)
 from s2_audit import audit, expected_month_counts, have_month_counts  # noqa: E402
 
 STATIC_ITEM_URL = ("https://sentinel-cogs.s3.us-west-2.amazonaws.com/"
@@ -138,11 +141,88 @@ def test_fetch_and_write_streams_normalized_rows_to_ndjson():
             "https://x/A2.json": _fake_item("A2")}
     with tempfile.TemporaryDirectory() as td:
         nd = str(Path(td) / "rows.ndjson")
-        n = fetch_and_write(scenes, lambda url: items[url], nd, workers=2)
+        n, missing = fetch_and_write(scenes, lambda url: items[url], nd, workers=2)
         assert n == 2
+        assert missing == 0
         rows = [json.loads(line) for line in Path(nd).read_text().splitlines()]
         assert {r["id"] for r in rows} == {"A1", "A2"}
         assert all(r["s2:mgrs_tile"] == "31UFU" for r in rows)
+
+
+# --------------------------------------------------------------------------
+# _get_json: 404/410 is a permanent skip (no retry); 5xx still retries.
+# Fix round, production run 35090066508: a genuinely-missing item JSON was
+# retried through the full 8-attempt ladder (~11 minutes) before crashing
+# the whole month.
+# --------------------------------------------------------------------------
+
+def _http_error(url: str, code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(url, code, f"HTTP {code}", None, None)
+
+
+def test_get_json_raises_missing_item_on_404_without_retrying(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise _http_error(req.full_url, 404)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(MissingItem):
+        _get_json("https://x/missing.json")
+    assert calls["n"] == 1, "a 404 must not be retried"
+
+
+def test_get_json_raises_missing_item_on_410_without_retrying(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise _http_error(req.full_url, 410)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(MissingItem):
+        _get_json("https://x/gone.json")
+    assert calls["n"] == 1, "a 410 must not be retried"
+
+
+def test_get_json_still_retries_5xx(monkeypatch):
+    """Existing retry behavior must survive the 404/410 special-case: a
+    transient 503 is retried by with_retries's ladder, not skipped."""
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _http_error(req.full_url, 503)
+        return io.BytesIO(b'{"ok": true}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(s2_fetch.time, "sleep", lambda s: None)  # skip real backoff
+    result = _get_json("https://x/flaky.json", tries=5)
+    assert result == {"ok": True}
+    assert calls["n"] == 3, "must retry a 5xx until it succeeds"
+
+
+def test_fetch_and_write_skips_missing_scene_and_keeps_valid_ones():
+    """Unit-level proof that fetch_and_write() treats MissingItem as a
+    skip, not a crash: a get_fn that raises MissingItem for one scene among
+    valid ones must still write the valid rows, count the miss, and warn."""
+    def get_fn(url):
+        if "missing" in url:
+            raise MissingItem(f"{url}: HTTP 404")
+        return _fake_item(url.rsplit("/", 1)[-1].removesuffix(".json"))
+
+    scenes = [("A1", "https://x/A1.json"),
+             ("MISSING", "https://x/missing.json"),
+             ("A2", "https://x/A2.json")]
+    with tempfile.TemporaryDirectory() as td:
+        nd = str(Path(td) / "rows.ndjson")
+        n, missing = fetch_and_write(scenes, get_fn, nd, workers=2)
+        assert n == 2
+        assert missing == 1
+        rows = [json.loads(line) for line in Path(nd).read_text().splitlines()]
+        assert {r["id"] for r in rows} == {"A1", "A2"}
 
 
 # --------------------------------------------------------------------------
@@ -277,6 +357,49 @@ def test_repair_month_skips_unparsable_scene_id_and_continues(capsys):
         err = capsys.readouterr().err
         assert "skipping unparsable scene id" in err
         assert "not-a-valid-scene-id" in err
+
+
+def test_repair_month_skips_missing_item_and_prints_summary(capsys):
+    """Integration proof for the 404/410-is-permanent fix: a day with one
+    genuinely-missing scene alongside a valid one must still write the
+    valid scene, warn about the missing one, and never call get_fn for it
+    more than once (no retry delay). The month-end summary line must
+    report both counts."""
+    def fake_list(prefix):
+        if prefix.endswith("2018/9/"):
+            return [
+                "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/",
+                "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_1_L2A/",
+            ]
+        return []
+
+    call_counts: dict[str, int] = {}
+
+    def get_fn(url):
+        call_counts[url] = call_counts.get(url, 0) + 1
+        if url.endswith("S2A_31UFU_20180905_1_L2A.json"):
+            raise MissingItem(f"{url}: HTTP 404")
+        return _get_by_url(url)
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        n = repair_month("2018-09", out, ["sentinel-s2-l2a-cogs/31/U/FU/"],
+                         workers=2, list_fn=fake_list, get_fn=get_fn)
+        assert n == 1, "only the valid scene counts toward rows fetched"
+        day5 = out / "repair" / "2018-09-05_2018-09-05.parquet"
+        assert day5.exists() and day5.stat().st_size > 0
+
+        missing_url = ("https://sentinel-cogs.s3.us-west-2.amazonaws.com/"
+                      "sentinel-s2-l2a-cogs/31/U/FU/2018/9/"
+                      "S2A_31UFU_20180905_1_L2A/S2A_31UFU_20180905_1_L2A.json")
+        assert call_counts[missing_url] == 1, (
+            "a 404-equivalent must be fetched exactly once -- no retry delay")
+
+        out_text = capsys.readouterr()
+        assert "skipping scene with missing item JSON: S2A_31UFU_20180905_1_L2A" \
+            in out_text.err
+        assert "month 2018-09: 1 scenes fetched, 1 missing item JSONs skipped" \
+            in out_text.out
 
 
 def test_repair_month_second_run_skips_already_finished_days():
