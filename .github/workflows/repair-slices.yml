@@ -1,0 +1,97 @@
+name: repair-slices
+
+# API-independent recovery path for month-slices backfill.yml lost to
+# sustained Earth Search 502 windows (e.g. 2018-09..2019-04). Fetches static
+# item JSON straight from the sentinel-cogs bucket -- anonymous S3, no
+# outage windows, no cloud credentials here (same posture as backfill.yml).
+#
+# Uploads slice-YYYY-MM artifacts with the IDENTICAL contract backfill.yml
+# uses (same name pattern, same flat-file-at-root layout), so
+# publish-backfill.yml consumes a repair artifact with zero changes: its
+# plan job dedupes newest-artifact-per-name, so a repair artifact naturally
+# supersedes a failed API one for the same month.
+
+on:
+  workflow_dispatch:
+    inputs:
+      months:
+        description: "Comma-separated months to repair, e.g. 2018-09,2018-10"
+        required: true
+      force:
+        description: "Repair even if a non-expired slice artifact already exists (for a bad/partial one)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        env:
+          MONTHS: ${{ inputs.months }}
+        run: |
+          python3 - << 'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          months = [m.strip() for m in os.environ["MONTHS"].split(",") if m.strip()]
+          if not months:
+              raise SystemExit("no months given")
+          print("matrix=" + json.dumps({"include": [{"month": m} for m in months]}))
+          EOF
+
+  repair:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      max-parallel: 4
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same resume check as backfill.yml, plus a force bypass: repair often
+      # re-does a month whose existing artifact is bad or partial rather
+      # than simply missing, and a failed run uploads no artifact at all
+      # (if-no-files-found: error), so the plain "already exists" check
+      # alone would never let a bad-but-present artifact be redone.
+      - name: Skip if this slice was already fetched
+        id: resume
+        if: ${{ inputs.force != true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NAME="slice-${{ matrix.month }}"
+          FOUND=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100&name=$NAME" \
+                    --jq '[.artifacts[] | select(.expired==false)] | length' 2>/dev/null || echo 0)
+          if [ "${FOUND:-0}" -gt 0 ]; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$NAME already exists; skipping (re-dispatch with force to override)"
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.resume.outputs.done != 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Repair the month from the bucket
+        if: steps.resume.outputs.done != 'true'
+        run: |
+          pip install --quiet duckdb boto3
+          python3 tools/s2_repair.py --month "${{ matrix.month }}" --out ./staging/chunks
+
+      - uses: actions/upload-artifact@v4
+        if: steps.resume.outputs.done != 'true'
+        with:
+          name: slice-${{ matrix.month }}
+          path: staging/chunks/repair/
+          retention-days: 30
+          if-no-files-found: error

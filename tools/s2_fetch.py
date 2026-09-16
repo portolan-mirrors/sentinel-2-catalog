@@ -42,12 +42,13 @@ DATA_COLUMNS = [c for c in COLUMNS if c[0] not in ("_month", "_hilbert")]
 _REL_ORBIT = re.compile(r"_R(\d{3})_")
 
 
-def _post(body: dict, tries: int = 8) -> dict:
-    data = json.dumps(body).encode()
+def with_retries(fn, tries: int = 8):
+    """Call fn() with exponential backoff (capped at 300s) on network/HTTP
+    errors. Shared by the API POST here and s2_repair.py's bucket GETs so
+    both retry the same way against different transports."""
     for i in range(tries):
         try:
-            req = urllib.request.Request(API, data=data, headers=UA)
-            return json.load(urllib.request.urlopen(req, timeout=120))
+            return fn()
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
             if i == tries - 1:
                 raise
@@ -55,6 +56,15 @@ def _post(body: dict, tries: int = 8) -> dict:
             print(f"  retry {i + 1} in {wait}s: {e}", file=sys.stderr)
             time.sleep(wait)
     raise AssertionError("unreachable")
+
+
+def _post(body: dict, tries: int = 8) -> dict:
+    data = json.dumps(body).encode()
+
+    def call():
+        req = urllib.request.Request(API, data=data, headers=UA)
+        return json.load(urllib.request.urlopen(req, timeout=120))
+    return with_retries(call, tries)
 
 
 def normalize(f: dict) -> dict:
@@ -148,12 +158,15 @@ def fetch_window(start: str, end: str, out_dir: Path,
     if not rows:
         dest.touch()          # sentinel: fetched, zero matches
         return 0
-    _write(rows, dest)
+    write_rows(rows, dest)
     print(f"  {dest.name}: {len(rows):,} rows in {pages} page(s)", flush=True)
     return len(rows)
 
 
-def _write(rows: list[dict], dest: Path) -> None:
+def write_rows(rows: list[dict], dest: Path) -> None:
+    """Write normalize()d rows to a canonical-schema chunk parquet. Shared
+    with s2_repair.py so the bucket repair path produces byte-identical
+    chunk schema to the API fetch path."""
     with tempfile.NamedTemporaryFile("w", suffix=".ndjson", delete=False) as tf:
         for r in rows:
             tf.write(json.dumps(r) + "\n")
