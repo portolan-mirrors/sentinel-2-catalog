@@ -1,0 +1,134 @@
+name: publish-stats
+
+# Build the mgrs-monthly stats table and the mgrs.pmtiles footprint tileset
+# from the PUBLISHED year parts (HTTP reads, no artifacts) and upload them.
+#
+# Why this exists as its own workflow: after the first data publish,
+# catalog/stats/ metadata (committed, static) references mgrs-monthly.parquet
+# and mgrs.pmtiles that nothing has built at full scale or uploaded yet --
+# publish-backfill's finalize job never touches stats. And once a catalog is
+# published, refresh-daily's "splice current year into stats" step passes
+# --existing "$BASE/stats/mgrs-monthly.parquet" to s2_stats.py, which will
+# 404 until that file exists at all. Run this once, manually, right after
+# the first publish to seed it.
+#
+# It doubles as the periodic full-rebuild path (footprints included) after
+# big archive changes (a repair run, a large backfill correction) where the
+# incremental --merge-years splice in refresh-daily is not enough.
+#
+# Bootstrap guard: same reasoning as refresh-daily.yml -- on a fresh repo
+# nothing is published yet, so the first step probes for catalog.json and
+# every other step is gated on that succeeding. A dispatch before the first
+# publish is a green no-op, not a red X.
+#
+# No glob over HTTP: DuckDB's read_parquet only expands glob patterns
+# (year=*/*.parquet) for filesystem paths and object-store URLs it lists
+# itself (s3://, gs://, ...); a plain https:// URL is fetched literally, so
+# a glob there 404s instead of expanding. tools/s2_stats.py's _sources_sql
+# does no expansion of its own either -- a URL source is passed straight
+# through. So the "enumerate published parts" step below resolves the glob
+# itself, by probing, and the build step gets an explicit list of URLs.
+#
+# No catalog metadata publish here: the stats collection.json is committed
+# and static, and its `updated` timestamp restamps on refresh-daily's normal
+# cycle. Running tools/publish.py here would just duplicate that.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: catalog-write
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Check the catalog is published
+        id: guard
+        run: |
+          set -uo pipefail
+          if curl -fsI https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json > /dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::catalog not yet published; nothing to build stats from"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.published == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.published == 'true'
+        with:
+          python-version: "3.12"
+
+      # tippecanoe is needed because --footprints drives `gpio pmtiles
+      # create`, which shells out to it (same install as ci.yml's pytest
+      # job, which exercises the same code path against a tiny fixture).
+      - name: Install tooling
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq tippecanoe
+          pip install --quiet duckdb boto3 geoparquet-io pmtiles pytz
+
+      # Resolve the "every published year part" glob by hand: probe each
+      # year=YYYY/items.parquet from 2015 (Sentinel-2's launch year) through
+      # the current year with a HEAD request, plus the current year's
+      # live.parquet if refresh-daily has published one yet. Loud failure
+      # if the guard passed (catalog.json exists) but this finds nothing --
+      # that combination means the catalog is published but empty/broken,
+      # never a quiet reason to skip.
+      - name: Enumerate published year parts
+        id: enumerate
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
+          CURRENT_YEAR=$(date -u +%Y)
+          urls=()
+          for Y in $(seq 2015 "$CURRENT_YEAR"); do
+            if curl -fsI "$BASE/year=$Y/items.parquet" > /dev/null; then
+              urls+=("$BASE/year=$Y/items.parquet")
+            fi
+          done
+          if curl -fsI "$BASE/year=$CURRENT_YEAR/live.parquet" > /dev/null; then
+            urls+=("$BASE/year=$CURRENT_YEAR/live.parquet")
+          fi
+          if [ "${#urls[@]}" -eq 0 ]; then
+            echo "::error::catalog.json is published but zero year parts were found under $BASE -- refusing to build stats from nothing"
+            exit 1
+          fi
+          echo "found ${#urls[@]} published part(s):"
+          printf '  %s\n' "${urls[@]}"
+          {
+            echo "urls<<PARTS_EOF"
+            printf '%s\n' "${urls[@]}"
+            echo "PARTS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build stats and footprints at full scale
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          mapfile -t URLS <<< "${{ steps.enumerate.outputs.urls }}"
+          python3 tools/s2_stats.py --sources "${URLS[@]}" \
+            --out ./staging/publish/stats --footprints
+
+      - name: Assume the Source Cooperative write role
+        if: steps.guard.outputs.published == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-region: us-west-2
+
+      - name: Upload data
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tools/upload_data.py --confirm --data-dir ./staging/publish
