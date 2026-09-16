@@ -6,7 +6,10 @@
 // issues HTTP range reads straight at the object store.
 import maplibregl from "https://esm.sh/maplibre-gl@4.7.1";
 import { Protocol } from "https://esm.sh/pmtiles@3.2.0";
-import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
+// 1.32.0 (DuckDB v1.4.3) is a floor, not a preference: the item parts are
+// GeoParquet 2.0.0, and 1.29.0 (DuckDB v1.1.1) refuses them outright with
+// "Geoparquet version 2.0.0 is not supported".
+import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
 
 // ?base=http://localhost:8081 points the whole app at a local publish tree,
 // which is how it is developed before the bucket is populated.
@@ -266,3 +269,219 @@ async function init() {
 }
 
 await init();
+
+// ---------------------------------------------------------------------------
+// The scene query. Click a tile, pick a window, and DuckDB-WASM range-reads the
+// year parts of sentinel-2-l2a directly. Every href shown below is read out of
+// the row's `assets` column (a JSON string carrying the upstream STAC assets
+// object) — this app never builds an object-store URL from a template.
+// ---------------------------------------------------------------------------
+
+// An MGRS tile id: 1-2 digit UTM zone, latitude band C..X, then two letters.
+// The values come from the tileset, not from a text box, but they are the only
+// thing on this page that reaches a SQL string, so they are checked anyway.
+const TILE_RE = /^\d{1,2}[C-X][A-Z]{2}$/;
+const CURRENT_YEAR = new Date().getUTCFullYear();
+
+let selectedTile = null;
+
+map.on("click", "mgrs-fill", (e) => {
+  const tile = e.features[0]?.properties?.mgrs_tile;
+  if (!TILE_RE.test(tile ?? "")) return;
+  selectedTile = tile;
+  $("query").querySelector(".hint").textContent =
+    `Tile ${tile}. Pick a window and search.`;
+  $("run").disabled = false;
+  timelineFor(tile);
+});
+
+// Which parts actually exist. `read_parquet` over a list fails outright on a
+// missing file, and the parts are genuinely optional: live.parquet only exists
+// for the current year once the daily refresh has run, and a year with no
+// scenes has no items.parquet at all. So each candidate is probed once with a
+// HEAD (a CORS-simple request, no preflight) and the answer is cached.
+const partProbes = new Map();
+const partExists = (url) => {
+  if (!partProbes.has(url)) {
+    partProbes.set(url, fetch(url, { method: "HEAD" })
+      // The empty body is drained so Chrome does not log the probe as an
+      // aborted request in the network panel.
+      .then(async (r) => { await r.arrayBuffer().catch(() => {}); return r.ok; })
+      .catch(() => false));
+  }
+  return partProbes.get(url);
+};
+
+async function partUrls(y0, y1) {
+  const candidates = [];
+  for (let y = y0; y <= y1; y++) {
+    candidates.push(`${BASE}/sentinel-2-l2a/year=${y}/items.parquet`);
+    if (y === CURRENT_YEAR) {
+      candidates.push(`${BASE}/sentinel-2-l2a/year=${y}/live.parquet`);
+    }
+  }
+  const present = await Promise.all(candidates.map(partExists));
+  return candidates.filter((_, i) => present[i]);
+}
+
+function sceneSql(urls, tile, d0, d1, cc) {
+  // `_month` is the cheap row-group filter, but it only narrows anything while
+  // the window stays inside one calendar year — across a year boundary
+  // (2023-11 → 2024-02) months 11..2 is empty, so it widens to the whole year.
+  const sameYear = d0.slice(0, 4) === d1.slice(0, 4);
+  const m0 = sameYear ? Number(d0.slice(5, 7)) : 1;
+  const m1 = sameYear ? Number(d1.slice(5, 7)) : 12;
+  // `datetime` is TIMESTAMPTZ; comparing it against a bare literal would be
+  // read in the session's zone, so both sides are pinned to UTC. The same
+  // conversion formats the label, rather than guessing at the epoch units
+  // Arrow hands back.
+  return `SELECT id,
+       strftime(datetime AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ') AS ts,
+       "eo:cloud_cover" AS cloud,
+       thumbnail_url,
+       assets
+FROM read_parquet([${urls.map((u) => `'${u}'`).join(", ")}], union_by_name=true)
+WHERE "s2:mgrs_tile" = '${tile}'
+  AND _month BETWEEN ${m0} AND ${m1}
+  AND (datetime AT TIME ZONE 'UTC')
+      BETWEEN TIMESTAMP '${d0} 00:00:00' AND TIMESTAMP '${d1} 23:59:59'
+  AND "eo:cloud_cover" <= ${cc}
+ORDER BY "eo:cloud_cover", id
+LIMIT 30`;
+}
+
+// The request a STAC API would have been asked for the same answer. Shown in
+// full because not making it is the point of this page.
+function apiMirror(tile, d0, d1, cc) {
+  return JSON.stringify({
+    note: "The STAC API request this page did NOT need to make. "
+      + "Earth Search would answer it; the panel above is the same answer, "
+      + "range-read out of static Parquet.",
+    method: "POST",
+    url: "https://earth-search.aws.element84.com/v1/search",
+    body: {
+      collections: ["sentinel-2-l2a"],
+      datetime: `${d0}T00:00:00Z/${d1}T23:59:59Z`,
+      query: {
+        "eo:cloud_cover": { lte: cc },
+        "s2:mgrs_tile": { eq: tile },
+      },
+      sortby: [{ field: "properties.eo:cloud_cover", direction: "asc" }],
+      limit: 30,
+    },
+  }, null, 2);
+}
+
+// Asset hrefs are remote-derived strings going into an href, so only real
+// http(s) URLs are linked; anything else (javascript:, data:, missing) is
+// dropped rather than rendered.
+function assetHref(assets, key) {
+  const href = assets?.[key]?.href;
+  if (typeof href !== "string") return null;
+  try {
+    const u = new URL(href);
+    return u.protocol === "https:" || u.protocol === "http:" ? href : null;
+  } catch {
+    return null;
+  }
+}
+
+const ASSET_LINKS = [["visual", "TCI"], ["red", "B04"], ["nir", "B08"],
+  ["scl", "SCL"]];
+
+function sceneCard(r, i) {
+  const card = el("div", "scene" + (i === 0 ? " best" : ""));
+  if (typeof r.thumbnail_url === "string" && r.thumbnail_url) {
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.alt = `Preview of ${r.id}`;
+    // A dead preview must not leave a broken-image box in the card.
+    img.addEventListener("error", () => img.remove(), { once: true });
+    img.src = r.thumbnail_url;
+    card.append(img);
+  }
+  const cap = document.createElement("div");
+  cap.append(el("b", null, r.id), document.createElement("br"));
+  cap.append(`${String(r.ts).slice(0, 10)} · ${Number(r.cloud).toFixed(1)}% cloud`);
+  cap.append(document.createElement("br"));
+  // 30 rows, so parsing the whole assets object per row is free; a bad row is
+  // shown without its links instead of killing the render.
+  let assets = null;
+  try {
+    assets = JSON.parse(r.assets);
+  } catch { /* leave the links off this card */ }
+  for (const [key, label] of ASSET_LINKS) {
+    const href = assetHref(assets, key);
+    if (!href) continue;
+    const a = el("a", null, label);
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.title = `${label} — ${href}`;
+    cap.append(a);
+  }
+  card.append(cap);
+  return card;
+}
+
+async function runQuery() {
+  const d0 = $("date0").value;
+  const d1 = $("date1").value;
+  const cc = Number($("maxcloud").value);
+  const box = $("results");
+  if (!selectedTile || !TILE_RE.test(selectedTile)) {
+    say("Click an MGRS tile on the map first.", true);
+    return;
+  }
+  if (!d0 || !d1) {
+    say("Set both ends of the date window.", true);
+    return;
+  }
+  if (d1 < d0) {
+    say("The window ends before it starts — swap the two dates.", true);
+    return;
+  }
+  $("run").disabled = true;
+  box.replaceChildren(el("p", "hint", "Reading the item parts…"));
+  try {
+    const urls = await partUrls(Number(d0.slice(0, 4)), Number(d1.slice(0, 4)));
+    if (!urls.length) {
+      $("sql").textContent = "";
+      $("api").textContent = "";
+      box.replaceChildren(el("p", "hint",
+        `No published item parts cover ${d0.slice(0, 4)}–${d1.slice(0, 4)}. `
+        + "Pick a window the backfill has reached."));
+      say(`Nothing published for ${d0.slice(0, 4)}–${d1.slice(0, 4)} yet.`);
+      return;
+    }
+    const sql = sceneSql(urls, selectedTile, d0, d1, cc);
+    $("sql").textContent = sql;
+    $("api").textContent = apiMirror(selectedTile, d0, d1, cc);
+    say(`Range-reading ${urls.length} parquet part`
+      + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
+    const rows = (await conn.query(sql)).toArray();
+    box.replaceChildren();
+    if (!rows.length) {
+      box.append(el("p", "hint",
+        `No ${selectedTile} scenes under ${cc}% cloud in that window — `
+        + "raise the slider or widen the dates."));
+      say(`No scenes matched — still no API call.`);
+      return;
+    }
+    box.append(...rows.map(sceneCard));
+    // The results sit below the timeline in the panel; without this the hero
+    // flow's answer lands off-screen on a short window.
+    box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    say(`${rows.length} scene${rows.length === 1 ? "" : "s"} for ${selectedTile}, `
+      + `clearest first — ${urls.length} range-read part`
+      + `${urls.length === 1 ? "" : "s"}, no API call.`);
+  } catch (err) {
+    box.replaceChildren(el("p", "hint", `Query failed — ${err.message}`));
+    say(`Could not read the item parts — ${err.message}`, true);
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
+$("run").addEventListener("click", runQuery);
