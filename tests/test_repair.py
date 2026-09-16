@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
 from s2_schema import COLUMNS  # noqa: E402
-from s2_fetch import normalize  # noqa: E402
+from s2_fetch import copy_ndjson_to_parquet, normalize  # noqa: E402
 from s2_repair import (  # noqa: E402
     _is_valid_zone, discover_scenes, fetch_and_write, group_scenes_by_day,
     repair_month, scene_day)
@@ -146,6 +146,29 @@ def test_fetch_and_write_streams_normalized_rows_to_ndjson():
 
 
 # --------------------------------------------------------------------------
+# copy_ndjson_to_parquet (s2_fetch.py, shared): atomic write on failure
+# --------------------------------------------------------------------------
+
+def test_copy_ndjson_to_parquet_leaves_no_partial_or_tmp_file_on_failure():
+    """Fix round: dest.exists() is the skip-if-exists check every caller
+    relies on (s2_fetch.py's fetch_window and s2_repair.py's per-day
+    resume alike), so a COPY that fails partway through must never leave a
+    partial file at dest -- a process killed mid-COPY (a real event under
+    runner eviction) would otherwise poison resume by making a
+    half-written chunk look finished. Triggered here with malformed
+    NDJSON, which fails after the destination path is already committed to
+    but before any bytes are written."""
+    with tempfile.TemporaryDirectory() as td:
+        dest = Path(td) / "2018-09-05_2018-09-05.parquet"
+        nd = Path(td) / "rows.ndjson"
+        nd.write_text("{not valid json\n")
+        with pytest.raises(Exception):
+            copy_ndjson_to_parquet(str(nd), dest)
+        assert not dest.exists(), "a failed COPY must not leave a partial dest"
+        assert not dest.with_name(dest.name + ".tmp").exists(), "no .tmp litter"
+
+
+# --------------------------------------------------------------------------
 # scene_day / group_scenes_by_day: date extraction from the scene id
 # --------------------------------------------------------------------------
 
@@ -167,6 +190,21 @@ def test_group_scenes_by_day_buckets_by_date():
     assert set(by_day) == {"2018-09-05", "2018-09-06"}
     assert len(by_day["2018-09-05"]) == 2
     assert len(by_day["2018-09-06"]) == 1
+
+
+def test_group_scenes_by_day_skips_unparsable_id_and_continues(capsys):
+    """Fix round: an unparsable scene id must be logged and skipped, not
+    raised -- group_scenes_by_day() runs before any day is fetched, so an
+    unhandled exception here would crash the whole month deterministically
+    on every retry (discovery re-runs from scratch each attempt)."""
+    scenes = [("S2A_31UFU_20180905_0_L2A", "https://x/a"),
+             ("not-a-valid-scene-id", "https://x/bad"),
+             ("S2A_31UFU_20180906_0_L2A", "https://x/c")]
+    by_day = group_scenes_by_day(scenes)
+    assert set(by_day) == {"2018-09-05", "2018-09-06"}
+    err = capsys.readouterr().err
+    assert "skipping unparsable scene id" in err
+    assert "not-a-valid-scene-id" in err
 
 
 # --------------------------------------------------------------------------
@@ -210,6 +248,35 @@ def test_repair_month_writes_one_chunk_per_day():
         day1 = dest_dir / "2018-09-01_2018-09-01.parquet"
         assert day1.exists() and day1.stat().st_size == 0
         assert len(list(dest_dir.glob("*.parquet"))) == 30  # every day in Sept
+
+
+def test_repair_month_skips_unparsable_scene_id_and_continues(capsys):
+    """Integration proof for the log-and-continue fix: a mixed batch with
+    one unparsable scene id alongside two valid ones must NOT raise -- the
+    valid days still get written, the bad id is warned about and skipped,
+    and repair_month returns normally (exit 0 at the CLI)."""
+    def fake_list(prefix):
+        if prefix.endswith("2018/9/"):
+            return [
+                "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/",
+                "sentinel-s2-l2a-cogs/31/U/FU/2018/9/not-a-valid-scene-id/",
+                "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180906_0_L2A/",
+            ]
+        return []
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        n = repair_month("2018-09", out, ["sentinel-s2-l2a-cogs/31/U/FU/"],
+                         workers=2, list_fn=fake_list, get_fn=_get_by_url)
+        assert n == 2, "the two valid days must still be fetched"
+        dest_dir = out / "repair"
+        day5 = dest_dir / "2018-09-05_2018-09-05.parquet"
+        day6 = dest_dir / "2018-09-06_2018-09-06.parquet"
+        assert day5.exists() and day5.stat().st_size > 0
+        assert day6.exists() and day6.stat().st_size > 0
+        err = capsys.readouterr().err
+        assert "skipping unparsable scene id" in err
+        assert "not-a-valid-scene-id" in err
 
 
 def test_repair_month_second_run_skips_already_finished_days():

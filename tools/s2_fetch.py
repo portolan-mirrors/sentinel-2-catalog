@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import tempfile
@@ -185,19 +186,31 @@ def copy_ndjson_to_parquet(nd_path: str, dest: Path) -> None:
     """The COPY/cast step shared by write_rows() above and s2_repair.py's
     streaming writer: turn an NDJSON file of normalize()d rows (one JSON
     object per line, `_geometry_json` instead of `geometry`) into a
-    canonical-schema chunk parquet."""
-    con = duckdb.connect()
-    con.execute("INSTALL spatial; LOAD spatial;")
-    cast = ", ".join(
-        f'CAST("{n}" AS {t}) AS "{n}"'
-        for n, t, _ in DATA_COLUMNS if n != "geometry")
-    con.execute(f"""
-        COPY (
-          SELECT {cast},
-                 ST_GeomFromGeoJSON(_geometry_json) AS geometry
-          FROM read_ndjson('{nd_path}', maximum_object_size=20000000)
-        ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
-    """)
+    canonical-schema chunk parquet.
+
+    COPYs to a same-directory temp name first, then os.replace()s it onto
+    `dest` -- a same-filesystem rename, atomic on POSIX and Windows alike.
+    Without this, a process killed mid-COPY (a real event: see
+    s2_repair.py's runner-eviction handling) would leave a PARTIAL file at
+    `dest`, and every caller's skip-if-exists check (`dest.exists()`) would
+    then treat that half-written chunk as finished and never retry it."""
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        con = duckdb.connect()
+        con.execute("INSTALL spatial; LOAD spatial;")
+        cast = ", ".join(
+            f'CAST("{n}" AS {t}) AS "{n}"'
+            for n, t, _ in DATA_COLUMNS if n != "geometry")
+        con.execute(f"""
+            COPY (
+              SELECT {cast},
+                     ST_GeomFromGeoJSON(_geometry_json) AS geometry
+              FROM read_ndjson('{nd_path}', maximum_object_size=20000000)
+            ) TO '{tmp}' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
+        """)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def main() -> int:

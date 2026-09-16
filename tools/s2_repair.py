@@ -179,10 +179,23 @@ def scene_day(scene_id: str) -> str:
 
 
 def group_scenes_by_day(scenes: list[tuple[str, str]]) -> dict[str, list[tuple[str, str]]]:
-    """scenes -> {"YYYY-MM-DD": [(scene_id, url), ...]}."""
+    """scenes -> {"YYYY-MM-DD": [(scene_id, url), ...]}.
+
+    A scene id that doesn't parse is logged and SKIPPED, not raised: this
+    runs before any day is fetched, so an unhandled exception here would
+    kill the whole month deterministically on every retry (discovery is
+    re-run from scratch each attempt) over one bad id, and no local check
+    can tell "harmless bucket oddity" from "expected item, malformed" --
+    the inventory audit (s2_audit.py) is the net that catches any resulting
+    shortfall against bucket ground truth, not this function."""
     by_day: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for scene_id, url in scenes:
-        by_day[scene_day(scene_id)].append((scene_id, url))
+        try:
+            day = scene_day(scene_id)
+        except ValueError:
+            print(f"  skipping unparsable scene id: {scene_id!r}", file=sys.stderr)
+            continue
+        by_day[day].append((scene_id, url))
     return dict(by_day)
 
 
