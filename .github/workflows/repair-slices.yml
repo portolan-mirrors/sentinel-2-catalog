@@ -37,10 +37,20 @@ jobs:
           MONTHS: ${{ inputs.months }}
         run: |
           python3 - << 'EOF' >> "$GITHUB_OUTPUT"
-          import json, os
-          months = [m.strip() for m in os.environ["MONTHS"].split(",") if m.strip()]
-          if not months:
+          import json, os, re
+          raw = [m.strip() for m in os.environ["MONTHS"].split(",") if m.strip()]
+          if not raw:
               raise SystemExit("no months given")
+          # A typo'd "2018-9" would otherwise mint artifact "slice-2018-9",
+          # which publish-backfill's plan job treats as a DIFFERENT slice
+          # name from "slice-2018-09" and would publish duplicate rows for
+          # the same month instead of superseding it.
+          pattern = re.compile(r"^\d{4}-\d{2}$")
+          bad = [m for m in raw if not pattern.match(m)]
+          if bad:
+              raise SystemExit(
+                  f"invalid month token(s), want YYYY-MM: {', '.join(bad)}")
+          months = sorted(set(raw))
           print("matrix=" + json.dumps({"include": [{"month": m} for m in months]}))
           EOF
 

@@ -11,6 +11,7 @@ import csv
 import json
 import sys
 import tempfile
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -22,7 +23,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from s2_schema import COLUMNS  # noqa: E402
 from s2_fetch import normalize  # noqa: E402
 from s2_repair import (  # noqa: E402
-    _is_valid_zone, discover_scenes, fetch_items, repair_month)
+    _is_valid_zone, discover_scenes, fetch_and_write, repair_month)
 from s2_audit import audit, expected_month_counts, have_month_counts  # noqa: E402
 
 STATIC_ITEM_URL = ("https://sentinel-cogs.s3.us-west-2.amazonaws.com/"
@@ -69,25 +70,40 @@ def test_is_valid_zone_excludes_the_stray_root_prefix():
 # --------------------------------------------------------------------------
 
 def test_discover_scenes_builds_https_urls_and_uses_unpadded_month():
+    """discover_scenes threads its LISTs across `workers` (finding #4 fix
+    round), so call order is not guaranteed -- assert on the SET of calls
+    and results, not list order."""
     calls = []
+    lock = threading.Lock()
 
     def fake_list(prefix):
-        calls.append(prefix)
+        with lock:
+            calls.append(prefix)
         if prefix == "sentinel-s2-l2a-cogs/31/U/FU/2018/9/":
             return ["sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/"]
         return []
 
     scenes = discover_scenes(["sentinel-s2-l2a-cogs/31/U/FU/",
                              "sentinel-s2-l2a-cogs/32/V/MJ/"],
-                             "2018", "9", fake_list)
-    # single-digit month in the prefix passed to list_fn, never "09"
-    assert calls == ["sentinel-s2-l2a-cogs/31/U/FU/2018/9/",
-                     "sentinel-s2-l2a-cogs/32/V/MJ/2018/9/"]
+                             "2018", "9", fake_list, workers=4)
+    # single-digit month in every prefix passed to list_fn, never "09"
+    assert set(calls) == {"sentinel-s2-l2a-cogs/31/U/FU/2018/9/",
+                          "sentinel-s2-l2a-cogs/32/V/MJ/2018/9/"}
     assert scenes == [
         ("S2A_31UFU_20180905_0_L2A",
          "https://sentinel-cogs.s3.us-west-2.amazonaws.com/"
          "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/"
          "S2A_31UFU_20180905_0_L2A.json")]
+
+
+def test_discover_scenes_uses_default_workers_when_not_given():
+    """`workers` has a default, so existing call sites with a positional
+    list_fn keep working without threading it through explicitly."""
+    scenes = discover_scenes(["sentinel-s2-l2a-cogs/31/U/FU/"], "2018", "9",
+                             lambda p: ["sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_X_0_L2A/"])
+    assert scenes == [("S2A_X_0_L2A",
+                       "https://sentinel-cogs.s3.us-west-2.amazonaws.com/"
+                       "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_X_0_L2A/S2A_X_0_L2A.json")]
 
 
 def _fake_item(item_id: str, month: str = "2018-09-05T10:00:00Z") -> dict:
@@ -110,13 +126,21 @@ def _fake_item(item_id: str, month: str = "2018-09-05T10:00:00Z") -> dict:
     }
 
 
-def test_fetch_items_normalizes_via_injected_getter():
+def test_fetch_and_write_streams_normalized_rows_to_ndjson():
+    """fetch_and_write must not accumulate rows in memory (finding #3 fix
+    round): it writes each normalize()d row straight to the NDJSON file at
+    nd_path as its future completes. Verified here by reading the file
+    back, not by inspecting a returned list."""
     scenes = [("A1", "https://x/A1.json"), ("A2", "https://x/A2.json")]
     items = {"https://x/A1.json": _fake_item("A1"),
             "https://x/A2.json": _fake_item("A2")}
-    rows = fetch_items(scenes, lambda url: items[url], workers=2)
-    assert {r["id"] for r in rows} == {"A1", "A2"}
-    assert all(r["s2:mgrs_tile"] == "31UFU" for r in rows)
+    with tempfile.TemporaryDirectory() as td:
+        nd = str(Path(td) / "rows.ndjson")
+        n = fetch_and_write(scenes, lambda url: items[url], nd, workers=2)
+        assert n == 2
+        rows = [json.loads(line) for line in Path(nd).read_text().splitlines()]
+        assert {r["id"] for r in rows} == {"A1", "A2"}
+        assert all(r["s2:mgrs_tile"] == "31UFU" for r in rows)
 
 
 # --------------------------------------------------------------------------
@@ -214,6 +238,52 @@ def test_expected_counts_exclude_tileinfo_and_handle_1_and_2_digit_months():
         assert counts == {(2018, 9): 1, (2018, 12): 1}, (
             "tileinfo_metadata.json must be excluded and both 1- and "
             "2-digit months must parse")
+
+
+def test_expected_counts_exclude_stray_root_keys_without_crashing():
+    """Regression net for finding #1 (fix round 1): a real inventory
+    contains ~64k keys like this one -- self-named, ends in .json, but with
+    NO {yyyy}/{m}/ pair at all because they sit directly under the bogus
+    "sentinel-s2-l2a-cogs/2019/" root prefix (see s2_repair.py's
+    _is_valid_zone() note). Before the fix, regexp_extract() found no match,
+    returned '', and CAST('' AS INTEGER) raised -- crashing the whole query
+    instead of excluding the row. It must now be silently excluded."""
+    with tempfile.TemporaryDirectory() as td:
+        inv = Path(td) / "inventory.csv"
+        _write_inventory_csv(inv, [
+            ("sentinel-cogs",
+             "sentinel-s2-l2a-cogs/2019/S2B_36KZC_20190806_0_L2A/"
+             "S2B_36KZC_20190806_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
+            ("sentinel-cogs",
+             "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/"
+             "S2A_31UFU_20180905_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
+        ])
+        con = duckdb.connect()
+        con.execute("SET TimeZone='UTC';")
+        counts = expected_month_counts(con, [str(inv)])  # must not raise
+        assert counts == {(2018, 9): 1}
+
+
+def test_expected_counts_exclude_non_self_named_json():
+    """Regression net for finding #2 (fix round 1): the brief's rule is
+    specifically {id}/{id}.json (self-named), not just "any .json that
+    isn't tileinfo_metadata.json". A differently-named JSON dropped in a
+    real scene directory must also be excluded."""
+    with tempfile.TemporaryDirectory() as td:
+        inv = Path(td) / "inventory.csv"
+        _write_inventory_csv(inv, [
+            ("sentinel-cogs",
+             "sentinel-s2-l2a-cogs/32/V/MJ/2018/12/S2A_32VMJ_20181215_0_L2A/"
+             "other_metadata.json", "100", "2024-01-01T00:00:00Z"),
+            ("sentinel-cogs",
+             "sentinel-s2-l2a-cogs/32/V/MJ/2018/12/S2A_32VMJ_20181215_0_L2A/"
+             "S2A_32VMJ_20181215_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
+        ])
+        con = duckdb.connect()
+        con.execute("SET TimeZone='UTC';")
+        counts = expected_month_counts(con, [str(inv)])
+        assert counts == {(2018, 12): 1}, (
+            "only the self-named {id}/{id}.json row may count")
 
 
 def test_audit_delta_table_and_exit_codes():

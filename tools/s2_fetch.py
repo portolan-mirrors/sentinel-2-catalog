@@ -166,26 +166,38 @@ def fetch_window(start: str, end: str, out_dir: Path,
 def write_rows(rows: list[dict], dest: Path) -> None:
     """Write normalize()d rows to a canonical-schema chunk parquet. Shared
     with s2_repair.py so the bucket repair path produces byte-identical
-    chunk schema to the API fetch path."""
+    chunk schema to the API fetch path. Holds all of `rows` in memory at
+    once -- fine here because fetch_window's own rows list is already
+    bounded by --days-per-chunk; s2_repair.py's per-month row count is not
+    bounded the same way, so it streams rows straight to an NDJSON file
+    instead of building a list and calls copy_ndjson_to_parquet() itself."""
     with tempfile.NamedTemporaryFile("w", suffix=".ndjson", delete=False) as tf:
         for r in rows:
             tf.write(json.dumps(r) + "\n")
         nd = tf.name
     try:
-        con = duckdb.connect()
-        con.execute("INSTALL spatial; LOAD spatial;")
-        cast = ", ".join(
-            f'CAST("{n}" AS {t}) AS "{n}"'
-            for n, t, _ in DATA_COLUMNS if n != "geometry")
-        con.execute(f"""
-            COPY (
-              SELECT {cast},
-                     ST_GeomFromGeoJSON(_geometry_json) AS geometry
-              FROM read_ndjson('{nd}', maximum_object_size=20000000)
-            ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
-        """)
+        copy_ndjson_to_parquet(nd, dest)
     finally:
         Path(nd).unlink()
+
+
+def copy_ndjson_to_parquet(nd_path: str, dest: Path) -> None:
+    """The COPY/cast step shared by write_rows() above and s2_repair.py's
+    streaming writer: turn an NDJSON file of normalize()d rows (one JSON
+    object per line, `_geometry_json` instead of `geometry`) into a
+    canonical-schema chunk parquet."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    cast = ", ".join(
+        f'CAST("{n}" AS {t}) AS "{n}"'
+        for n, t, _ in DATA_COLUMNS if n != "geometry")
+    con.execute(f"""
+        COPY (
+          SELECT {cast},
+                 ST_GeomFromGeoJSON(_geometry_json) AS geometry
+          FROM read_ndjson('{nd_path}', maximum_object_size=20000000)
+        ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 100000)
+    """)
 
 
 def main() -> int:

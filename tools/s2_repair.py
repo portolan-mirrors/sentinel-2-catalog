@@ -20,25 +20,37 @@ Discovery is two-level:
      prefixes across 60 real UTM zones -- see build_prefix_cache()'s
      _is_valid_zone() note for one bucket-root anomaly excluded along the
      way.
-  2. Per month: for each cached tile prefix, LIST "{prefix}{yyyy}/{m}/" for
-     scene directories, then GET "{id}.json" for each -- both anonymous
-     (boto3 UNSIGNED for LIST, plain HTTPS for GET), both threaded.
+  2. Per month: for each cached tile prefix (threaded, --workers), LIST
+     "{prefix}{yyyy}/{m}/" for scene directories, then GET "{id}.json" for
+     each (also threaded) -- both anonymous: boto3 UNSIGNED for LIST, plain
+     HTTPS for GET.
 
 Resumable exactly like s2_fetch.py: an existing non-empty chunk is skipped,
 and a month with zero matches leaves a zero-byte sentinel.
+
+Memory: a month can be ~450k items -- far more than s2_fetch's own
+per-chunk row lists, which stay small because fetch_window is called once
+per --days-per-chunk window (1 day by default). repair_month() does NOT
+hold a month's rows in a Python list: fetch_and_write() streams each
+normalize()d row straight to a temp NDJSON file as its GET future
+completes, so peak memory is bounded by in-flight HTTP responses
+(~--workers of them) plus DuckDB's own read_ndjson buffering during the
+single COPY at the end, not by the item count.
 """
 from __future__ import annotations
 
 import argparse
 import calendar
 import json
+import os
 import sys
+import tempfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from s2_fetch import UA, normalize, with_retries, write_rows  # noqa: E402
+from s2_fetch import UA, copy_ndjson_to_parquet, normalize, with_retries  # noqa: E402
 
 BUCKET = "sentinel-cogs"
 PREFIX_ROOT = "sentinel-s2-l2a-cogs/"
@@ -111,14 +123,22 @@ def load_prefixes(path: Path = DEFAULT_PREFIX_CACHE) -> list[str]:
     return [line for line in path.read_text().splitlines() if line]
 
 
-def discover_scenes(prefixes: list[str], yyyy: str, m: str, list_fn) -> list[tuple[str, str]]:
+def discover_scenes(prefixes: list[str], yyyy: str, m: str, list_fn,
+                    workers: int = 16) -> list[tuple[str, str]]:
     """[(scene_id, item_json_url), ...] for one month across every cached
-    tile prefix. `m` must already be the bucket's non-padded form ("9", not
-    "09"). `list_fn(prefix)` returns the CommonPrefixes directly under
-    `prefix` -- injected so this is testable without S3."""
+    tile prefix (~35k of them -- threaded across `workers`, matching
+    build_prefix_cache's pattern; a serial loop over that many LISTs would
+    dominate a month's wall clock). `m` must already be the bucket's
+    non-padded form ("9", not "09"). `list_fn(prefix)` returns the
+    CommonPrefixes directly under `prefix` -- injected so this is testable
+    without S3. Results are gathered in prefix order (not completion
+    order), which also keeps behavior deterministic for tests."""
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(list_fn, f"{p}{yyyy}/{m}/") for p in prefixes]
+        results = [f.result() for f in futures]
     out: list[tuple[str, str]] = []
-    for prefix in prefixes:
-        for scene_prefix in list_fn(f"{prefix}{yyyy}/{m}/"):
+    for scene_prefixes in results:
+        for scene_prefix in scene_prefixes:
             scene_id = scene_prefix.rstrip("/").rsplit("/", 1)[-1]
             out.append((scene_id, f"{HTTPS_BASE}/{scene_prefix}{scene_id}.json"))
     return out
@@ -131,16 +151,24 @@ def _get_json(url: str, tries: int = 8) -> dict:
     return with_retries(call, tries)
 
 
-def fetch_items(scenes: list[tuple[str, str]], get_fn, workers: int = 16) -> list[dict]:
-    """GET + normalize() every scene's item JSON. `get_fn(url)` returns the
-    parsed item dict -- injected so this is testable without S3, and swapped
-    for a real HTTPS GET (with retry) in production."""
-    rows = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
+                    workers: int = 16) -> int:
+    """GET + normalize() every scene's item JSON, writing each row straight
+    to the NDJSON file at `nd_path` as its future completes -- never holds
+    more than one month's worth of in-flight requests in memory, unlike
+    accumulating a Python list of ~450k rows. The writes happen in THIS
+    thread as as_completed() yields (fetching is threaded, consuming is
+    not), so no lock is needed even though GETs run in worker threads.
+    `get_fn(url)` returns the parsed item dict -- injected so this is
+    testable without S3, and swapped for a real HTTPS GET (with retry) in
+    production. Returns the row count written."""
+    n = 0
+    with open(nd_path, "w") as nd, ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(get_fn, url) for _, url in scenes]
         for f in as_completed(futures):
-            rows.append(normalize(f.result()))
-    return rows
+            nd.write(json.dumps(normalize(f.result())) + "\n")
+            n += 1
+    return n
 
 
 def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 16,
@@ -162,14 +190,20 @@ def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 
         if get_fn is None:
             get_fn = _get_json
 
-    scenes = discover_scenes(prefixes, y, m, list_fn)
+    scenes = discover_scenes(prefixes, y, m, list_fn, workers)
     if not scenes:
         dest.touch()          # sentinel: fetched, zero matches
         return 0
-    rows = fetch_items(scenes, get_fn, workers)
-    write_rows(rows, dest)
-    print(f"  {dest.name}: {len(rows):,} rows", flush=True)
-    return len(rows)
+
+    fd, nd = tempfile.mkstemp(suffix=".ndjson")
+    os.close(fd)
+    try:
+        n = fetch_and_write(scenes, get_fn, nd, workers)
+        copy_ndjson_to_parquet(nd, dest)
+    finally:
+        Path(nd).unlink(missing_ok=True)
+    print(f"  {dest.name}: {n:,} rows", flush=True)
+    return n
 
 
 def main() -> int:

@@ -14,8 +14,21 @@ reads it directly via read_csv with an explicit column list; no separate
 ORC path needed.
 
 Each scene directory holds two JSON files -- "{id}.json" (the item) and
-"tileinfo_metadata.json" (excluded here). Both end in ".json", so the
-exclusion must check the tail of the key, not just the extension.
+"tileinfo_metadata.json" (excluded here). Both end in ".json", so the item
+is identified by the brief's actual rule: the file is SELF-NAMED, i.e. the
+filename stem equals the enclosing directory name ({id}/{id}.json). RE2 (
+DuckDB's regex engine) has no backreferences, so this is checked by
+extracting the directory-name and filename-stem groups separately and
+comparing them for equality in SQL, not inside one regex.
+
+The bucket also holds ~64k keys (see s2_repair.py's _is_valid_zone() note)
+that end in ".json" and even happen to be self-named, but sit directly
+under a bogus "sentinel-s2-l2a-cogs/2019/" root prefix with no {yyyy}/{m}/
+segments at all -- these fail the year/month regex entirely and MUST be
+filtered out of the WHERE clause with regexp_matches(), not just left for
+the CAST to sort out: DuckDB's CAST('' AS INTEGER) raises rather than
+returning NULL, so a regexp_extract() that found no match crashes the
+whole query instead of producing an excludable row.
 
 Truth: the audit defines "expected" from the bucket. Earth Search keeps
 multiple processing sequences (s2:sequence) for some scenes, so a small
@@ -34,9 +47,11 @@ INV_BUCKET = "sentinel-cogs-inventory"
 INV_PREFIX = "sentinel-cogs/sentinel-cogs/hive/"
 DEFAULT_PUBLISHED_BASE = "https://data.source.coop/portolan-mirrors/sentinel-2-catalog"
 
-# Anchors the tail of an item key: .../{yyyy}/{m}/{id}/{id}.json. m is 1 or
-# 2 digits (the bucket does not zero-pad month path segments).
-KEY_RE = r'/(\d{4})/(\d{1,2})/[^/]+/[^/]+\.json$'
+# Anchors the tail of an item key: .../{yyyy}/{m}/{dirname}/{filestem}.json.
+# m is 1 or 2 digits (the bucket does not zero-pad month path segments).
+# Groups 3 (dirname) and 4 (filestem) are compared for equality in SQL to
+# enforce the self-named {id}/{id}.json rule -- RE2 has no backreferences.
+KEY_RE = r'/(\d{4})/(\d{1,2})/([^/]+)/([^/]+)\.json$'
 
 CSV_COLUMNS = {"bucket": "VARCHAR", "key": "VARCHAR",
               "size": "BIGINT", "last_modified": "VARCHAR"}
@@ -83,8 +98,19 @@ def manifest_data_urls(s3, manifest_key: str) -> list[str]:
 
 
 def _month_where(months: list[str] | None) -> str:
-    where = ("key LIKE 'sentinel-s2-l2a-cogs/%.json' "
-            "AND key NOT LIKE '%tileinfo_metadata.json'")
+    # The LIKE is a cheap pre-filter (ends in .json under the tile root);
+    # regexp_matches excludes keys with no {yyyy}/{m}/ pair at all (the
+    # bogus root-level "2019/" scenes) BEFORE the CAST below ever sees them
+    # -- required, not just tidy: CAST('' AS INTEGER) raises in DuckDB, it
+    # does not return NULL, so an unmatched regexp_extract() would crash the
+    # whole query rather than being excludable. The final clause enforces
+    # the self-named {id}/{id}.json rule (drops tileinfo_metadata.json and
+    # any other non-self-named json alongside a real item).
+    where = (
+        "key LIKE 'sentinel-s2-l2a-cogs/%.json' "
+        f"AND regexp_matches(key, '{KEY_RE}') "
+        f"AND regexp_extract(key, '{KEY_RE}', 3) = regexp_extract(key, '{KEY_RE}', 4)"
+    )
     if not months:
         return where
     clauses = []
