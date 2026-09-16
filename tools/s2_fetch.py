@@ -18,6 +18,7 @@ sat:orbit_state on newer items).
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -46,11 +47,24 @@ _REL_ORBIT = re.compile(r"_R(\d{3})_")
 def with_retries(fn, tries: int = 8):
     """Call fn() with exponential backoff (capped at 300s) on network/HTTP
     errors. Shared by the API POST here and s2_repair.py's bucket GETs so
-    both retry the same way against different transports."""
+    both retry the same way against different transports.
+
+    Catches http.client.HTTPException and ConnectionError alongside
+    urllib.error.URLError/HTTPError and TimeoutError: urllib only wraps
+    connect-phase failures into URLError. A connection that drops during
+    the response-read phase surfaces as a raw http.client.HTTPException
+    subclass (RemoteDisconnected, BadStatusLine, IncompleteRead) or a raw
+    ConnectionError subclass (ConnectionResetError), neither of which is a
+    URLError -- so without this those escaped uncaught and killed a whole
+    month's repair job (production, run 35097702125, job repair (2018-09)).
+    MissingItem (s2_repair.py) is a plain Exception, not one of these, so
+    it stays outside this tuple by construction and keeps propagating
+    immediately with zero retries."""
     for i in range(tries):
         try:
             return fn()
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+                http.client.HTTPException, ConnectionError) as e:
             if i == tries - 1:
                 raise
             wait = min(2 ** i * 5, 300)
