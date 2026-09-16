@@ -4,8 +4,10 @@
 Assets ship as a JSON string column holding the upstream assets object
 verbatim, never a nested struct: deep struct nesting made earlier parquets
 hard to open, and a string keeps every reader's schema flat. Verbatim
-because it is nearly free — measured 179 B/row under zstd-22 with
-clustered ordering — and lossless beats clever. This module is the single
+because it is nearly free — measured 179 B/row under zstd with clustered
+ordering on 2026-09-15, before anyone knew the requested compression level
+was not reaching the file; parts now publish at zstd 18, which cannot make
+that number larger — and lossless beats clever. This module is the single
 source of truth for the column list; collection metadata is generated
 from it.
 """

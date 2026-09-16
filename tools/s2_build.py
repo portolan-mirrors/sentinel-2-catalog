@@ -73,17 +73,25 @@ ROW_GROUP = 100_000
 # The one knob. zstd decompression cost is flat across levels, so a reader
 # pays nothing for a high one -- but the writer pays, and on this row shape
 # (geometry + array + JSON-heavy columns) the ultra tiers fall off a cliff.
-# Benchmarked single-threaded on 50k rows of the real staged 2017 file
-# (gpio-fix-report.md): level 3 = 1.4s / 22.3MB, level 15 = 5.0s / 19.6MB,
-# level 22 = 662.1s / 15.7MB. That is 132x level 15's time for 20% off its
-# size, and extrapolates to ~4.9 hours of compression for one year part --
-# the best explanation of the two 6-hour CI timeouts on 2017. 22 is what the
-# user asked for on 2026-09-15, when every timing in front of them was
-# secretly level 3; the 15-vs-22 call is being made separately, so this
-# constant stays 22 until it is. S2_ZSTD_LEVEL is a test hook
-# (tests/test_build.py builds one fixture at two levels); nothing in CI sets
-# it, and no year part should ever be built with it set.
-ZSTD_LEVEL = int(os.environ.get("S2_ZSTD_LEVEL", "22"))
+# Benchmarked single-threaded on the first 50k rows of the real staged 2017
+# file, DuckDB COPY with threads=1 (levels 3/15/22 from gpio-fix-report.md;
+# 18 re-measured 2026-09-16 the same way, with 15 re-run alongside it as the
+# control -- it reproduced byte-for-byte, 19,638,531 B, in 6.4s):
+#
+#   level  3 =   1.4s / 22.3MB
+#   level 15 =   5.0s / 19.6MB
+#   level 18 = 164.8s / 18.7MB   <- published
+#   level 22 = 662.1s / 15.7MB
+#
+# 18 buys 5% off level 15's size for 26x its time (against the 6.4s
+# control run; 33x against the report's 5.0s), and extrapolates to
+# roughly 70 minutes of single-threaded compression for a 1.3M-row year --
+# hours less than 22's ~4.9 (the two 6-hour CI timeouts on 2017), but not
+# minutes. The user chose 18 over both (2026-09-16): "worth some extra time
+# for smaller files, as everyone who downloads them benefits". S2_ZSTD_LEVEL
+# is a test hook (tests/test_build.py builds one fixture at two levels);
+# nothing in CI sets it, and no year part should ever be built with it set.
+ZSTD_LEVEL = int(os.environ.get("S2_ZSTD_LEVEL", "18"))
 # What this process's DuckDB keeps while the gpio subprocess writes. Small
 # enough to hand the runner's RAM over, big enough that the connection
 # survives to stage the next year.

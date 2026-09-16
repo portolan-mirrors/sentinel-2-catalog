@@ -102,9 +102,10 @@ are not in `run_all.py` because they need `duckdb`, and the build test needs
 Install `geoparquet-io==1.5.0` — the version every workflow pins. Unpinned, it
 moved from 1.3.0 to 1.5.0 under this catalog without anyone noticing, and
 `gpio sort column`'s `--compression-level` went from a no-op to a flag that
-costs hours at zstd 22. `tools/s2_build.py` needs at least 1.4 for that flag
-and for `--write-memory`; testing against an older local install measures a
-tool CI does not run.
+costs real time (parts publish at zstd 18; 22 costs hours per year).
+`tools/s2_build.py` needs at least 1.4 for that flag and for
+`--write-memory`; testing against an older local install measures a tool CI
+does not run.
 
 CI runs `rashid`, `stac-check`, and `tests/run_all.py` on every pull request.
 `docs/conformance.md` records any accepted deviation, with the rule, why, and

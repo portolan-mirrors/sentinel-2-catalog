@@ -103,10 +103,11 @@ def test_build_handles_dotdot_in_paths():
 # back the rows of a multi-row-group file scrambled, and that read-side
 # artifact looks exactly like an unsorted write.
 BIG_ROWS = 150_000
-# Levels for the compression gate. Never 22 here: benchmarked single-threaded
-# on real staged rows, level 22 costs 662s per 50k rows against 5.0s at 15
-# (gpio-fix-report.md). A CI gate that took ten minutes to prove a flag is
-# wired would not survive. 1-vs-15 proves the same thing in under a second.
+# Levels for the compression gate. Never the published level (18) here:
+# benchmarked single-threaded on real staged rows, 18 costs 164.8s per 50k
+# rows and 22 costs 662s, against 5.0s at 15 (s2_build.py's ZSTD_LEVEL
+# comment). A CI gate that took minutes to prove a flag is wired would not
+# survive. 1-vs-15 proves the same thing in under a second.
 LEVEL_LOW, LEVEL_HIGH = 1, 15
 SMALL_ROWS = 50_000
 
@@ -141,7 +142,7 @@ def _mk_big_chunk(con, path, rows=BIG_ROWS):
 def _build(out, chunks, level, env=None):
     """Run the CLI the way the workflows do, with zstd pinned through the
     S2_ZSTD_LEVEL test hook. Every test passes a level: the published default
-    is 22, which no test can afford to wait for."""
+    is 18, which no test can afford to wait for."""
     env = dict(env or os.environ, S2_ZSTD_LEVEL=str(level))
     return subprocess.run(
         [sys.executable, "tools/s2_build.py", "--sources", str(chunks.parent),
