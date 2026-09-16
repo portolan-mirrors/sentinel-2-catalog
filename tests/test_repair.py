@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 
 import duckdb
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -23,7 +24,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 from s2_schema import COLUMNS  # noqa: E402
 from s2_fetch import normalize  # noqa: E402
 from s2_repair import (  # noqa: E402
-    _is_valid_zone, discover_scenes, fetch_and_write, repair_month)
+    _is_valid_zone, discover_scenes, fetch_and_write, group_scenes_by_day,
+    repair_month, scene_day)
 from s2_audit import audit, expected_month_counts, have_month_counts  # noqa: E402
 
 STATIC_ITEM_URL = ("https://sentinel-cogs.s3.us-west-2.amazonaws.com/"
@@ -144,60 +146,128 @@ def test_fetch_and_write_streams_normalized_rows_to_ndjson():
 
 
 # --------------------------------------------------------------------------
-# repair_month: end-to-end against injected lister/getter, real parquet out
+# scene_day / group_scenes_by_day: date extraction from the scene id
 # --------------------------------------------------------------------------
 
-def test_repair_month_writes_canonical_chunk():
-    def fake_list(prefix):
-        if prefix.endswith("2018/9/"):
-            sid = "S2A_31UFU_2018090" + prefix[-4]
-            return [f"sentinel-s2-l2a-cogs/31/U/FU/2018/9/{sid}_0_L2A/"]
-        return []
+def test_scene_day_parses_the_embedded_acquisition_date():
+    assert scene_day("S2A_31UFU_20180905_0_L2A") == "2018-09-05"
+    assert scene_day("S2C_53HNV_20260910_0_L2A") == "2026-09-10"
 
-    def fake_get(url):
-        item_id = url.rsplit("/", 1)[-1].removesuffix(".json")
-        return _fake_item(item_id)
 
+def test_scene_day_rejects_unrecognized_ids():
+    with pytest.raises(ValueError):
+        scene_day("not-a-scene-id")
+
+
+def test_group_scenes_by_day_buckets_by_date():
+    scenes = [("S2A_31UFU_20180905_0_L2A", "https://x/a"),
+             ("S2A_31UFU_20180905_1_L2A", "https://x/b"),
+             ("S2A_31UFU_20180906_0_L2A", "https://x/c")]
+    by_day = group_scenes_by_day(scenes)
+    assert set(by_day) == {"2018-09-05", "2018-09-06"}
+    assert len(by_day["2018-09-05"]) == 2
+    assert len(by_day["2018-09-06"]) == 1
+
+
+# --------------------------------------------------------------------------
+# repair_month: end-to-end against injected lister/getter, real parquet out.
+# Day-granular (fix round: eviction resilience) -- one chunk per day, so a
+# month is many small units of work rather than one big one, and a rerun
+# only fetches whatever day never finished.
+# --------------------------------------------------------------------------
+
+def _two_day_month_list_fn(prefix):
+    if prefix.endswith("2018/9/"):
+        return ["sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/",
+                "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180906_0_L2A/"]
+    return []
+
+
+def _get_by_url(url):
+    item_id = url.rsplit("/", 1)[-1].removesuffix(".json")
+    return _fake_item(item_id)
+
+
+def test_repair_month_writes_one_chunk_per_day():
     with tempfile.TemporaryDirectory() as td:
         out = Path(td)
         n = repair_month("2018-09", out, ["sentinel-s2-l2a-cogs/31/U/FU/"],
-                         workers=2, list_fn=fake_list, get_fn=fake_get)
-        assert n == 1
-        dest = out / "repair" / "2018-09-01_2018-09-30.parquet"
-        assert dest.exists()
+                         workers=2, list_fn=_two_day_month_list_fn, get_fn=_get_by_url)
+        assert n == 2  # one scene per day, two days with scenes
+        dest_dir = out / "repair"
+        day5 = dest_dir / "2018-09-05_2018-09-05.parquet"
+        day6 = dest_dir / "2018-09-06_2018-09-06.parquet"
+        assert day5.exists() and day5.stat().st_size > 0
+        assert day6.exists() and day6.stat().st_size > 0
         con = duckdb.connect()
         con.execute("INSTALL spatial; LOAD spatial;")
-        desc = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{dest}')").fetchall()
+        desc = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{day5}')").fetchall()
         got = [d[0] for d in desc]
-        want = [n for n, _, _ in DATA_COLUMNS]
-        assert got == want, "repair chunk must match s2_fetch's canonical schema"
+        want = [c[0] for c in DATA_COLUMNS]
+        assert got == want, "each day's chunk must match s2_fetch's canonical schema"
+        # Every other day in September gets a zero-byte sentinel, exactly
+        # like s2_fetch.py's own per-day resumability contract.
+        day1 = dest_dir / "2018-09-01_2018-09-01.parquet"
+        assert day1.exists() and day1.stat().st_size == 0
+        assert len(list(dest_dir.glob("*.parquet"))) == 30  # every day in Sept
 
 
-def test_repair_month_skips_when_chunk_exists():
+def test_repair_month_second_run_skips_already_finished_days():
+    """Per-day flush proof: after a first full run, a second run over the
+    same month must not re-fetch ANY day -- discovery (list_fn) still runs
+    (month-level, unconditional), but get_fn must never be called again."""
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        first = repair_month("2018-09", out, ["sentinel-s2-l2a-cogs/31/U/FU/"],
+                             workers=2, list_fn=_two_day_month_list_fn,
+                             get_fn=_get_by_url)
+        assert first == 2
+
+        def boom(*a, **k):
+            raise AssertionError("must not re-fetch a day whose chunk already exists")
+
+        second = repair_month("2018-09", out, ["sentinel-s2-l2a-cogs/31/U/FU/"],
+                              workers=2, list_fn=_two_day_month_list_fn, get_fn=boom)
+        assert second == 0
+
+
+def test_repair_month_resumes_partial_progress():
+    """The workflow's resume story: a prior (evicted) attempt already
+    finished day 1 and uploaded a partial slice-YYYY-MM artifact; the
+    workflow downloads it into the SAME staging dir before re-invoking this
+    tool. repair_month must skip day 1 (its chunk already exists on disk)
+    and only fetch day 2."""
     with tempfile.TemporaryDirectory() as td:
         out = Path(td)
         dest_dir = out / "repair"
-        dest_dir.mkdir()
-        existing = dest_dir / "2019-01-01_2019-01-31.parquet"
-        existing.write_bytes(b"not-empty")
+        dest_dir.mkdir(parents=True)
+        pre_existing = dest_dir / "2018-09-05_2018-09-05.parquet"
+        pre_existing.write_bytes(b"already-finished-before-eviction")
 
-        def boom(*a, **k):
-            raise AssertionError("must not be called when chunk already exists")
+        def get_fn(url):
+            if "20180905" in url:
+                raise AssertionError("day 1 already has a chunk; must not re-fetch")
+            return _get_by_url(url)
 
-        n = repair_month("2019-01", out, ["sentinel-s2-l2a-cogs/31/U/FU/"],
-                         list_fn=boom, get_fn=boom)
-        assert n == 0
-        assert existing.read_bytes() == b"not-empty"
+        n = repair_month("2018-09", out, ["sentinel-s2-l2a-cogs/31/U/FU/"],
+                         workers=2, list_fn=_two_day_month_list_fn, get_fn=get_fn)
+        assert n == 1, "only day 2's one scene should be fetched"
+        assert pre_existing.read_bytes() == b"already-finished-before-eviction"
+        day6 = dest_dir / "2018-09-06_2018-09-06.parquet"
+        assert day6.exists() and day6.stat().st_size > 0
 
 
-def test_repair_month_zero_scenes_writes_sentinel():
+def test_repair_month_zero_scenes_writes_sentinel_per_day():
     with tempfile.TemporaryDirectory() as td:
         out = Path(td)
         n = repair_month("2019-02", out, ["sentinel-s2-l2a-cogs/31/U/FU/"],
                          list_fn=lambda p: [], get_fn=lambda u: {})
         assert n == 0
-        dest = out / "repair" / "2019-02-01_2019-02-28.parquet"
-        assert dest.exists() and dest.stat().st_size == 0
+        dest_dir = out / "repair"
+        for day in ("01", "14", "28"):
+            f = dest_dir / f"2019-02-{day}_2019-02-{day}.parquet"
+            assert f.exists() and f.stat().st_size == 0
+        assert len(list(dest_dir.glob("*.parquet"))) == 28  # 2019 is not a leap year
 
 
 # --------------------------------------------------------------------------

@@ -1,15 +1,31 @@
 name: repair-slices
 
 # API-independent recovery path for month-slices backfill.yml lost to
-# sustained Earth Search 502 windows (e.g. 2018-09..2019-04). Fetches static
-# item JSON straight from the sentinel-cogs bucket -- anonymous S3, no
-# outage windows, no cloud credentials here (same posture as backfill.yml).
+# sustained Earth Search 502 windows (e.g. 2018-12..2019-04, reproducible
+# from any IP -- the bucket path is the ONLY source for these months).
+# Fetches static item JSON straight from the sentinel-cogs bucket --
+# anonymous S3, no outage windows, no cloud credentials here (same posture
+# as backfill.yml).
 #
 # Uploads slice-YYYY-MM artifacts with the IDENTICAL contract backfill.yml
 # uses (same name pattern, same flat-file-at-root layout), so
 # publish-backfill.yml consumes a repair artifact with zero changes: its
 # plan job dedupes newest-artifact-per-name, so a repair artifact naturally
 # supersedes a failed API one for the same month.
+#
+# Eviction resilience (production evidence, 2026-09-16, run 35066483463):
+# 11/11 repair job attempts were killed by GitHub Actions runner evictions
+# ("shutdown signal") before finishing a month -- faster at higher
+# --workers (~20-25min at 48 vs ~1h at 16), so raising parallelism cannot
+# outrun the reaper; --workers defaults back to 16 here. s2_repair.py now
+# writes one parquet chunk PER DAY, finalized as soon as that day's items
+# are fetched, so an eviction mid-month still leaves every already-finished
+# day on disk. This job therefore: downloads whatever slice-YYYY-MM
+# artifact a PRIOR (evicted) attempt already produced before repairing
+# (s2_repair.py's per-day skip-if-exists picks up only the unfinished
+# days), and uploads with `if: always()` so partial progress from an
+# eviction is never lost -- publish-backfill's newest-per-name dedupe means
+# each re-upload simply supersedes the last.
 
 on:
   workflow_dispatch:
@@ -17,8 +33,11 @@ on:
       months:
         description: "Comma-separated months to repair, e.g. 2018-09,2018-10"
         required: true
+      workers:
+        description: "Fetch parallelism (higher finishes faster but is evicted faster too -- 16 is the observed sweet spot)"
+        default: "16"
       force:
-        description: "Repair even if a non-expired slice artifact already exists (for a bad/partial one)"
+        description: "Ignore any existing slice-YYYY-MM artifact and start the month clean"
         type: boolean
         default: false
 
@@ -65,41 +84,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Same resume check as backfill.yml, plus a force bypass: repair often
-      # re-does a month whose existing artifact is bad or partial rather
-      # than simply missing, and a failed run uploads no artifact at all
-      # (if-no-files-found: error), so the plain "already exists" check
-      # alone would never let a bad-but-present artifact be redone.
-      - name: Skip if this slice was already fetched
-        id: resume
+      # An existing slice-YYYY-MM artifact is no longer "done, skip it" --
+      # it is PROGRESS from a prior (likely evicted) attempt. Download it
+      # into the exact directory s2_repair.py writes to, so its per-day
+      # skip-if-exists logic resumes from whatever days already landed
+      # instead of re-fetching the whole month. `force` discards it and
+      # starts clean (e.g. to redo a month whose saved days look bad).
+      - name: Download prior progress for this slice, if any
         if: ${{ inputs.force != true }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          mkdir -p staging/chunks/repair
           NAME="slice-${{ matrix.month }}"
-          FOUND=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100&name=$NAME" \
-                    --jq '[.artifacts[] | select(.expired==false)] | length' 2>/dev/null || echo 0)
-          if [ "${FOUND:-0}" -gt 0 ]; then
-            echo "done=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::$NAME already exists; skipping (re-dispatch with force to override)"
+          ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100&name=$NAME" \
+                 --jq '[.artifacts[] | select(.expired==false)] | sort_by(.created_at) | last | .id // empty' \
+                 2>/dev/null || true)
+          if [ -n "${ID:-}" ]; then
+            echo "::notice::$NAME found (artifact $ID); downloading prior progress"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip" > dl.zip
+            unzip -q -o dl.zip -d staging/chunks/repair
+            rm -f dl.zip
+            echo "existing day chunk(s): $(find staging/chunks/repair -name '*.parquet' | wc -l)"
           else
-            echo "done=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$NAME not found; starting clean"
           fi
 
       - uses: actions/setup-python@v5
-        if: steps.resume.outputs.done != 'true'
         with:
           python-version: "3.12"
 
+      # Never gated on the download step above: a killed job must still
+      # attempt whatever days remain, whether or not it found prior
+      # progress to resume from.
       - name: Repair the month from the bucket
-        if: steps.resume.outputs.done != 'true'
         run: |
           pip install --quiet duckdb boto3
-          python3 tools/s2_repair.py --month "${{ matrix.month }}" --out ./staging/chunks --workers 48
+          python3 tools/s2_repair.py --month "${{ matrix.month }}" --out ./staging/chunks \
+            --workers "${{ inputs.workers }}"
 
+      # if: always() -- an eviction mid-month must not discard the days
+      # that already finished before it hit. if-no-files-found: error
+      # stays: a job evicted before even ONE day landed (and with no prior
+      # artifact to resume from) has nothing to save, and that is correct,
+      # not a bug to route around.
       - uses: actions/upload-artifact@v4
-        if: steps.resume.outputs.done != 'true'
+        if: always()
         with:
           name: slice-${{ matrix.month }}
           path: staging/chunks/repair/

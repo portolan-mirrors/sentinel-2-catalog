@@ -25,17 +25,35 @@ Discovery is two-level:
      each (also threaded) -- both anonymous: boto3 UNSIGNED for LIST, plain
      HTTPS for GET.
 
-Resumable exactly like s2_fetch.py: an existing non-empty chunk is skipped,
-and a month with zero matches leaves a zero-byte sentinel.
+Chunking and eviction resilience (production evidence, 2026-09-16): a
+single-parquet-per-month run of repair-slices.yml was killed by GitHub
+Actions runner evictions in 11/11 attempts -- worse at higher --workers
+(~20-25min to eviction at 48 vs ~1h at 16, i.e. kill rate tracks request
+rate, so raising parallelism cannot outrun it) -- and Earth Search
+persistently 502s 2018-12..2019-04 from any IP, so this bucket path is the
+ONLY source for those months and must survive being evicted mid-run.
+repair_month() therefore writes one chunk PER DAY
+("YYYY-MM-DD_YYYY-MM-DD.parquet", same naming s2_fetch.py uses at
+--days-per-chunk=1, so publish-backfill's `${Y}-*.parquet` glob already
+matches), finalizing each day's parquet as soon as that day's items are
+fetched -- so a mid-month eviction still leaves every already-finished
+day's chunk on disk (and, per the workflow, already uploaded). Discovery
+stays a single month-level LIST pass (splitting it per day would multiply
+LISTs by ~30 for no benefit); scenes are grouped into days by the acquisition
+date embedded in the scene id (S2A_31UFU_20180905_0_L2A -> 2018-09-05), not
+by a second LIST per day. Skip-if-exists is per day, exactly like
+s2_fetch.py: an existing non-empty day chunk is skipped (no re-fetch), and
+a day with zero matches leaves a zero-byte sentinel -- so re-running
+repair_month() for a month that was interrupted mid-way (the workflow
+downloads whatever partial slice-YYYY-MM artifact already exists before
+re-invoking this tool) only fetches the days that never finished.
 
-Memory: a month can be ~450k items -- far more than s2_fetch's own
-per-chunk row lists, which stay small because fetch_window is called once
-per --days-per-chunk window (1 day by default). repair_month() does NOT
-hold a month's rows in a Python list: fetch_and_write() streams each
-normalize()d row straight to a temp NDJSON file as its GET future
-completes, so peak memory is bounded by in-flight HTTP responses
-(~--workers of them) plus DuckDB's own read_ndjson buffering during the
-single COPY at the end, not by the item count.
+Memory: a day is at most a few thousand items (unlike a whole month, up to
+~450k) -- fetch_and_write() still streams each normalize()d row straight to
+a temp NDJSON file as its GET future completes rather than building a
+Python list, so peak memory per day is bounded by in-flight HTTP responses
+(~--workers of them) plus DuckDB's own read_ndjson buffering during that
+day's COPY, not by the item count.
 """
 from __future__ import annotations
 
@@ -43,9 +61,11 @@ import argparse
 import calendar
 import json
 import os
+import re
 import sys
 import tempfile
 import urllib.request
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -144,6 +164,28 @@ def discover_scenes(prefixes: list[str], yyyy: str, m: str, list_fn,
     return out
 
 
+_SCENE_ID_RE = re.compile(r'^[A-Z0-9]+_[A-Z0-9]+_(\d{4})(\d{2})(\d{2})_\d+_[A-Z0-9]+$')
+
+
+def scene_day(scene_id: str) -> str:
+    """The ISO acquisition date (YYYY-MM-DD) embedded in a scene id, e.g.
+    S2A_31UFU_20180905_0_L2A -> "2018-09-05". Grouping by this avoids a
+    second, per-day LIST pass: one month-level discover_scenes() call
+    already names every scene, and the date is right there in its id."""
+    m = _SCENE_ID_RE.match(scene_id)
+    if not m:
+        raise ValueError(f"cannot parse acquisition date from scene id: {scene_id!r}")
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+
+def group_scenes_by_day(scenes: list[tuple[str, str]]) -> dict[str, list[tuple[str, str]]]:
+    """scenes -> {"YYYY-MM-DD": [(scene_id, url), ...]}."""
+    by_day: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for scene_id, url in scenes:
+        by_day[scene_day(scene_id)].append((scene_id, url))
+    return dict(by_day)
+
+
 def _get_json(url: str, tries: int = 8) -> dict:
     def call():
         req = urllib.request.Request(url, headers={"User-Agent": UA["User-Agent"]})
@@ -171,17 +213,42 @@ def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
     return n
 
 
+def _fetch_one_day(day: str, day_scenes: list[tuple[str, str]], dest_dir: Path,
+                   get_fn, workers: int) -> int:
+    """Fetch+write one day's chunk (or a zero-byte sentinel), skipping if
+    its destination already exists -- the unit of eviction resilience: this
+    is the piece of work that either fully lands on disk or never starts,
+    so an eviction mid-month never corrupts or loses an already-finished
+    day."""
+    dest = dest_dir / f"{day}_{day}.parquet"
+    if dest.exists():
+        print(f"  {dest.name}: exists, skipping")
+        return 0
+    if not day_scenes:
+        dest.touch()          # sentinel: fetched, zero matches
+        return 0
+    fd, nd = tempfile.mkstemp(suffix=".ndjson")
+    os.close(fd)
+    try:
+        n = fetch_and_write(day_scenes, get_fn, nd, workers)
+        copy_ndjson_to_parquet(nd, dest)
+    finally:
+        Path(nd).unlink(missing_ok=True)
+    print(f"  {dest.name}: {n:,} rows", flush=True)
+    return n
+
+
 def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 16,
                  list_fn=None, get_fn=None) -> int:
+    """Discover one month's scenes with a single month-level LIST pass, then
+    fetch and write ONE PARQUET CHUNK PER DAY (skip-if-exists per day, same
+    resumability contract as s2_fetch.py) -- see the module docstring for
+    why: a mid-month eviction must not lose already-finished days."""
     y, m_pad = month.split("-")
     m = str(int(m_pad))          # bucket path segment is not zero-padded
     last_day = calendar.monthrange(int(y), int(m_pad))[1]
     dest_dir = out_dir / "repair"
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{y}-{m_pad}-01_{y}-{m_pad}-{last_day:02d}.parquet"
-    if dest.exists():
-        print(f"  {dest.name}: exists, skipping")
-        return 0
 
     if list_fn is None or get_fn is None:
         s3 = _s3_client()
@@ -191,25 +258,20 @@ def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 
             get_fn = _get_json
 
     scenes = discover_scenes(prefixes, y, m, list_fn, workers)
-    if not scenes:
-        dest.touch()          # sentinel: fetched, zero matches
-        return 0
+    by_day = group_scenes_by_day(scenes)
 
-    fd, nd = tempfile.mkstemp(suffix=".ndjson")
-    os.close(fd)
-    try:
-        n = fetch_and_write(scenes, get_fn, nd, workers)
-        copy_ndjson_to_parquet(nd, dest)
-    finally:
-        Path(nd).unlink(missing_ok=True)
-    print(f"  {dest.name}: {n:,} rows", flush=True)
-    return n
+    total = 0
+    for day_num in range(1, last_day + 1):
+        day = f"{y}-{m_pad}-{day_num:02d}"
+        total += _fetch_one_day(day, by_day.get(day, []), dest_dir, get_fn, workers)
+    return total
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--month", help="YYYY-MM")
-    ap.add_argument("--out", help="output DIR; writes DIR/repair/<chunk>.parquet")
+    ap.add_argument("--out", help="output DIR; writes DIR/repair/<day>_<day>.parquet"
+                                  " per day, one per day in the month")
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--refresh-prefixes", action="store_true",
                     help="rebuild tools/mgrs_prefixes.txt (~1k anonymous LISTs)")
