@@ -9,11 +9,16 @@ PUBLISHABLE_SUFFIXES.
 This gate also checks that the script refuses an unedited config and that it
 exits with a message when data_dir is absent.
 
-No network, no AWS, no credentials.
+No network, no AWS, no credentials -- the one aws_session check below builds
+a boto3.Session object (which makes no call and needs no real secret) to
+check which credential source it picked, exactly as tests/test_publish.py
+does for the same function.
 
 Run: python3 tests/test_upload_data.py
 """
+import importlib.util
 import io
+import os
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -192,6 +197,32 @@ with tempfile.TemporaryDirectory() as tmp:
         f"data_dir:    {root.resolve()}/" in out.getvalue(),
         f"the CLI --data-dir wins over the unset config: {out.getvalue()!r}",
     )
+
+# --- the AWS session prefers ambient env credentials over the profile --
+# configure-aws-credentials puts an assumed OIDC role in the environment;
+# building the session from catalog.publish.yaml's named profile instead
+# fails outright on a runner where that profile does not exist ("The config
+# profile (portolan-mirrors) could not be found"). aws_session must ignore
+# the configured profile whenever AWS_ACCESS_KEY_ID is set. Constructing a
+# boto3.Session makes no network call and needs no real secret, so this
+# stays within the "no network, no AWS, no credentials" rule above.
+if importlib.util.find_spec("boto3") is None:
+    print("note: boto3 is not installed; skipping the aws_session check")
+else:
+    old_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    os.environ["AWS_ACCESS_KEY_ID"] = "ASIAFAKEFAKEFAKEFAKE"
+    try:
+        session = upload_data.aws_session({"profile": "no-such-profile-at-all"})
+        check(
+            session.profile_name == "default",
+            "ambient env creds win over a configured (even nonexistent) "
+            f"profile, got profile_name={session.profile_name!r}",
+        )
+    finally:
+        if old_key is None:
+            os.environ.pop("AWS_ACCESS_KEY_ID", None)
+        else:
+            os.environ["AWS_ACCESS_KEY_ID"] = old_key
 
 # --- the sentinel guard ------------------------------------------------
 check(
