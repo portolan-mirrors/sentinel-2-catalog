@@ -233,13 +233,28 @@ def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
     accumulating a Python list of ~450k rows. The writes happen in THIS
     thread as as_completed() yields (fetching is threaded, consuming is
     not), so no lock is needed even though GETs run in worker threads.
-    `get_fn(url)` returns the parsed item dict, or raises MissingItem for a
-    scene with no item JSON in the bucket (permanent, logged and skipped --
-    NOT retried, NOT a failure) -- injected so this is testable without S3,
-    and swapped for a real HTTPS GET (with retry) in production. Returns
-    (rows written, scenes skipped as permanently missing)."""
+    `get_fn(url)` returns the parsed item dict -- injected so this is
+    testable without S3, and swapped for a real HTTPS GET (with retry) in
+    production.
+
+    Two kinds of per-scene skip, both logged and counted rather than
+    raised (a single bad scene must never crash the whole day's, let alone
+    month's, fetch):
+      - `get_fn` raises MissingItem for a scene with no item JSON in the
+        bucket at all (permanent, HTTP 404/410 -- NOT retried).
+      - normalize() raises ValueError for a scene whose item JSON exists
+        but is missing required fields (production evidence, 2026-09-16,
+        run 35092766147: S2B_35NKA_20180901_0_L2A had neither
+        s2:mgrs_tile nor the mgrs:* fields normalize() falls back to --
+        one such exotic straggler killed the whole month before this fix;
+        a follow-up survey of 88 scenes across 3 tiles x 2 months found
+        zero other occurrences, so these are rare, not systemic).
+
+    Returns (rows written, scenes skipped -- either reason, one counter:
+    the inventory audit is the tool for distinguishing "how many" from
+    "why", not this return value)."""
     n = 0
-    missing = 0
+    skipped = 0
     with open(nd_path, "w") as nd, ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(get_fn, url): scene_id for scene_id, url in scenes}
         for f in as_completed(futures):
@@ -248,11 +263,17 @@ def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
             except MissingItem:
                 print(f"  skipping scene with missing item JSON: {futures[f]}",
                      file=sys.stderr)
-                missing += 1
+                skipped += 1
                 continue
-            nd.write(json.dumps(normalize(item)) + "\n")
+            try:
+                row = normalize(item)
+            except ValueError as e:
+                print(f"  skipping unnormalizable item: {e}", file=sys.stderr)
+                skipped += 1
+                continue
+            nd.write(json.dumps(row) + "\n")
             n += 1
-    return n, missing
+    return n, skipped
 
 
 def _fetch_one_day(day: str, day_scenes: list[tuple[str, str]], dest_dir: Path,
@@ -261,7 +282,8 @@ def _fetch_one_day(day: str, day_scenes: list[tuple[str, str]], dest_dir: Path,
     its destination already exists -- the unit of eviction resilience: this
     is the piece of work that either fully lands on disk or never starts,
     so an eviction mid-month never corrupts or loses an already-finished
-    day. Returns (rows written, scenes skipped as permanently missing)."""
+    day. Returns (rows written, scenes skipped -- missing item JSON or
+    unnormalizable; see fetch_and_write())."""
     dest = dest_dir / f"{day}_{day}.parquet"
     if dest.exists():
         print(f"  {dest.name}: exists, skipping")
@@ -272,16 +294,16 @@ def _fetch_one_day(day: str, day_scenes: list[tuple[str, str]], dest_dir: Path,
     fd, nd = tempfile.mkstemp(suffix=".ndjson")
     os.close(fd)
     try:
-        n, missing = fetch_and_write(day_scenes, get_fn, nd, workers)
+        n, skipped = fetch_and_write(day_scenes, get_fn, nd, workers)
         if n:
             copy_ndjson_to_parquet(nd, dest)
         else:
-            dest.touch()      # every scene that day was permanently missing
+            dest.touch()      # every scene that day was skipped
     finally:
         Path(nd).unlink(missing_ok=True)
     if n:
         print(f"  {dest.name}: {n:,} rows", flush=True)
-    return n, missing
+    return n, skipped
 
 
 def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 16,
@@ -290,10 +312,11 @@ def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 
     fetch and write ONE PARQUET CHUNK PER DAY (skip-if-exists per day, same
     resumability contract as s2_fetch.py) -- see the module docstring for
     why: a mid-month eviction must not lose already-finished days. A scene
-    with no item JSON in the bucket (MissingItem, permanent) is skipped and
-    counted, never retried; the running total is printed as a month-end
-    summary so the shortfall is visible in the run log and comparable
-    against the inventory audit."""
+    with no item JSON in the bucket, or one that exists but fails
+    normalize()'s field checks, is skipped and counted rather than
+    crashing the month (see fetch_and_write()); the running total is
+    printed as a month-end summary so the shortfall is visible in the run
+    log and comparable against the inventory audit."""
     y, m_pad = month.split("-")
     m = str(int(m_pad))          # bucket path segment is not zero-padded
     last_day = calendar.monthrange(int(y), int(m_pad))[1]
@@ -311,14 +334,14 @@ def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 
     by_day = group_scenes_by_day(scenes)
 
     total = 0
-    total_missing = 0
+    total_skipped = 0
     for day_num in range(1, last_day + 1):
         day = f"{y}-{m_pad}-{day_num:02d}"
-        n, missing = _fetch_one_day(day, by_day.get(day, []), dest_dir, get_fn, workers)
+        n, skipped = _fetch_one_day(day, by_day.get(day, []), dest_dir, get_fn, workers)
         total += n
-        total_missing += missing
+        total_skipped += skipped
     print(f"month {month}: {total:,} scenes fetched, "
-         f"{total_missing:,} missing item JSONs skipped")
+         f"{total_skipped:,} scenes skipped (missing or unnormalizable)")
     return total
 
 

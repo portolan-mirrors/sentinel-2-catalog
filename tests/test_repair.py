@@ -131,6 +131,17 @@ def _fake_item(item_id: str, month: str = "2018-09-05T10:00:00Z") -> dict:
     }
 
 
+def _fake_item_missing_mgrs(item_id: str, month: str = "2018-09-01T10:00:00Z") -> dict:
+    """A valid-JSON item that lacks both s2:mgrs_tile and every mgrs:*
+    fallback field -- normalize()'s ValueError guard fires on this exact
+    shape (production evidence, 2026-09-16, run 35092766147:
+    S2B_35NKA_20180901_0_L2A)."""
+    item = _fake_item(item_id, month)
+    for key in ("mgrs:utm_zone", "mgrs:latitude_band", "mgrs:grid_square"):
+        del item["properties"][key]
+    return item
+
+
 def test_fetch_and_write_streams_normalized_rows_to_ndjson():
     """fetch_and_write must not accumulate rows in memory (finding #3 fix
     round): it writes each normalize()d row straight to the NDJSON file at
@@ -223,6 +234,33 @@ def test_fetch_and_write_skips_missing_scene_and_keeps_valid_ones():
         assert missing == 1
         rows = [json.loads(line) for line in Path(nd).read_text().splitlines()]
         assert {r["id"] for r in rows} == {"A1", "A2"}
+
+
+def test_fetch_and_write_skips_unnormalizable_item_and_keeps_valid_ones(capsys):
+    """Fix round, production run 35092766147: an item whose JSON is valid
+    but lacks both s2:mgrs_tile and every mgrs:* fallback field must be
+    skipped (normalize()'s ValueError), not crash the batch -- exactly like
+    a MissingItem, just from a different stage (get_fn succeeded; normalize
+    is what fails)."""
+    def get_fn(url):
+        item_id = url.rsplit("/", 1)[-1].removesuffix(".json")
+        if item_id == "BAD":
+            return _fake_item_missing_mgrs(item_id)
+        return _fake_item(item_id)
+
+    scenes = [("A1", "https://x/A1.json"),
+             ("BAD", "https://x/BAD.json"),
+             ("A2", "https://x/A2.json")]
+    with tempfile.TemporaryDirectory() as td:
+        nd = str(Path(td) / "rows.ndjson")
+        n, skipped = fetch_and_write(scenes, get_fn, nd, workers=2)
+        assert n == 2
+        assert skipped == 1
+        rows = [json.loads(line) for line in Path(nd).read_text().splitlines()]
+        assert {r["id"] for r in rows} == {"A1", "A2"}
+        err = capsys.readouterr().err
+        assert "skipping unnormalizable item" in err
+        assert "BAD" in err
 
 
 # --------------------------------------------------------------------------
@@ -398,8 +436,49 @@ def test_repair_month_skips_missing_item_and_prints_summary(capsys):
         out_text = capsys.readouterr()
         assert "skipping scene with missing item JSON: S2A_31UFU_20180905_1_L2A" \
             in out_text.err
-        assert "month 2018-09: 1 scenes fetched, 1 missing item JSONs skipped" \
-            in out_text.out
+        assert "month 2018-09: 1 scenes fetched, 1 scenes skipped " \
+            "(missing or unnormalizable)" in out_text.out
+
+
+def test_repair_month_skips_unnormalizable_item_and_prints_summary(capsys):
+    """Integration proof, production run 35092766147: a day with one
+    exotic scene whose item JSON exists but fails normalize() (no
+    s2:mgrs_tile, no mgrs:* fallback -- exactly S2B_35NKA_20180901_0_L2A)
+    alongside a valid scene must still write the valid scene, warn with the
+    item id, and count it in the month-end summary. No raise."""
+    def fake_list(prefix):
+        if prefix.endswith("2018/9/"):
+            return [
+                "sentinel-s2-l2a-cogs/35/N/KA/2018/9/S2B_35NKA_20180901_0_L2A/",
+                "sentinel-s2-l2a-cogs/35/N/KA/2018/9/S2B_35NKA_20180902_0_L2A/",
+            ]
+        return []
+
+    def get_fn(url):
+        item_id = url.rsplit("/", 1)[-1].removesuffix(".json")
+        if item_id == "S2B_35NKA_20180901_0_L2A":
+            return _fake_item_missing_mgrs(item_id, "2018-09-01T10:00:00Z")
+        return _fake_item(item_id, "2018-09-02T10:00:00Z")
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        n = repair_month("2018-09", out, ["sentinel-s2-l2a-cogs/35/N/KA/"],
+                         workers=2, list_fn=fake_list, get_fn=get_fn)
+        assert n == 1, "only the valid scene counts toward rows fetched"
+
+        dest_dir = out / "repair"
+        day1 = dest_dir / "2018-09-01_2018-09-01.parquet"
+        day2 = dest_dir / "2018-09-02_2018-09-02.parquet"
+        # The exotic scene was the ONLY scene on day 1, so day 1 gets a
+        # zero-byte sentinel (same as a day discovered with zero scenes).
+        assert day1.exists() and day1.stat().st_size == 0
+        assert day2.exists() and day2.stat().st_size > 0
+
+        out_text = capsys.readouterr()
+        assert "skipping unnormalizable item" in out_text.err
+        assert "S2B_35NKA_20180901_0_L2A" in out_text.err
+        assert "month 2018-09: 1 scenes fetched, 1 scenes skipped " \
+            "(missing or unnormalizable)" in out_text.out
 
 
 def test_repair_month_second_run_skips_already_finished_days():
