@@ -1,7 +1,8 @@
 // Sentinel-2 explorer. Everything below talks to static files:
 //   stats/mgrs-monthly.parquet  – choropleth + timeline
 //   stats/mgrs.pmtiles          – MGRS tile footprints
-//   sentinel-2-l2a/year=*/…     – item queries (Task 12)
+//   sentinel-2-l2a/year=*/…     – item queries (Task 12; one part per year
+//                                 by the tile's UTM zone from 2019, Task 18)
 // There is no API, no server and no database behind this page: DuckDB-WASM
 // issues HTTP range reads straight at the object store.
 import maplibregl from "https://esm.sh/maplibre-gl@4.7.1";
@@ -295,11 +296,28 @@ map.on("click", "mgrs-fill", (e) => {
   timelineFor(tile);
 });
 
+// The zone parts of a year from 2019: [file stem, first zone, last zone],
+// mirrored from tools/s2_build.py ZONE_PARTS (spec Amendment 3) because the
+// browser cannot import it. A year before 2019 is one items.parquet; from
+// 2019 it is these four files, split by the UTM zone of the tile id, so a
+// query for one tile needs exactly one of them.
+const ZONE_PARTS = [["z01-20", 1, 20], ["z21-35", 21, 35],
+  ["z36-46", 36, 46], ["z47-60", 47, 60]];
+
+// The zone part holding a tile: its UTM zone is the leading one or two
+// digits of the id ("1VCJ" is zone 1, "31UFU" is zone 31).
+function zonePartFor(tile) {
+  const zone = Number(tile.match(/^\d{1,2}/)[0]);
+  const hit = ZONE_PARTS.find(([, lo, hi]) => zone >= lo && zone <= hi);
+  return hit ? hit[0] : null;
+}
+
 // Which parts actually exist. `read_parquet` over a list fails outright on a
 // missing file, and the parts are genuinely optional: live.parquet only exists
-// for the current year once the daily refresh has run, and a year with no
-// scenes has no items.parquet at all. So each candidate is probed once with a
-// HEAD (a CORS-simple request, no preflight) and the answer is cached.
+// for the current year once the daily refresh has run, a year with no scenes
+// has no items.parquet at all, and a year holds either items.parquet or the
+// zone parts, never both. So each candidate is probed once with a HEAD (a
+// CORS-simple request, no preflight) and the answer is cached.
 const partProbes = new Map();
 const partExists = (url) => {
   if (!partProbes.has(url)) {
@@ -312,13 +330,20 @@ const partExists = (url) => {
   return partProbes.get(url);
 };
 
-async function partUrls(y0, y1) {
+// Every part that could hold `tile` in the years y0..y1, filtered to the ones
+// that exist. Per year that is the legacy items.parquet OR the one zone part
+// the tile's zone falls in -- the other three zone parts are never probed,
+// let alone read -- plus live.parquet for the current year. Probe-based
+// rather than keyed on the year, so the app needs no idea which years were
+// published in which shape.
+async function partUrls(y0, y1, tile) {
+  const zonePart = zonePartFor(tile);
   const candidates = [];
   for (let y = y0; y <= y1; y++) {
-    candidates.push(`${BASE}/sentinel-2-l2a/year=${y}/items.parquet`);
-    if (y === CURRENT_YEAR) {
-      candidates.push(`${BASE}/sentinel-2-l2a/year=${y}/live.parquet`);
-    }
+    const dir = `${BASE}/sentinel-2-l2a/year=${y}`;
+    candidates.push(`${dir}/items.parquet`);
+    if (zonePart) candidates.push(`${dir}/${zonePart}.parquet`);
+    if (y === CURRENT_YEAR) candidates.push(`${dir}/live.parquet`);
   }
   const present = await Promise.all(candidates.map(partExists));
   return candidates.filter((_, i) => present[i]);
@@ -445,7 +470,8 @@ async function runQuery() {
   $("run").disabled = true;
   box.replaceChildren(el("p", "hint", "Reading the item parts…"));
   try {
-    const urls = await partUrls(Number(d0.slice(0, 4)), Number(d1.slice(0, 4)));
+    const urls = await partUrls(Number(d0.slice(0, 4)), Number(d1.slice(0, 4)),
+      selectedTile);
     if (!urls.length) {
       $("sql").textContent = "";
       $("api").textContent = "";
