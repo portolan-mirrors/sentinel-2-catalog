@@ -1,0 +1,44 @@
+name: publish-catalog
+
+# Publish the committed catalog metadata as-is: no data, no regeneration.
+# For the case where the repository's baseline is the truth (a corrected
+# or hand-regenerated catalog/) and the bucket's copy is stale. The gates
+# run first, so a broken baseline never reaches the bucket.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: catalog-write
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        run: pip install --quiet boto3 'rashid>=0.1.8,<0.2.0' stac-check
+
+      - name: Validate the committed catalog
+        env:
+          CI_LIGHT: "1"
+        run: python3 tests/run_all.py
+
+      - name: Assume the Source Cooperative write role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-catalog
+          aws-region: us-west-2
+
+      - name: Publish the catalog metadata
+        run: python3 tools/publish.py --confirm
