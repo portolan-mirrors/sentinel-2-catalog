@@ -234,3 +234,175 @@ def test_gpio_check_still_gates_the_build():
         proc = _build(out, chunks, LEVEL_LOW, env=env)
         assert proc.returncode != 0
         assert "gpio check failed" in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# --split zones (spec Amendment 3): a year lands as four UTM-zone parts.
+# ---------------------------------------------------------------------------
+sys.path.insert(0, str(ROOT / "tools"))
+from s2_build import ZONE_PARTS  # noqa: E402
+
+ZONE_LABELS = [label for label, _, _ in ZONE_PARTS]
+
+
+def _mk_zone_chunk(con, path, zones, per_zone=3, year=2024, prefix=""):
+    """`per_zone` scenes in each UTM zone of `zones`, spread over months and
+    longitudes so a part's (_month, _hilbert) order is checkable. Tile ids
+    take the upstream shape: no zero padding ('1VCJ', '31UFU')."""
+    rows = []
+    for z in zones:
+        for i in range(per_zone):
+            rows.append(
+                f"('{prefix}S2A_{z}_{i}', "
+                f"TIMESTAMPTZ '{year}-{(z + i) % 12 + 1:02d}-10 10:00:00+00', "
+                f"'{year}-01-01T12:00:00Z', '{z}UFU', "
+                f"ST_Point({(z * 6 - 183 + i) % 180}, {(z * 3 + i) % 80 - 40}))")
+    con.execute(f"""
+        COPY (
+          SELECT NULL::VARCHAR AS thumbnail_url, 'Feature' AS type,
+                 '1.1.0' AS stac_version, []::VARCHAR[] AS stac_extensions,
+                 v.id, v.dt AS datetime, v.g AS "s2:generation_time",
+                 v.tile AS "s2:mgrs_tile", 50.0 AS "eo:cloud_cover",
+                 v.geom AS geometry
+          FROM (VALUES {", ".join(rows)}) v(id, dt, g, tile, geom)
+        ) TO '{path}' (FORMAT PARQUET)
+    """)
+
+
+def _build_split(out, chunks, extra=()):
+    env = dict(os.environ, S2_ZSTD_LEVEL=str(LEVEL_LOW))
+    return subprocess.run(
+        [sys.executable, "tools/s2_build.py", "--sources", str(chunks.parent),
+         "--years", "2024", "--out", str(out), *extra],
+        cwd=ROOT, env=env, capture_output=True, text=True)
+
+
+def _zone(tile: str) -> int:
+    return int(tile[:2] if tile[:2].isdigit() else tile[:1])
+
+
+def test_split_zones_writes_one_sorted_part_per_range():
+    """Every ZONE_PARTS range gets exactly one file holding only its zones,
+    sorted (_month, _hilbert), passing `gpio check all`; the parts together
+    hold every deduped input row and nothing else is left in the year dir."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    zones = [1, 5, 20, 21, 30, 35, 36, 40, 46, 47, 55, 60]
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", zones)
+        # A second copy of every zone-1 scene with a newer generation time:
+        # deduped across the split, so the part total is the distinct count.
+        _mk_zone_chunk(con, chunks / "b.parquet", [1])
+        con.execute(f"""
+            COPY (SELECT * REPLACE ('2024-06-01T00:00:00Z' AS "s2:generation_time")
+                  FROM read_parquet('{chunks / "b.parquet"}'))
+            TO '{chunks / "b.parquet"}' (FORMAT PARQUET)""")
+        distinct = con.execute(
+            f"SELECT count(DISTINCT id) FROM read_parquet('{chunks}/*.parquet')"
+        ).fetchone()[0]
+        assert distinct == len(zones) * 3
+
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks, ["--split", "zones"])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        year_dir = out / "year=2024"
+        assert sorted(p.name for p in year_dir.iterdir()) == \
+            [f"{label}.parquet" for label in ZONE_LABELS]
+
+        total = 0
+        for label, lo, hi in ZONE_PARTS:
+            part = year_dir / f"{label}.parquet"
+            rows = con.execute(
+                f'SELECT "s2:mgrs_tile", _month, _hilbert, "s2:generation_time" '
+                f"FROM read_parquet('{part}')").fetchall()
+            assert rows, label
+            assert all(lo <= _zone(r[0]) <= hi for r in rows), label
+            keys = [(r[1], r[2]) for r in rows]
+            assert keys == sorted(keys), label
+            chk = subprocess.run(["gpio", "check", "all", str(part)],
+                                 capture_output=True, text=True)
+            assert chk.returncode == 0, chk.stdout + chk.stderr
+            total += len(rows)
+            for line in (f"year=2024/{label}.parquet: staged",
+                         f"year=2024/{label}.parquet: sorted",
+                         f"year=2024/{label}.parquet: gpio check all passed"):
+                assert line in proc.stdout, line
+        assert total == distinct
+        # The dedupe kept the newer generation for zone 1.
+        gens = con.execute(
+            f"SELECT DISTINCT \"s2:generation_time\" FROM "
+            f"read_parquet('{year_dir / 'z01-20.parquet'}') "
+            f"WHERE \"s2:mgrs_tile\" = '1UFU'").fetchall()
+        assert gens == [("2024-06-01T00:00:00Z",)]
+
+
+def test_split_zones_writes_nothing_for_an_empty_range():
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", [3, 33, 58])
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks, ["--split", "zones"])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert sorted(p.name for p in (out / "year=2024").iterdir()) == \
+            ["z01-20.parquet", "z21-35.parquet", "z47-60.parquet"]
+        assert "year=2024/z36-46.parquet: no rows, skipped" in proc.stdout
+
+
+def test_split_zones_refuses_a_tile_it_cannot_place():
+    """A row whose zone cannot be parsed belongs to no part. Dropping it on
+    the floor would publish a year that is quietly short, so the build
+    stops instead."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", [3, 33])
+        con.execute(f"""
+            COPY (SELECT * REPLACE (
+                    CASE WHEN id = 'S2A_3_0' THEN 'XXABC' ELSE "s2:mgrs_tile" END
+                    AS "s2:mgrs_tile")
+                  FROM read_parquet('{chunks / "a.parquet"}'))
+            TO '{chunks / "a.parquet"}' (FORMAT PARQUET)""")
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks, ["--split", "zones"])
+        assert proc.returncode != 0
+        assert "1 row(s) with no UTM zone" in proc.stderr
+        assert not list((out / "year=2024").glob("*.parquet"))
+
+
+def test_without_split_the_year_is_one_file_as_before():
+    """The legacy path: no --split, one items.parquet, every row, sorted."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    zones = [1, 20, 21, 35, 36, 46, 47, 60]
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", zones)
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert [p.name for p in (out / "year=2024").iterdir()] == \
+            ["items.parquet"]
+        keys = con.execute(
+            f"SELECT _month, _hilbert FROM "
+            f"read_parquet('{out / 'year=2024' / 'items.parquet'}')").fetchall()
+        assert len(keys) == len(zones) * 3
+        assert keys == sorted(keys)
+
+
+def test_split_and_name_do_not_mix():
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        proc = _build_split(Path(td) / "publish", chunks,
+                            ["--split", "zones", "--name", "live.parquet"])
+        assert proc.returncode != 0
+        assert "--name" in proc.stderr
+

@@ -2,6 +2,21 @@
 """Compact chunks (and/or the seed archive) into published year parts.
 
     sentinel-2-l2a/year=<YYYY>/items.parquet   (--name overrides, e.g. live.parquet)
+    sentinel-2-l2a/year=<YYYY>/z01-20.parquet  (--split zones: four parts by
+                          z21-35.parquet   UTM zone of s2:mgrs_tile, see
+                          z36-46.parquet   ZONE_PARTS; spec Amendment 3)
+                          z47-60.parquet
+
+Without --split the year is one file, which is how 2015-2018 are published
+and how `live.parquet` is always built. With `--split zones` the year is
+staged ONCE (dedupe + helper columns, exactly as without), then each zone
+range is copied out of that staged file into its own staged part and put
+through the same gpio sort/write/check/rename pipeline on its own -- so the
+sort, the spill and the output only ever hold a quarter of the year. That is
+what lets a 7M-row year build on a free runner: 2019 as one file spilled
+past the runner's 51.9 GB disk in gpio's sort. A range with no rows writes
+no file. A row whose tile has no parseable zone belongs to no part, and
+rather than drop it the build stops.
 
 Rows are deduped by id keeping the highest s2:generation_time, then sorted
 (_month, _hilbert): month-first keeps month pruning inside a year file,
@@ -97,6 +112,25 @@ ZSTD_LEVEL = int(os.environ.get("S2_ZSTD_LEVEL", "18"))
 # survives to stage the next year.
 GPIO_HANDOFF = "512MB"
 WORLD = "ST_Extent(ST_MakeEnvelope(-180, -90, 180, 90))"
+# The spatial parts of a zone-split year: (file stem, first zone, last zone),
+# inclusive. Fixed catalog-wide (spec Amendment 3) from the 2018 row
+# distribution so the four balance (27/26/22/25%); do not retune them per
+# year, a client picks its part from the tile id alone. make_items.py,
+# make_collection.py, the explorer app and the collection docs all name
+# these, and tests/test_build.py pins the docs to this tuple.
+ZONE_PARTS = (
+    ("z01-20", 1, 20),
+    ("z21-35", 21, 35),
+    ("z36-46", 36, 46),
+    ("z47-60", 47, 60),
+)
+# The first year published as zone parts. 2015-2018 were published whole
+# before the split existed and stay that way; the workflows pass --split
+# zones for every year from this one on.
+ZONE_SPLIT_FROM = 2019
+# The UTM zone of a scene, from the leading one or two digits of its MGRS
+# tile id ('1VCJ', '31UFU'). NULL when the id does not start with a digit.
+ZONE_SQL = """TRY_CAST(regexp_extract("s2:mgrs_tile", '^(\\d{1,2})', 1) AS INTEGER)"""
 
 
 def say(msg: str) -> None:
@@ -148,12 +182,106 @@ def _select(con, lst: str) -> str:
     return ", ".join(parts)
 
 
+def _sort_and_check(con, staged: Path, final: Path, year: int,
+                    memory: str) -> None:
+    """The ordered GeoParquet 2.0 write of one part, then its gate.
+
+    gpio writes `<name>.tmp` (hence --any-extension) and os.replace() puts it
+    on `<name>` in one atomic rename, so a killed build leaves the previous
+    part intact rather than a half-written one that every resume's exists()
+    check downstream would trust. --write-memory needs gpio >= 1.4; on 1.3.0
+    it was silently dropped and the write self-picked 50% of available RAM.
+    The DuckDB limit drops to GPIO_HANDOFF for the duration so the two
+    processes are not bidding for the same RAM.
+    """
+    name = final.name
+    tmp = final.with_name(final.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    t0 = time.monotonic()
+    try:
+        con.execute(f"SET memory_limit='{GPIO_HANDOFF}';")
+        r = subprocess.run(
+            ["gpio", "sort", "column", str(staged), str(tmp),
+             "_month,_hilbert", "--geoparquet-version", "2.0",
+             "--compression", "zstd",
+             "--compression-level", str(ZSTD_LEVEL),
+             "--row-group-size", str(ROW_GROUP),
+             "--write-memory", memory, "--any-extension"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            print(r.stdout[-1500:], r.stderr[-1500:], file=sys.stderr)
+            raise SystemExit(f"gpio sort failed for {year}")
+        os.replace(tmp, final)
+    finally:
+        con.execute(f"SET memory_limit='{memory}';")
+        tmp.unlink(missing_ok=True)
+    say(f"year={year}/{name}: sorted (_month, _hilbert) and written "
+        f"zstd-{ZSTD_LEVEL}, {final.stat().st_size / 1e6:,.0f} MB, "
+        f"{time.monotonic() - t0:,.1f}s")
+    # Best-practices gate on the artifact itself: compression, row
+    # groups, spatial order, bbox metadata. Fails the build only on
+    # gpio's error-level violations (non-zero exit); WARNING-level
+    # findings (e.g. omitted geo-metadata CRS, which the GeoParquet
+    # spec defaults to OGC:CRS84) pass and are acceptable.
+    t0 = time.monotonic()
+    chk = subprocess.run(["gpio", "check", "all", str(final)],
+                         capture_output=True, text=True)
+    if chk.returncode != 0:
+        print(chk.stdout[-1500:], chk.stderr[-1500:], file=sys.stderr)
+        raise SystemExit(f"gpio check failed for {year}")
+    say(f"year={year}/{name}: gpio check all passed, "
+        f"{time.monotonic() - t0:,.1f}s")
+
+
+def _stage_zone_parts(con, staged: Path, year: int) -> list[tuple[str, Path, int]]:
+    """Copy each ZONE_PARTS range out of the staged year into its own staged
+    file. Returns (label, path, rows) for the ranges that have rows, and
+    removes the whole-year staged file once they all exist so the disk never
+    holds the year twice on top of a sort spill. A row with no parseable zone
+    would land in no part; rather than publish a year that is quietly short,
+    the build stops on the first one."""
+    lost = con.execute(
+        f"SELECT count(*) FROM read_parquet('{staged}') "
+        f"WHERE {ZONE_SQL} IS NULL OR {ZONE_SQL} NOT BETWEEN 1 AND 60"
+    ).fetchone()[0]
+    if lost:
+        raise SystemExit(
+            f"year={year}: {lost:,} row(s) with no UTM zone in "
+            f"s2:mgrs_tile fall outside every zone part; refusing to "
+            f"drop them")
+    parts = []
+    for label, lo, hi in ZONE_PARTS:
+        name = f"{label}.parquet"
+        part_staged = staged.with_name(name)
+        t0 = time.monotonic()
+        con.execute(f"""
+            COPY (SELECT * FROM read_parquet('{staged}')
+                  WHERE {ZONE_SQL} BETWEEN {lo} AND {hi})
+            TO '{part_staged}'
+              (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {ROW_GROUP})
+        """)
+        n = con.execute(
+            f"SELECT count(*) FROM read_parquet('{part_staged}')").fetchone()[0]
+        if n == 0:
+            part_staged.unlink()
+            say(f"year={year}/{name}: no rows, skipped")
+            continue
+        say(f"year={year}/{name}: staged {n:,} rows (zones {lo}-{hi}), "
+            f"{part_staged.stat().st_size / 1e6:,.0f} MB, "
+            f"{time.monotonic() - t0:,.1f}s")
+        parts.append((label, part_staged, n))
+    staged.unlink()
+    return parts
+
+
 def build_year(con, files: list[str], year: int, outdir: Path,
-               name: str = "items.parquet", memory: str = "8GB") -> int:
+               name: str = "items.parquet", memory: str = "8GB",
+               split: str | None = None) -> int:
     lst = ",".join(f"'{f}'" for f in files)
     dest = outdir / f"year={year}"
     dest.mkdir(parents=True, exist_ok=True)
     final = dest / name
+    label = "zones" if split == "zones" else name
     with tempfile.TemporaryDirectory() as td:
         staged = Path(td) / "rows.parquet"
         t0 = time.monotonic()
@@ -173,59 +301,34 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         """)
         n = con.execute(
             f"SELECT count(*) FROM read_parquet('{staged}')").fetchone()[0]
-        say(f"year={year}/{name}: staged {n:,} rows, "
+        say(f"year={year}/{label}: staged {n:,} rows, "
             f"{staged.stat().st_size / 1e6:,.0f} MB, "
             f"{time.monotonic() - t0:,.1f}s")
         if n == 0:
             if not any(dest.iterdir()):
                 shutil.rmtree(dest, ignore_errors=True)
             return 0
-        # The ordered GeoParquet 2.0 write. gpio writes `<name>.tmp` (hence
-        # --any-extension) and os.replace() puts it on `<name>` in one
-        # atomic rename, so a killed build leaves the previous part intact
-        # rather than a half-written one that every resume's exists() check
-        # downstream would trust. --write-memory needs gpio >= 1.4; on 1.3.0
-        # it was silently dropped and the write self-picked 50% of available
-        # RAM. The DuckDB limit drops to GPIO_HANDOFF for the duration so
-        # the two processes are not bidding for the same RAM.
-        tmp = final.with_name(final.name + ".tmp")
-        tmp.unlink(missing_ok=True)
-        t0 = time.monotonic()
-        try:
-            con.execute(f"SET memory_limit='{GPIO_HANDOFF}';")
-            r = subprocess.run(
-                ["gpio", "sort", "column", str(staged), str(tmp),
-                 "_month,_hilbert", "--geoparquet-version", "2.0",
-                 "--compression", "zstd",
-                 "--compression-level", str(ZSTD_LEVEL),
-                 "--row-group-size", str(ROW_GROUP),
-                 "--write-memory", memory, "--any-extension"],
-                capture_output=True, text=True)
-            if r.returncode != 0:
-                print(r.stdout[-1500:], r.stderr[-1500:], file=sys.stderr)
-                raise SystemExit(f"gpio sort failed for {year}")
-            os.replace(tmp, final)
-        finally:
-            con.execute(f"SET memory_limit='{memory}';")
-            tmp.unlink(missing_ok=True)
-        say(f"year={year}/{name}: sorted (_month, _hilbert) and written "
-            f"zstd-{ZSTD_LEVEL}, {final.stat().st_size / 1e6:,.0f} MB, "
-            f"{time.monotonic() - t0:,.1f}s")
-        # Best-practices gate on the artifact itself: compression, row
-        # groups, spatial order, bbox metadata. Fails the build only on
-        # gpio's error-level violations (non-zero exit); WARNING-level
-        # findings (e.g. omitted geo-metadata CRS, which the GeoParquet
-        # spec defaults to OGC:CRS84) pass and are acceptable.
-        t0 = time.monotonic()
-        chk = subprocess.run(["gpio", "check", "all", str(final)],
-                             capture_output=True, text=True)
-        if chk.returncode != 0:
-            print(chk.stdout[-1500:], chk.stderr[-1500:], file=sys.stderr)
-            raise SystemExit(f"gpio check failed for {year}")
-        say(f"year={year}/{name}: gpio check all passed, "
-            f"{time.monotonic() - t0:,.1f}s")
-    print(f"  year={year}/{name}: {n:,} rows, "
-          f"{final.stat().st_size / 1e6:,.0f} MB", flush=True)
+        if split != "zones":
+            _sort_and_check(con, staged, final, year, memory)
+            print(f"  year={year}/{name}: {n:,} rows, "
+                  f"{final.stat().st_size / 1e6:,.0f} MB", flush=True)
+            return n
+        # Four parts, one at a time: each staged range is sorted, written,
+        # checked and deleted before the next one's sort starts, so the
+        # peak is one range's spill plus the other ranges waiting on disk,
+        # never a whole year's sort.
+        written = 0
+        for part_label, part_staged, part_rows in _stage_zone_parts(con, staged, year):
+            part_final = dest / f"{part_label}.parquet"
+            _sort_and_check(con, part_staged, part_final, year, memory)
+            part_staged.unlink()
+            print(f"  year={year}/{part_final.name}: {part_rows:,} rows, "
+                  f"{part_final.stat().st_size / 1e6:,.0f} MB", flush=True)
+            written += part_rows
+        if written != n:
+            raise SystemExit(
+                f"year={year}: staged {n:,} rows but the zone parts hold "
+                f"{written:,}")
     return n
 
 
@@ -237,7 +340,13 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", default="items.parquet")
     ap.add_argument("--memory", default="8GB")
+    ap.add_argument("--split", choices=["zones"],
+                    help="write the year as ZONE_PARTS files by UTM zone "
+                         "instead of one --name file (years >= "
+                         f"{ZONE_SPLIT_FROM})")
     a = ap.parse_args()
+    if a.split and a.name != "items.parquet":
+        ap.error("--split zones names its own parts; --name does not apply")
 
     outdir = Path(a.out).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -257,8 +366,8 @@ def main() -> int:
 
     total = 0
     for y in years:
-        total += build_year(con, files, y, outdir, a.name, a.memory)
-    print(f"TOTAL {total:,} rows across {len(years)} part(s)")
+        total += build_year(con, files, y, outdir, a.name, a.memory, a.split)
+    print(f"TOTAL {total:,} rows across {len(years)} year(s)")
     if total == 0:
         print("no rows matched: nothing was written", file=sys.stderr)
         return 1
