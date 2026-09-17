@@ -40,17 +40,31 @@ limit.
 ```
 sentinel-2-l2a/
   collection.json
-  year=2017/items.parquet   … year=2026/items.parquet
+  year=2017/items.parquet      one file per year through 2018
+  year=2018/items.parquet
+  year=2019/z01-20.parquet     four files per year from 2019, by UTM zone
+  year=2019/z21-35.parquet
+  year=2019/z36-46.parquet
+  year=2019/z47-60.parquet
+  …
+  year=2026/z01-20.parquet … z47-60.parquet
   year=2026/live.parquet       rolling tail since the last consolidation
 ```
 
 One directory per year Earth Search actually holds items for, so the listing
 starts where its record does — see Coverage below.
 
-`items.parquet` is the consolidated archive for a year. The current year also
-carries `live.parquet`, rebuilt daily from the Earth Search API and folded into
-`items.parquet` once a month. The two never overlap, so a glob over
-`year=*/*.parquet` reads each scene exactly once and includes yesterday.
+A year's archive is one file through 2018 and four from 2019, split by the UTM
+zone of `s2:mgrs_tile` (the leading digits of the tile id): `z01-20.parquet`
+holds zones 1–20, `z21-35.parquet` zones 21–35, `z36-46.parquet` zones 36–46,
+`z47-60.parquet` zones 47–60. The split is what keeps a 7-million-scene year
+buildable, and it is also a spatial index for free: a tile id names its part,
+so a query for `31UFU` in 2021 can open `year=2021/z21-35.parquet` alone and
+skip the other three quarters of the year. The current year also carries
+`live.parquet`, rebuilt daily from the Earth Search API and folded into the
+archive parts once a month. No two parts of a year overlap, so a glob over
+`year=*/*.parquet` reads each scene exactly once and includes yesterday,
+whichever shape the year has.
 
 Each `year=YYYY/YYYY.json` item states that year's measured row count, time
 range, footprint bounds and platforms, so a client can choose a year without

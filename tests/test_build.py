@@ -406,3 +406,15 @@ def test_split_and_name_do_not_mix():
         assert proc.returncode != 0
         assert "--name" in proc.stderr
 
+
+
+def test_docs_name_every_zone_part():
+    """The zone ranges are documented by hand in the collection docs, so this
+    pins the prose to the constant: every part file name and its zone range
+    must appear where a reader will look for them."""
+    for doc in ("catalog/sentinel-2-l2a/AGENTS.md",
+                "catalog/sentinel-2-l2a/README.md"):
+        text = (ROOT / doc).read_text()
+        for label, lo, hi in ZONE_PARTS:
+            assert f"{label}.parquet" in text, (doc, label)
+            assert f"{lo}–{hi}" in text or f"{lo}-{hi}" in text, (doc, label)

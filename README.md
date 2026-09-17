@@ -22,7 +22,7 @@ URL and never committed.
 
 | Collection | Holds |
 |---|---|
-| `sentinel-2-l2a` | The item index — Earth Search's Sentinel-2 L2A metadata, partitioned `year=YYYY/items.parquet` plus a `live.parquet` tail, sorted `(_month, _hilbert)` |
+| `sentinel-2-l2a` | The item index — Earth Search's Sentinel-2 L2A metadata, partitioned by year (`year=YYYY/items.parquet` through 2018; four UTM-zone parts `z01-20` … `z47-60.parquet` from 2019) plus a `live.parquet` tail, sorted `(_month, _hilbert)` |
 | `stats` | MGRS tile × month aggregates (scene counts, cloud cover) and a tile-footprint PMTiles layer, for the explorer app and for query planning. Still to come. |
 
 The backfill fills `sentinel-2-l2a` year by year, so

@@ -16,13 +16,31 @@ public `sentinel-cogs` bucket on AWS, and every COG URL is already in the
 `assets` column of the row that describes it.
 
 ```
-https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/items.parquet
-https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/live.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/items.parquet   2015-2018
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z01-20.parquet   2019 onward, four parts
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z21-35.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z36-46.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z47-60.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/live.parquet    current year only
 ```
 
-`items.parquet` is the consolidated archive for the year. The current year also
-has `live.parquet`, the tail fetched daily since the last consolidation. They
-do not overlap, so glob both:
+A year's archive is one of two shapes. 2015-2018 are a single `items.parquet`
+each. From 2019 the archive is four files, split by the UTM zone of
+`s2:mgrs_tile` (the leading one or two digits of the tile id):
+
+| part file        | UTM zones |
+| ---------------- | --------- |
+| `z01-20.parquet` | 1–20      |
+| `z21-35.parquet` | 21–35     |
+| `z36-46.parquet` | 36–46     |
+| `z47-60.parquet` | 47–60     |
+
+The boundaries are fixed for every year (they balance the 2018 row
+distribution at 27/26/22/25%), so the part that holds a tile is known from
+the tile id alone: `31UFU` is zone 31, always in `z21-35.parquet`. The current
+year also has `live.parquet`, the tail fetched daily since the last
+consolidation. No two parts of a year overlap, so a glob over the year reads
+each scene once, whichever shape the year has:
 
 ```sql
 read_parquet('.../sentinel-2-l2a/year=*/*.parquet', hive_partitioning=true)
@@ -30,6 +48,8 @@ read_parquet('.../sentinel-2-l2a/year=*/*.parquet', hive_partitioning=true)
 
 `hive_partitioning=true` exposes `year` as an INTEGER column that is not stored
 in the files. Filter on it first; it is the only filter that skips whole files.
+There is no `zone=` directory and no zone column: the zone split is a file
+name inside the year, and you use it by choosing the file.
 
 ## Query pattern
 
@@ -58,6 +78,31 @@ LIMIT 20;
 
 Column names with a colon are not identifiers. Quote them: `"eo:cloud_cover"`,
 not `eo:cloud_cover`.
+
+**Read only the part containing your tile's zone.** The glob above opens every
+part of the year and lets the `s2:mgrs_tile` filter discard three quarters of
+it by row-group statistics. When you know the tile, skip them entirely: pick
+the file by zone. Zone 31 is in `z21-35.parquet`, so the same query over 2021
+touches one file:
+
+```sql
+SELECT id, datetime, "eo:cloud_cover",
+       json_extract_string(assets, '$.visual.href') AS visual_cog
+FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=2021/z21-35.parquet')
+WHERE "s2:mgrs_tile" = '31UFU'
+  AND _month BETWEEN 8 AND 10
+  AND "eo:cloud_cover" < 10
+ORDER BY "eo:cloud_cover"
+LIMIT 20;
+```
+
+To choose the file in code, parse the zone with `^\d{1,2}` and take the range
+that contains it; for a year before 2019 the file is `items.parquet`
+regardless of zone. Add `live.parquet` for the current year. A bounding box
+spans the zone ranges its longitudes fall in (each UTM zone is six degrees
+wide), so a regional bbox query names one or two parts; a global query globs. The per-year item (`year=YYYY/YYYY.json`) lists every part
+of that year as its own asset, with its own row count and time range, if you
+would rather discover than assume.
 
 Use a `ST_Intersects` filter on `geometry` when you have a real polygon and no
 tile id. It works, and it is slower than the tile filter, because it has to
@@ -162,9 +207,9 @@ Do not build an asset URL from a template. Read the href.
 
 A scene can be fetched more than once: the daily refresh re-reads a five-day
 window, and a reprocessed product keeps its id. Rows are deduped by `id`,
-keeping the highest `s2:generation_time` (`NULLS LAST`), when each part is
-built. So `id` is unique within a part, and the parts of a year do not overlap,
-so `id` is unique within a year. Across the whole table, treat `id` as unique
+keeping the highest `s2:generation_time` (`NULLS LAST`), when each year is
+built. So `id` is unique within a part, and the parts of a year do not overlap
+(a scene has one tile, and a tile one zone), so `id` is unique within a year. Across the whole table, treat `id` as unique
 and report it if you ever find otherwise.
 
 ## What this collection does not do
