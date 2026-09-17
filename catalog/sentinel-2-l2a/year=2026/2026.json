@@ -53,17 +53,53 @@
     ]
   },
   "assets": {
-    "data": {
-      "href": "./items.parquet",
+    "data-z01-20": {
+      "href": "./z01-20.parquet",
       "type": "application/vnd.apache.parquet",
-      "title": "2026 scenes, GeoParquet 2.0",
+      "title": "2026 scenes, UTM zones 1\u201320",
       "roles": [
         "data"
       ],
       "start_datetime": "2026-09-12T00:16:10.622Z",
+      "end_datetime": "2026-09-13T23:21:36.919Z",
+      "table:row_count": 8275,
+      "file:size": 2965544
+    },
+    "data-z21-35": {
+      "href": "./z21-35.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2026 scenes, UTM zones 21\u201335",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2026-09-12T06:00:14.338Z",
+      "end_datetime": "2026-09-13T19:50:22.313Z",
+      "table:row_count": 8993,
+      "file:size": 3155602
+    },
+    "data-z36-46": {
+      "href": "./z36-46.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2026 scenes, UTM zones 36\u201346",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2026-09-12T02:36:10.547Z",
+      "end_datetime": "2026-09-13T13:18:00.722Z",
+      "table:row_count": 7026,
+      "file:size": 2449631
+    },
+    "data-z47-60": {
+      "href": "./z47-60.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2026 scenes, UTM zones 47\u201360",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2026-09-12T00:16:18.837Z",
       "end_datetime": "2026-09-13T23:45:27.298Z",
-      "table:row_count": 31264,
-      "file:size": 12787344
+      "table:row_count": 6970,
+      "file:size": 2482245
     }
   },
   "links": [
