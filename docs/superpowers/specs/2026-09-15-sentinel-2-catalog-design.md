@@ -242,3 +242,27 @@ for lossiness or client-side reconstruction. Decisions:
    STAC item.
 3. The collection still publishes `item_assets` (cached from Earth Search)
    as documentation, not as a reconstruction dependency.
+
+## Amendment 3 — 2026-09-17 (user decision): spatial part split for big years
+
+Whole-year sorts are infeasible on free runners once Earth Search reaches
+global coverage: 2019 (7.17M rows, 14.8 GB staged) spilled past the 51.9 GB
+runner disk. Decision: years from 2019 onward are published as **four
+spatial parts inside the same `year=YYYY/` directory**, split by UTM zone
+of `s2:mgrs_tile`, boundaries fixed catalog-wide from the 2018 row
+distribution so the parts balance:
+
+| part file           | UTM zones | share of 2018 rows |
+|---------------------|-----------|--------------------|
+| `z01-20.parquet`    | 1–20      | 27%                |
+| `z21-35.parquet`    | 21–35     | 26%                |
+| `z36-46.parquet`    | 36–46     | 22%                |
+| `z47-60.parquet`    | 47–60     | 25%                |
+
+Properties: the `year=*/*.parquet` partition glob and every client URL
+pattern are unchanged; 2015–2018 stay single `items.parquet` files (both
+shapes match the glob); `live.parquet` stays one unsplit per-year tail;
+within-part sort stays `(_month, _hilbert)`. Clients with a tile id can
+prune to one part by zone; bbox queries touch 1–2 parts. The collection's
+partition metadata documents the zone ranges; year items list each part
+as its own asset with per-part counts/extents.
