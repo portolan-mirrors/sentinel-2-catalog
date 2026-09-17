@@ -304,6 +304,30 @@ def test_a_recorded_zone_part_that_vanished_is_fatal():
     assert "z36-46.parquet" in str(caught.value)
 
 
+def test_unrecorded_unknown_part_is_left_out_when_the_year_has_a_record(capsys):
+    """The ruling (Task 18): a candidate the committed item never recorded,
+    whose probe cannot answer, is left out -- the year is built from what
+    the record holds, which it can never be smaller than -- and the run
+    says so on stderr. A RECORDED part whose probe cannot answer still falls
+    back to its record (test_unreachable_part_falls_back_to_the_committed_record),
+    and a recorded part that answers 404 still halts
+    (test_absent_part_the_committed_item_describes_is_fatal)."""
+    with tempfile.TemporaryDirectory() as td:
+        year_dir = staged_live(Path(td))
+        committed = committed_item()
+        parts = discover(year_dir, 2026, True, committed,
+                         prober(ABSENT, **{"items.parquet": (UNKNOWN, None),
+                                           "z21-35.parquet": (UNKNOWN, None)}))
+        assert [(p["key"], p["source"]) for p in parts] == [
+            ("data", "committed"), ("live", "local")]
+        item = build_item(connect(), 2026, parts, committed)
+    assert item["properties"]["table:row_count"] == 9_000_001
+    assert "data-z21-35" not in item["assets"]
+    err = capsys.readouterr().err
+    assert "z21-35.parquet" in err and "left out" in err
+    assert "items.parquet" not in err
+
+
 def test_unrecorded_unknown_part_halts_only_without_a_record():
     """Nothing committed at all: a probe that cannot answer stops the run,
     because there is no record to keep the year from shrinking."""

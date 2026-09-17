@@ -312,7 +312,8 @@ def discover(year_dir: Path, year: int, remote_baseline: bool,
             if recorded is None:
                 if recorded_keys:
                     print(f"  {year}: cannot reach {name} and the committed "
-                          f"item does not record it; left out")
+                          f"item does not record it; left out",
+                          file=sys.stderr)
                     continue
                 raise SystemExit(
                     f"year={year}: cannot reach {url}, and no committed item "

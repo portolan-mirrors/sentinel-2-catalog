@@ -79,13 +79,20 @@ jobs:
           # geoparquet-io pinned on purpose: see ci.yml and gpio-fix-report.md.
           pip install --quiet duckdb boto3 'geoparquet-io==1.5.0' pmtiles pytz
 
-      # Resolve the "every published year part" glob by hand: probe each
-      # year=YYYY/items.parquet from 2015 (Sentinel-2's launch year) through
-      # the current year with a HEAD request, plus the current year's
-      # live.parquet if refresh-daily has published one yet. Loud failure
-      # if the guard passed (catalog.json exists) but this finds nothing --
-      # that combination means the catalog is published but empty/broken,
-      # never a quiet reason to skip.
+      # Resolve the "every published year part" glob by hand: probe every
+      # archive part name a year can hold -- items.parquet for a year
+      # published whole (2015-2018), the four z*.parquet UTM-zone parts for
+      # a year from 2019 (spec Amendment 3; the names come from
+      # tools/s2_build.py ZONE_PARTS so this list cannot drift from the
+      # builder) -- from 2015 (Sentinel-2's launch year) through the current
+      # year with a HEAD request, plus the current year's live.parquet if
+      # refresh-daily has published one yet. A 404 is a part that does not
+      # exist for that year, which is the normal case for five of the six
+      # names; any other answer is a part this run cannot see and would
+      # silently leave out of the stats, so it fails the job. Loud failure
+      # too if the guard passed (catalog.json exists) but this finds
+      # nothing -- that combination means the catalog is published but
+      # empty/broken, never a quiet reason to skip.
       - name: Enumerate published year parts
         id: enumerate
         if: steps.guard.outputs.published == 'true'
@@ -93,13 +100,30 @@ jobs:
           set -euo pipefail
           BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
           CURRENT_YEAR=$(date -u +%Y)
+          ARCHIVE_NAMES=$(python3 -c '
+          import sys; sys.path.insert(0, "tools")
+          from s2_build import ZONE_PARTS
+          print(" ".join(["items", *(label for label, _, _ in ZONE_PARTS)]))')
+          # probe <year> <name>: 0 if year=<year>/<name>.parquet is published,
+          # 1 if it answers 404; anything else stops the job.
+          probe() {
+            local code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$BASE/year=$1/$2.parquet")
+            case "$code" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *) echo "::error::year=$1/$2.parquet: HEAD answered $code, not 200 or 404"; exit 1 ;;
+            esac
+          }
           urls=()
           for Y in $(seq 2015 "$CURRENT_YEAR"); do
-            if curl -fsI "$BASE/year=$Y/items.parquet" > /dev/null; then
-              urls+=("$BASE/year=$Y/items.parquet")
-            fi
+            for NAME in $ARCHIVE_NAMES; do
+              if probe "$Y" "$NAME"; then
+                urls+=("$BASE/year=$Y/$NAME.parquet")
+              fi
+            done
           done
-          if curl -fsI "$BASE/year=$CURRENT_YEAR/live.parquet" > /dev/null; then
+          if probe "$CURRENT_YEAR" live; then
             urls+=("$BASE/year=$CURRENT_YEAR/live.parquet")
           fi
           if [ "${#urls[@]}" -eq 0 ]; then
