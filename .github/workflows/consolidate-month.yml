@@ -68,11 +68,19 @@ jobs:
           mkdir -p staging
           Y="${{ inputs.year }}"; [ -z "$Y" ] && Y=$(date -u +%Y)
           BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
+          # The zone-part names and the first zone-split year come from
+          # tools/s2_build.py, so this job cannot drift from the builder.
+          read -r SPLIT_FROM ZONE_NAMES <<< "$(python3 -c '
+          import sys; sys.path.insert(0, "tools")
+          from s2_build import ZONE_PARTS, ZONE_SPLIT_FROM
+          print(ZONE_SPLIT_FROM, " ".join(label for label, _, _ in ZONE_PARTS))')"
           # fetch <name>: download year=$Y/<name>.parquet to staging/<name>-prev.parquet.
           # Returns 1 only on a 404 (never published); any other failure --
-          # a 5xx, a timeout, a truncated body -- kills the job, because a
-          # part silently left out of the merge is a part overwritten on
-          # upload with a fraction of its rows.
+          # a non-200 HEAD, or a GET that fails or is cut short -- kills the
+          # job, because a part silently left out of the merge is a part
+          # overwritten on upload with a fraction of its rows. fetch is
+          # called as an if/&& condition, where `set -e` does not apply
+          # inside the body, so every fatal path exits explicitly.
           fetch() {
             local code
             code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$BASE/year=$Y/$1.parquet")
@@ -84,14 +92,17 @@ jobs:
               echo "::error::year=$Y/$1.parquet: HEAD answered $code, not 200 or 404"
               exit 1
             fi
-            curl -fSL -o "staging/$1-prev.parquet" "$BASE/year=$Y/$1.parquet"
+            curl -fSL -o "staging/$1-prev.parquet" "$BASE/year=$Y/$1.parquet" || {
+              rm -f "staging/$1-prev.parquet"
+              echo "::error::year=$Y/$1.parquet: GET failed after HEAD 200; not consolidating without it"
+              exit 1
+            }
           }
           SRC=""
           SPLIT=""
-          if [ "$Y" -ge 2019 ]; then
-            # Zone parts: the names come from tools/s2_build.py ZONE_PARTS.
+          if [ "$Y" -ge "$SPLIT_FROM" ]; then
             SPLIT="--split zones"
-            for P in z01-20 z21-35 z36-46 z47-60; do
+            for P in $ZONE_NAMES; do
               if fetch "$P"; then SRC="$SRC staging/$P-prev.parquet"; fi
             done
           else

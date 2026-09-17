@@ -196,7 +196,8 @@ jobs:
             exit 0
           fi
           SPLIT=""
-          if [ "$Y" -ge 2019 ]; then
+          SPLIT_FROM=$(python3 -c 'import sys; sys.path.insert(0, "tools"); from s2_build import ZONE_SPLIT_FROM; print(ZONE_SPLIT_FROM)')
+          if [ "$Y" -ge "$SPLIT_FROM" ]; then
             SPLIT="--split zones"
           fi
           # $SPLIT is unquoted on purpose: empty or two words.

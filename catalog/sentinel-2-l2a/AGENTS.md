@@ -100,9 +100,10 @@ To choose the file in code, parse the zone with `^\d{1,2}` and take the range
 that contains it; for a year before 2019 the file is `items.parquet`
 regardless of zone. Add `live.parquet` for the current year. A bounding box
 spans the zone ranges its longitudes fall in (each UTM zone is six degrees
-wide), so a regional bbox query names one or two parts; a global query globs. The per-year item (`year=YYYY/YYYY.json`) lists every part
-of that year as its own asset, with its own row count and time range, if you
-would rather discover than assume.
+wide), so a regional bbox query names one or two parts; a global query globs.
+The per-year item (`year=YYYY/YYYY.json`) lists every part of that year as its
+own asset, with its own row count and time range, if you would rather discover
+than assume.
 
 Use a `ST_Intersects` filter on `geometry` when you have a real polygon and no
 tile id. It works, and it is slower than the tile filter, because it has to
@@ -209,8 +210,9 @@ A scene can be fetched more than once: the daily refresh re-reads a five-day
 window, and a reprocessed product keeps its id. Rows are deduped by `id`,
 keeping the highest `s2:generation_time` (`NULLS LAST`), when each year is
 built. So `id` is unique within a part, and the parts of a year do not overlap
-(a scene has one tile, and a tile one zone), so `id` is unique within a year. Across the whole table, treat `id` as unique
-and report it if you ever find otherwise.
+(a scene has one tile, and a tile one zone), so `id` is unique within a year.
+Across the whole table, treat `id` as unique and report it if you ever find
+otherwise.
 
 ## What this collection does not do
 
