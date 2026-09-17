@@ -23,17 +23,25 @@ things:
         --data-dir keep their committed item JSON untouched.
 
     python3 tools/make_items.py --data-dir ... --remote-baseline
-        Same, plus: for a year that IS staged, any standard part missing from
+        Same, plus: for a year that IS staged, any candidate part missing from
         --data-dir is read from the published copy over HTTP. The daily
         refresh stages only `live.parquet`; without this the year's item would
         be rewritten to describe the rolling tail alone and drop the millions
-        of rows sitting in the published `items.parquet`.
+        of rows sitting in the published archive parts.
 
         A probe that fails is not a part that is missing. A 404 means the part
         was never published; anything else -- a timeout, a 5xx, a broken link
         -- means the question went unanswered, and the run falls back to what
         the committed item recorded for that part rather than writing a
         smaller year. See discover() for the three cases.
+
+A year takes one of two shapes (spec Amendment 3), and both are discovered
+from the same candidate list: 2015-2018 are one `items.parquet`; from 2019
+the archive is four zone parts `z01-20.parquet` .. `z47-60.parquet`, split
+by the UTM zone of `s2:mgrs_tile` (s2_build.ZONE_PARTS). Either shape may
+add `live.parquet`. Every part present becomes its own asset, with its own
+row count, time range and size, so a client with a tile id can pick the one
+part its zone lives in and the year's totals are the sum of the parts.
 
 Collection item links are not written here. make_collection.py globs the item
 files it finds and links every one, so the two tools cannot disagree about
@@ -44,12 +52,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from s2_build import ZONE_PARTS  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -61,14 +73,20 @@ PUBLIC = "https://data.source.coop/portolan-mirrors/sentinel-2-catalog"
 UA = {"User-Agent": "sentinel-2-catalog-tools/1.0 "
                     "(+https://github.com/portolan-mirrors/sentinel-2-catalog)"}
 
-# The two part names a year can hold, in the order they are advertised.
-# `items.parquet` is the consolidated archive; `live.parquet` is the rolling
-# tail fetched daily and folded back in monthly. They do not overlap: a
-# consolidation rewrites items.parquet and resets live.parquet, so a year's
-# row count is the sum of its parts.
+# Every part name a year can hold, in the order they are advertised:
+# (asset key, file name, title template, roles). `items.parquet` is the
+# consolidated archive of a year published before the zone split; the four
+# `z*.parquet` files are the archive of a year from 2019, one per ZONE_PARTS
+# range; `live.parquet` is the rolling tail fetched daily and folded back in
+# monthly. A year holds one archive shape, never both, and the archive and
+# the tail do not overlap: a consolidation rewrites the archive parts and
+# resets live.parquet, so a year's row count is the sum of its parts.
 PARTS = (
     ("data", "items.parquet", "{year} scenes, GeoParquet 2.0",
      ["data"]),
+    *((f"data-{label}", f"{label}.parquet",
+       f"{{year}} scenes, UTM zones {lo}\u2013{hi}", ["data"])
+      for label, lo, hi in ZONE_PARTS),
     ("live", "live.parquet",
      "Rolling tail since the last consolidation, refreshed daily", ["data"]),
 )
@@ -255,10 +273,16 @@ def discover(year_dir: Path, year: int, remote_baseline: bool,
              this run must not paper over that by rewriting the year smaller.
     UNKNOWN  the probe failed: a timeout, a 5xx, a broken link. Fall back to
              what the committed item recorded for that part, so a bad minute on
-             the network cannot shrink the record. With nothing committed to
-             fall back to, stop: an item built from the parts that happened to
-             answer is worse than no new item at all.
+             the network cannot shrink the record. A part the committed item
+             never recorded is skipped when that item records the year's other
+             parts: the year cannot come out smaller than its record, and a
+             part no successful run has seen is not made real by a probe that
+             could not answer. With nothing committed at all, stop: an item
+             built from the parts that happened to answer is worse than no new
+             item at all.
     """
+    recorded_keys = {key for key, _, _, _ in PARTS
+                     if recorded_part(committed, key) is not None}
     found = []
     for key, name, title, roles in PARTS:
         common = {"key": key, "name": name, "title": title, "roles": roles}
@@ -286,6 +310,10 @@ def discover(year_dir: Path, year: int, remote_baseline: bool,
                     f"delete the asset from the item on purpose.")
         else:
             if recorded is None:
+                if recorded_keys:
+                    print(f"  {year}: cannot reach {name} and the committed "
+                          f"item does not record it; left out")
+                    continue
                 raise SystemExit(
                     f"year={year}: cannot reach {url}, and no committed item "
                     f"records what it holds. Refusing to write an item from "
