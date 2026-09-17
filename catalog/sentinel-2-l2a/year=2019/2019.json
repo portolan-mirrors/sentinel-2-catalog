@@ -5,101 +5,100 @@
     "https://stac-extensions.github.io/table/v1.2.0/schema.json",
     "https://stac-extensions.github.io/file/v2.1.0/schema.json"
   ],
-  "id": "2026",
+  "id": "2019",
   "collection": "sentinel-2-l2a",
   "bbox": [
-    -179.9953,
-    -75.5491,
-    179.986,
-    82.816
+    -180.0,
+    -82.8532,
+    180.0,
+    82.8211
   ],
   "geometry": {
     "type": "Polygon",
     "coordinates": [
       [
         [
-          -179.9953,
-          -75.5491
+          -180.0,
+          -82.8532
         ],
         [
-          179.986,
-          -75.5491
+          180.0,
+          -82.8532
         ],
         [
-          179.986,
-          82.816
+          180.0,
+          82.8211
         ],
         [
-          -179.9953,
-          82.816
+          -180.0,
+          82.8211
         ],
         [
-          -179.9953,
-          -75.5491
+          -180.0,
+          -82.8532
         ]
       ]
     ]
   },
   "properties": {
-    "title": "Sentinel-2 L2A scenes, 2026",
+    "title": "Sentinel-2 L2A scenes, 2019",
     "datetime": null,
-    "start_datetime": "2026-09-12T00:16:10.622Z",
-    "end_datetime": "2026-09-13T23:45:27.298Z",
-    "table:row_count": 31264,
+    "start_datetime": "2019-01-01T00:00:03.126Z",
+    "end_datetime": "2019-12-31T22:59:34.052Z",
+    "table:row_count": 7173674,
     "s2:platforms": [
       "sentinel-2a",
-      "sentinel-2b",
-      "sentinel-2c"
+      "sentinel-2b"
     ]
   },
   "assets": {
     "data-z01-20": {
       "href": "./z01-20.parquet",
       "type": "application/vnd.apache.parquet",
-      "title": "2026 scenes, UTM zones 1\u201320",
+      "title": "2019 scenes, UTM zones 1\u201320",
       "roles": [
         "data"
       ],
-      "start_datetime": "2026-09-12T00:16:10.622Z",
-      "end_datetime": "2026-09-13T23:21:36.919Z",
-      "table:row_count": 8275,
-      "file:size": 2965544
+      "start_datetime": "2019-01-01T08:15:04.816Z",
+      "end_datetime": "2019-12-31T22:21:14.277Z",
+      "table:row_count": 1995817,
+      "file:size": 2757584956
     },
     "data-z21-35": {
       "href": "./z21-35.parquet",
       "type": "application/vnd.apache.parquet",
-      "title": "2026 scenes, UTM zones 21\u201335",
+      "title": "2019 scenes, UTM zones 21\u201335",
       "roles": [
         "data"
       ],
-      "start_datetime": "2026-09-12T06:00:14.338Z",
-      "end_datetime": "2026-09-13T19:50:22.313Z",
-      "table:row_count": 8993,
-      "file:size": 3155602
+      "start_datetime": "2019-01-01T08:09:28.401Z",
+      "end_datetime": "2019-12-31T15:36:39.982Z",
+      "table:row_count": 1828555,
+      "file:size": 2627617625
     },
     "data-z36-46": {
       "href": "./z36-46.parquet",
       "type": "application/vnd.apache.parquet",
-      "title": "2026 scenes, UTM zones 36\u201346",
+      "title": "2019 scenes, UTM zones 36\u201346",
       "roles": [
         "data"
       ],
-      "start_datetime": "2026-09-12T02:36:10.547Z",
-      "end_datetime": "2026-09-13T13:18:00.722Z",
-      "table:row_count": 7026,
-      "file:size": 2449631
+      "start_datetime": "2019-01-01T04:19:53.680Z",
+      "end_datetime": "2019-12-31T09:00:39.603Z",
+      "table:row_count": 1542540,
+      "file:size": 2172868387
     },
     "data-z47-60": {
       "href": "./z47-60.parquet",
       "type": "application/vnd.apache.parquet",
-      "title": "2026 scenes, UTM zones 47\u201360",
+      "title": "2019 scenes, UTM zones 47\u201360",
       "roles": [
         "data"
       ],
-      "start_datetime": "2026-09-12T00:16:18.837Z",
-      "end_datetime": "2026-09-13T23:45:27.298Z",
-      "table:row_count": 6970,
-      "file:size": 2482245
+      "start_datetime": "2019-01-01T00:00:03.126Z",
+      "end_datetime": "2019-12-31T22:59:34.052Z",
+      "table:row_count": 1806762,
+      "file:size": 2577497446
     }
   },
   "links": [
