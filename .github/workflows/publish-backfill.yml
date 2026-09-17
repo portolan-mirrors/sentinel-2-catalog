@@ -177,6 +177,13 @@ jobs:
       # s2_fetch.py names each chunk <start>_<end>.parquet, so the year
       # prefix on the glob selects exactly this year's files -- s2_build.py
       # never has to rescan a chunk dir holding every other year too.
+      #
+      # Years from 2019 (s2_build.ZONE_SPLIT_FROM) are built as four
+      # UTM-zone parts, z01-20 .. z47-60 (spec Amendment 3): a whole 2019
+      # (7.17M rows) spilled past the runner's disk in gpio's sort, and a
+      # quarter of a year is 2017-sized, which builds in about an hour.
+      # 2015-2018 are already published as one items.parquet each and stay
+      # on the single-file path.
       - name: Build year=${{ matrix.year }}
         id: build
         run: |
@@ -188,8 +195,13 @@ jobs:
             echo "built=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          SPLIT=""
+          if [ "$Y" -ge 2019 ]; then
+            SPLIT="--split zones"
+          fi
+          # $SPLIT is unquoted on purpose: empty or two words.
           python3 tools/s2_build.py --sources staging/chunks/api/${Y}-*.parquet \
-            --years "$Y" --out staging/publish/sentinel-2-l2a --memory 12GB
+            --years "$Y" --out staging/publish/sentinel-2-l2a --memory 12GB $SPLIT
           echo "built=true" >> "$GITHUB_OUTPUT"
 
       # Source Cooperative's bucket is reached by assuming a role it has

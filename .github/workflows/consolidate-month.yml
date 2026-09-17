@@ -1,8 +1,18 @@
 name: consolidate-month
 
-# Fold live.parquet into the year's items.parquet on the 3rd of each month
-# (the lookback has long since covered month-end by then). Rewrites one
-# year part (~a few hundred MB) and empties live.
+# Fold live.parquet into the year's archive parts on the 3rd of each month
+# (the lookback has long since covered month-end by then). Rewrites the
+# year's archive and empties live.
+#
+# The archive of a year from 2019 (s2_build.ZONE_SPLIT_FROM) is four
+# UTM-zone parts, z01-20 .. z47-60 (spec Amendment 3); before that it is
+# one items.parquet. This job downloads whichever shape the year has, merges
+# live in, and writes the same shape back -- so for 2019+ the merge is
+# `--split zones` over every existing part plus live, and the four parts
+# are re-uploaded. On the first consolidation of a year a part may not be
+# published yet (404), and that is fine; any other failure to fetch a part
+# is fatal, because a part left out of the merge would be rewritten from
+# live's rows alone and overwrite months of scenes on upload.
 #
 # Bootstrap guard: same reasoning as refresh-daily.yml -- nothing is
 # published on a fresh repo until publish-backfill has run once, so the
@@ -51,30 +61,65 @@ jobs:
         if: steps.guard.outputs.published == 'true'
         # geoparquet-io pinned on purpose: see ci.yml and gpio-fix-report.md.
         run: pip install --quiet duckdb boto3 'geoparquet-io==1.5.0' 'rashid>=0.1.8,<0.2.0' stac-check
-      - name: Merge live into the year part
+      - name: Merge live into the year's archive parts
         if: steps.guard.outputs.published == 'true'
         run: |
           set -euo pipefail
           mkdir -p staging
           Y="${{ inputs.year }}"; [ -z "$Y" ] && Y=$(date -u +%Y)
           BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
-          curl -fSL -o staging/items-prev.parquet "$BASE/year=$Y/items.parquet"
-          curl -fSL -o staging/live-prev.parquet "$BASE/year=$Y/live.parquet" \
-            || rm -f staging/live-prev.parquet
-          SRC="staging/items-prev.parquet"
-          [ -s staging/live-prev.parquet ] && SRC="$SRC staging/live-prev.parquet"
+          # fetch <name>: download year=$Y/<name>.parquet to staging/<name>-prev.parquet.
+          # Returns 1 only on a 404 (never published); any other failure --
+          # a 5xx, a timeout, a truncated body -- kills the job, because a
+          # part silently left out of the merge is a part overwritten on
+          # upload with a fraction of its rows.
+          fetch() {
+            local code
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -I "$BASE/year=$Y/$1.parquet")
+            if [ "$code" = "404" ]; then
+              echo "year=$Y/$1.parquet: not published (404)"
+              return 1
+            fi
+            if [ "$code" != "200" ]; then
+              echo "::error::year=$Y/$1.parquet: HEAD answered $code, not 200 or 404"
+              exit 1
+            fi
+            curl -fSL -o "staging/$1-prev.parquet" "$BASE/year=$Y/$1.parquet"
+          }
+          SRC=""
+          SPLIT=""
+          if [ "$Y" -ge 2019 ]; then
+            # Zone parts: the names come from tools/s2_build.py ZONE_PARTS.
+            SPLIT="--split zones"
+            for P in z01-20 z21-35 z36-46 z47-60; do
+              if fetch "$P"; then SRC="$SRC staging/$P-prev.parquet"; fi
+            done
+          else
+            fetch items && SRC="staging/items-prev.parquet"
+          fi
+          if fetch live; then SRC="$SRC staging/live-prev.parquet"; fi
+          if [ -z "$SRC" ]; then
+            echo "::error::nothing published under year=$Y to consolidate"
+            exit 1
+          fi
+          # $SRC and $SPLIT are unquoted on purpose: word lists.
           python3 tools/s2_build.py --sources $SRC --years "$Y" \
-            --out ./staging/publish/sentinel-2-l2a --memory 12GB
+            --out ./staging/publish/sentinel-2-l2a --memory 12GB $SPLIT
           # Empty live: publish a zero-row live.parquet rather than deleting
           # (publishing never deletes; a missing object would 404 in the glob
-          # clients already resolved).
+          # clients already resolved). Its schema is copied from whichever
+          # archive part the merge just wrote.
           Y="$Y" python3 - << 'EOF'
-          import duckdb, os
+          import duckdb, glob, os
           y = os.environ["Y"]
           con = duckdb.connect(); con.execute("INSTALL spatial; LOAD spatial;")
-          src = f"staging/publish/sentinel-2-l2a/year={y}/items.parquet"
-          dst = f"staging/publish/sentinel-2-l2a/year={y}/live.parquet"
-          con.execute(f"COPY (SELECT * FROM read_parquet('{src}') LIMIT 0) TO '{dst}' (FORMAT PARQUET, COMPRESSION zstd)")
+          year_dir = f"staging/publish/sentinel-2-l2a/year={y}"
+          parts = sorted(p for p in glob.glob(f"{year_dir}/*.parquet")
+                         if not p.endswith("/live.parquet"))
+          if not parts:
+              raise SystemExit(f"no archive part written under {year_dir}")
+          dst = f"{year_dir}/live.parquet"
+          con.execute(f"COPY (SELECT * FROM read_parquet('{parts[0]}') LIMIT 0) TO '{dst}' (FORMAT PARQUET, COMPRESSION zstd)")
           EOF
       - name: Restamp collection metadata
         if: steps.guard.outputs.published == 'true'
