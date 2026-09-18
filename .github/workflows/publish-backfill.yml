@@ -274,23 +274,33 @@ jobs:
             --years "$Y" --out staging/publish/sentinel-2-l2a --memory 12GB $SPLIT \
             --skip-existing-url "$PUBLIC_BASE/sentinel-2-l2a" \
             --on-part-done "python3 tools/upload_part.py --data-dir staging/publish"
-          echo "built=true" >> "$GITHUB_OUTPUT"
+          # A year whose every part was already published stages nothing
+          # (s2_build skips it on the HEADs alone, exit 0). That is the
+          # success the flag exists for -- a re-dispatch of a finished
+          # year -- not a failure, and the safety upload below would exit
+          # 1 on an empty staging tree, so it is gated on `staged`.
+          if find staging/publish -name '*.parquet' | grep -q .; then
+            echo "staged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::year=$Y: every part was already published; nothing built, nothing to upload"
+            echo "staged=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # Safety net, expected to upload nothing: every part was uploaded by
       # --on-part-done, and upload_data's change detection (size for a
       # multipart ETag; the listing runs on the env credentials, which
       # aws_session prefers over the config profile) sees each one already
       # there. Re-assumed first, because the session above may be hours
-      # old by now.
+      # old by now. Skipped when nothing was staged.
       - name: Assume the Source Cooperative write role for the safety upload
-        if: steps.build.outputs.built == 'true'
+        if: steps.build.outputs.staged == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.year }}-final
           aws-region: us-west-2
       - name: Upload anything year ${{ matrix.year }} still has staged
-        if: steps.build.outputs.built == 'true'
+        if: steps.build.outputs.staged == 'true'
         run: python3 tools/upload_data.py --confirm --data-dir staging/publish
 
   finalize:

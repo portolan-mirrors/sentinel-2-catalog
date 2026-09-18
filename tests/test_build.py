@@ -235,6 +235,10 @@ def test_gpio_check_still_gates_the_build():
         proc = _build(out, chunks, LEVEL_LOW, env=env)
         assert proc.returncode != 0
         assert "gpio check failed" in proc.stderr
+        # The part that failed its check never reached its final name, and
+        # the temporary it was checked under is gone too.
+        assert not (out / "year=2024" / "items.parquet").exists()
+        assert list((out / "year=2024").iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -534,28 +538,44 @@ def test_split_zones_refuses_a_year_with_no_parts():
 
 
 class _Bucket:
-    """A stand-in for the bucket's public base: HEAD answers per name from
-    `codes` (default 404), every request is logged."""
+    """A stand-in for the bucket's public base, serving `root` (a directory
+    holding year=YYYY/<part>.parquet, or None for an empty bucket) so
+    DuckDB can read a published part's footer over HTTP as s2_build does
+    for real. `codes` forces a HEAD status per file name; otherwise a
+    file that exists answers 200 and anything else 404. Every HEAD is
+    logged with its User-Agent."""
 
-    def __init__(self, codes: dict[str, int]):
+    def __init__(self, codes: dict[str, int] | None = None, root=None):
         import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from functools import partial
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-        self.codes, self.seen = codes, []
+        self.codes, self.seen = codes or {}, []
         bucket = self
+        directory = str(root) if root else tempfile.mkdtemp()
 
-        class H(BaseHTTPRequestHandler):
+        class H(SimpleHTTPRequestHandler):
             def do_HEAD(self):
                 name = self.path.rsplit("/", 1)[-1]
                 bucket.seen.append((self.headers.get("User-Agent"), self.path))
-                self.send_response(bucket.codes.get(name, 404))
+                forced = bucket.codes.get(name)
+                if forced is None:
+                    return super().do_HEAD()
+                self.send_response(forced)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+
+            def translate_path(self, path):
+                # The bucket's public base has one more segment than the
+                # directory: strip /sentinel-2-l2a.
+                return super().translate_path(
+                    path.replace("/sentinel-2-l2a/", "/", 1))
 
             def log_message(self, *a):
                 pass
 
-        self.srv = HTTPServer(("127.0.0.1", 0), H)
+        self.srv = ThreadingHTTPServer(
+            ("127.0.0.1", 0), partial(H, directory=directory))
         self.url = f"http://127.0.0.1:{self.srv.server_port}/sentinel-2-l2a"
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
@@ -563,22 +583,37 @@ class _Bucket:
         self.srv.shutdown()
 
 
+def _publish_fixture(con, td: Path, year: int, zones, per_zone=1):
+    """Build the fixture once, plainly, into <td>/bucket -- the state of the
+    bucket after a run that finished those parts -- and return
+    (chunks, bucket dir)."""
+    chunks = td / "chunks" / "api"
+    chunks.mkdir(parents=True)
+    _mk_zone_chunk(con, chunks / "a.parquet", zones, per_zone=per_zone,
+                   year=year)
+    proc = _build_split(td / "bucket", chunks, ["--split", "zones"], year=year)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return chunks, td / "bucket"
+
+
 def test_skip_existing_builds_only_the_unpublished_parts():
-    """Resume after a timeout: the parts the bucket already has (HEAD 200)
-    are skipped with a log line and never written; the 404 ones are built;
-    the part total still has to add up to the staged rows, skipped parts
+    """Resume after a timeout: the parts the bucket already has (HEAD 200,
+    and a footer row count equal to what this build would write) are
+    skipped with a log line and never written; the 404 ones are built; the
+    part total still has to add up to the staged rows, skipped parts
     included; --on-part-done runs once per BUILT part, with its path."""
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
     year = ZONE_SPLIT_8_FROM
     published = {"z01-15.parquet": 200, "z36-40.parquet": 200}
-    bucket = _Bucket(published)
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            chunks = Path(td) / "chunks" / "api"
-            chunks.mkdir(parents=True)
-            _mk_zone_chunk(con, chunks / "a.parquet", list(range(1, 61)),
-                           per_zone=1, year=year)
+    with tempfile.TemporaryDirectory() as td:
+        chunks, bucket_dir = _publish_fixture(con, Path(td), year,
+                                              list(range(1, 61)))
+        for part in (bucket_dir / f"year={year}").iterdir():
+            if part.name not in published:
+                part.unlink()  # the run "timed out" after these two
+        bucket = _Bucket(root=bucket_dir)
+        try:
             out = Path(td) / "publish"
             log = Path(td) / "hook.log"
             hook = (f"{sys.executable} -c \"import sys; open(sys.argv[1], 'a')"
@@ -591,29 +626,100 @@ def test_skip_existing_builds_only_the_unpublished_parts():
             built = sorted(p.name for p in year_dir.iterdir())
             assert built == sorted(f"{lb}.parquet" for lb in OCTANT_LABELS
                                    if f"{lb}.parquet" not in published)
-            for name in published:
-                assert f"year={year}/{name}: already published, skipping" \
-                    in proc.stdout
+            for name, rows in (("z01-15.parquet", 15), ("z36-40.parquet", 5)):
+                assert (f"year={year}/{name}: already published with the "
+                        f"same {rows} rows") in proc.stdout
             # 60 rows staged: 15 + 5 skipped, 40 written, and the sum checked.
             assert "TOTAL 40 rows across 1 year(s), 2 part(s) already published" \
                 in proc.stdout
-            # One HEAD per part, with the catalog's client name, before any
-            # staging happened.
-            assert sorted(path for _, path in bucket.seen) == sorted(
+            # One probe HEAD per part with the catalog's client name (DuckDB
+            # adds its own HEAD when it reads a skipped part's footer).
+            probes = [path for ua, path in bucket.seen
+                      if ua.startswith("sentinel-2-catalog-tools/")]
+            assert sorted(probes) == sorted(
                 f"/sentinel-2-l2a/year={year}/{lb}.parquet" for lb in OCTANT_LABELS)
-            assert all(ua.startswith("sentinel-2-catalog-tools/")
-                       for ua, _ in bucket.seen)
             # The hook ran once per built part, in order, with the final
             # (resolved: --out is) path.
             assert log.read_text().splitlines() == \
                 [str(year_dir.resolve() / name) for name in
                  (f"{lb}.parquet" for lb in OCTANT_LABELS)
                  if name not in published]
-    finally:
-        bucket.close()
+        finally:
+            bucket.close()
+
+
+def test_skip_existing_refuses_a_published_part_with_other_rows():
+    """A published part built from an older slice set does not hold what
+    this build's slices give its range. Skipping it would leave the year
+    stale, so the build stops and names the part and both counts -- read
+    from the published part's footer over HTTP, as in production."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    year = ZONE_SPLIT_8_FROM
+    with tempfile.TemporaryDirectory() as td:
+        # Published from a slice set with zones 3 and 7 only (2 rows in
+        # z01-15); the new slices have zones 3, 7 and 9 (3 rows).
+        chunks, bucket_dir = _publish_fixture(con, Path(td), year, [3, 7])
+        _mk_zone_chunk(con, chunks / "b.parquet", [9], per_zone=1, year=year)
+        bucket = _Bucket(root=bucket_dir)
+        try:
+            out = Path(td) / "publish"
+            proc = _build_split(out, chunks, [
+                "--split", "zones", "--skip-existing-url", bucket.url], year=year)
+            assert proc.returncode != 0
+            assert ("year=2021/z01-15.parquet: already published with 2 rows, "
+                    "but this build's slices give zones 1-15 3 rows") in proc.stderr
+            assert not list((out / f"year={year}").glob("*.parquet"))
+        finally:
+            bucket.close()
+
+
+def test_skip_existing_row_check_with_an_injected_count():
+    """The same rule through build_year() with the probe and the footer
+    read injected: an equal count skips, a different one stops."""
+    from s2_build import build_year, connect
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    year = ZONE_SPLIT_8_FROM
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks"
+        chunks.mkdir()
+        _mk_zone_chunk(con, chunks / "a.parquet", [3, 40], per_zone=2, year=year)
+        bcon = connect("1GB", Path(td))
+        files = [str(chunks / "a.parquet")]
+        seen = []
+
+        def probe(base, y, name):
+            return name == "z01-15.parquet"
+
+        def same(con, url):
+            seen.append(url)
+            return 2
+
+        # In-process, so ZSTD_LEVEL is the import-time default; four rows
+        # at level 18 cost nothing.
+        written, skipped = build_year(
+            bcon, files, year, Path(td) / "ok", split="zones",
+            skip_existing_url="http://bucket/sentinel-2-l2a",
+            probe=probe, remote_rows=same)
+        assert (written, skipped) == (2, 1)
+        assert seen == [f"http://bucket/sentinel-2-l2a/year={year}/z01-15.parquet"]
+        assert sorted(p.name for p in (Path(td) / "ok" / f"year={year}").iterdir()) \
+            == ["z36-40.parquet"]
+
+        with pytest.raises(SystemExit) as caught:
+            build_year(bcon, files, year, Path(td) / "stale", split="zones",
+                       skip_existing_url="http://bucket/sentinel-2-l2a",
+                       probe=probe, remote_rows=lambda con, url: 7)
+        assert "z01-15.parquet: already published with 7 rows" in str(caught.value)
+        assert "zones 1-15 2 rows" in str(caught.value)
+        assert not list((Path(td) / "stale" / f"year={year}").glob("*.parquet"))
 
 
 def test_skip_existing_skips_a_fully_published_year_without_staging():
+    """Every part HEADs 200: nothing is staged, so nothing is compared --
+    the point of the flag is that re-dispatching a finished year costs
+    eight HEADs and no minutes."""
     year = ZONE_SPLIT_8_FROM
     bucket = _Bucket({f"{lb}.parquet": 200 for lb in OCTANT_LABELS})
     try:

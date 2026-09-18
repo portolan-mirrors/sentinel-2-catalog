@@ -38,10 +38,12 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-from s2_fetch import UA as _FETCH_UA  # noqa: E402
 
-UA = {"User-Agent": _FETCH_UA["User-Agent"]}
+# The same client name s2_fetch.py and make_items.py send; spelled out
+# rather than imported so this script does not pull duckdb in through
+# s2_fetch just to read one string.
+UA = {"User-Agent": "sentinel-2-catalog-tools/1.0 "
+                    "(+https://github.com/portolan-mirrors/sentinel-2-catalog)"}
 AUDIENCE = "sts.amazonaws.com"
 SESSION_SECONDS = 3600
 

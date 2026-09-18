@@ -75,16 +75,19 @@ problem, not this file's -- 12GB (what the workflows pass) on a 16GB runner
 is already close, because DuckDB's accounting undershot real RSS by ~1GB+ on
 the staging phase in the y2017 diagnosis.
 
-The part lands through a `.tmp` name plus os.replace(): gpio writes
-`items.parquet.tmp` (hence --any-extension) and the rename puts it on
-`items.parquet` in one atomic step. Without it a killed build leaves a
-half-written part that every resume's exists() check downstream would trust
--- the same protection copy_ndjson_to_parquet() gives chunk files.
+The part lands through a temporary name plus os.replace(): gpio writes
+`.items.tmp.parquet` (a dotfile, so upload_data's dotfile rule and every
+`*.parquet` glob ignore it if a killed build leaves it behind; still
+`.parquet`, because `gpio check` sniffs the extension), `gpio check all`
+gates it there, and only then does the rename put it on `items.parquet` in
+one atomic step. So a killed build, or a part that failed its check, never
+leaves anything at a final name that a resume's exists() check downstream
+would trust -- the same protection copy_ndjson_to_parquet() gives chunk
+files.
 
-`gpio check all` gates the artifact, and every phase prints a timestamped
-line with rows, bytes and seconds. The 2017 job burned six hours with no
-output at all; a stall should be visible in the log, not inferred from a
-timeout.
+Every phase prints a timestamped line with rows, bytes and seconds. The 2017
+job burned six hours with no output at all; a stall should be visible in the
+log, not inferred from a timeout.
 """
 from __future__ import annotations
 
@@ -254,18 +257,19 @@ def _select(con, lst: str) -> str:
 
 def _sort_and_check(con, staged: Path, final: Path, year: int,
                     memory: str) -> None:
-    """The ordered GeoParquet 2.0 write of one part, then its gate.
+    """The ordered GeoParquet 2.0 write of one part, its gate, then its name.
 
-    gpio writes `<name>.tmp` (hence --any-extension) and os.replace() puts it
-    on `<name>` in one atomic rename, so a killed build leaves the previous
-    part intact rather than a half-written one that every resume's exists()
-    check downstream would trust. --write-memory needs gpio >= 1.4; on 1.3.0
-    it was silently dropped and the write self-picked 50% of available RAM.
+    gpio writes `.<stem>.tmp.parquet`, `gpio check all` runs on that, and
+    only a part that passed is os.replace()d onto `<name>` in one atomic
+    rename -- so neither a killed build nor a part that failed its check
+    leaves anything at the final name that a resume's exists() check
+    downstream would trust. --write-memory needs gpio >= 1.4; on 1.3.0 it
+    was silently dropped and the write self-picked 50% of available RAM.
     The DuckDB limit drops to GPIO_HANDOFF for the duration so the two
     processes are not bidding for the same RAM.
     """
     name = final.name
-    tmp = final.with_name(final.name + ".tmp")
+    tmp = final.with_name(f".{final.stem}.tmp.parquet")
     tmp.unlink(missing_ok=True)
     t0 = time.monotonic()
     try:
@@ -276,31 +280,31 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
              "--compression", "zstd",
              "--compression-level", str(ZSTD_LEVEL),
              "--row-group-size", str(ROW_GROUP),
-             "--write-memory", memory, "--any-extension"],
+             "--write-memory", memory],
             capture_output=True, text=True)
         if r.returncode != 0:
             print(r.stdout[-1500:], r.stderr[-1500:], file=sys.stderr)
             raise SystemExit(f"gpio sort failed for {year}")
+        say(f"year={year}/{name}: sorted (_month, _hilbert) and written "
+            f"zstd-{ZSTD_LEVEL}, {tmp.stat().st_size / 1e6:,.0f} MB, "
+            f"{time.monotonic() - t0:,.1f}s")
+        # Best-practices gate on the artifact itself: compression, row
+        # groups, spatial order, bbox metadata. Fails the build only on
+        # gpio's error-level violations (non-zero exit); WARNING-level
+        # findings (e.g. omitted geo-metadata CRS, which the GeoParquet
+        # spec defaults to OGC:CRS84) pass and are acceptable.
+        t0 = time.monotonic()
+        chk = subprocess.run(["gpio", "check", "all", str(tmp)],
+                             capture_output=True, text=True)
+        if chk.returncode != 0:
+            print(chk.stdout[-1500:], chk.stderr[-1500:], file=sys.stderr)
+            raise SystemExit(f"gpio check failed for {year}")
+        say(f"year={year}/{name}: gpio check all passed, "
+            f"{time.monotonic() - t0:,.1f}s")
         os.replace(tmp, final)
     finally:
         con.execute(f"SET memory_limit='{memory}';")
         tmp.unlink(missing_ok=True)
-    say(f"year={year}/{name}: sorted (_month, _hilbert) and written "
-        f"zstd-{ZSTD_LEVEL}, {final.stat().st_size / 1e6:,.0f} MB, "
-        f"{time.monotonic() - t0:,.1f}s")
-    # Best-practices gate on the artifact itself: compression, row
-    # groups, spatial order, bbox metadata. Fails the build only on
-    # gpio's error-level violations (non-zero exit); WARNING-level
-    # findings (e.g. omitted geo-metadata CRS, which the GeoParquet
-    # spec defaults to OGC:CRS84) pass and are acceptable.
-    t0 = time.monotonic()
-    chk = subprocess.run(["gpio", "check", "all", str(final)],
-                         capture_output=True, text=True)
-    if chk.returncode != 0:
-        print(chk.stdout[-1500:], chk.stderr[-1500:], file=sys.stderr)
-        raise SystemExit(f"gpio check failed for {year}")
-    say(f"year={year}/{name}: gpio check all passed, "
-        f"{time.monotonic() - t0:,.1f}s")
 
 
 def published_part(base: str, year: int, name: str, tries: int = 8) -> bool:
@@ -341,6 +345,21 @@ def published_part(base: str, year: int, name: str, tries: int = 8) -> bool:
         f"refusing to guess whether it is published")
 
 
+def published_rows(con, url: str) -> int:
+    """The row count of a published part, from its footer over HTTP (DuckDB
+    httpfs: a HEAD and a range read of the footer, never the data). Used to
+    check that a part being skipped as already published holds the same
+    rows this build's slices would give it."""
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    try:
+        return con.execute(
+            "SELECT num_rows FROM parquet_file_metadata(?)", [url]).fetchone()[0]
+    except duckdb.Error as e:
+        raise SystemExit(
+            f"cannot read the footer of {url} to check its row count ({e}); "
+            f"refusing to guess whether the published part is current")
+
+
 def run_part_hook(cmd: list[str], part: Path, year: int) -> None:
     """Run the --on-part-done command with the finished part's path appended
     (`shlex.split(CMD) + [path]`, stdio inherited so an upload's progress
@@ -363,15 +382,19 @@ def run_part_hook(cmd: list[str], part: Path, year: int) -> None:
 
 def _stage_zone_parts(con, staged: Path, year: int,
                       parts: tuple[tuple[str, int, int], ...],
-                      skip: set[str]) -> list[tuple[str, Path | None, int]]:
+                      skip: dict[str, str],
+                      remote_rows=published_rows) -> list[tuple[str, Path | None, int]]:
     """Copy each range of `parts` out of the staged year into its own staged
     file. Returns (label, path, rows) for the ranges that have rows -- path
-    None for a label in `skip`, which is only counted (its rows still have
-    to add up) and never copied -- and removes the whole-year staged file
-    once they all exist so the disk never holds the year twice on top of a
-    sort spill. A row with no parseable zone would land in no part; rather
-    than publish a year that is quietly short, the build stops on the first
-    one."""
+    None for a label in `skip` (label -> published URL), which is never
+    copied but is counted, and its count compared with the published
+    part's footer: a published part built from an older slice set does not
+    match what this build would write, and keeping it silently would leave
+    the year stale, so that stops the build naming both counts. Removes
+    the whole-year staged file once the copies exist so the disk never
+    holds the year twice on top of a sort spill. A row with no parseable
+    zone would land in no part; rather than publish a year that is quietly
+    short, the build stops on the first one."""
     lost = con.execute(
         f"SELECT count(*) FROM read_parquet('{staged}') "
         f"WHERE {ZONE_SQL} IS NULL OR {ZONE_SQL} NOT BETWEEN 1 AND 60"
@@ -388,8 +411,16 @@ def _stage_zone_parts(con, staged: Path, year: int,
             n = con.execute(
                 f"SELECT count(*) FROM read_parquet('{staged}') "
                 f"WHERE {ZONE_SQL} BETWEEN {lo} AND {hi}").fetchone()[0]
-            say(f"year={year}/{name}: already published, skipping "
-                f"({n:,} rows in zones {lo}-{hi} left to the published part)")
+            have = remote_rows(con, skip[label])
+            if have != n:
+                raise SystemExit(
+                    f"year={year}/{name}: already published with {have:,} "
+                    f"rows, but this build's slices give zones {lo}-{hi} "
+                    f"{n:,} rows; the published part is not this build's. "
+                    f"Not skipping it silently -- rebuild the year without "
+                    f"--skip-existing-url, or remove the stale part first.")
+            say(f"year={year}/{name}: already published with the same "
+                f"{n:,} rows (zones {lo}-{hi}), skipping")
             out.append((label, None, n))
             continue
         part_staged = staged.with_name(name)
@@ -418,12 +449,14 @@ def build_year(con, files: list[str], year: int, outdir: Path,
                name: str = "items.parquet", memory: str = "8GB",
                split: str | None = None, skip_existing_url: str | None = None,
                on_part_done: list[str] | None = None,
-               probe=published_part) -> tuple[int, int]:
+               probe=published_part, remote_rows=published_rows) -> tuple[int, int]:
     """Build one year. Returns (rows written, parts skipped as already
     published). With --split zones the parts are zone_parts_for(year); a
     year below ZONE_SPLIT_FROM has none and the split is refused rather
-    than silently written whole. `probe` is published_part, injectable for
-    tests."""
+    than silently written whole. `probe` (published_part) and `remote_rows`
+    (published_rows) are injectable for tests. A year whose every part is
+    published is skipped before staging, on the HEADs alone: the point of
+    the flag is that re-dispatching a finished year costs nothing."""
     lst = ",".join(f"'{f}'" for f in files)
     dest = outdir / f"year={year}"
     dest.mkdir(parents=True, exist_ok=True)
@@ -439,11 +472,12 @@ def build_year(con, files: list[str], year: int, outdir: Path,
     # Ask the bucket before staging anything: a year whose every part is
     # already up costs one HEAD per part and no minutes, and a rerun after a
     # timeout builds only what the last run did not finish uploading.
-    skip: set[str] = set()
+    skip: dict[str, str] = {}
     if skip_existing_url:
         wanted = [f"{lb}.parquet" for lb, _, _ in parts] if parts else [name]
-        skip = {n[:-len(".parquet")] for n in wanted
-                if probe(skip_existing_url, year, n)}
+        skip = {n[:-len(".parquet")]:
+                f"{skip_existing_url.rstrip('/')}/year={year}/{n}"
+                for n in wanted if probe(skip_existing_url, year, n)}
         if len(skip) == len(wanted):
             say(f"year={year}/{label}: every part already published "
                 f"({', '.join(wanted)}); nothing to build")
@@ -487,7 +521,7 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         # ranges waiting on disk, never a whole year's sort.
         written = skipped = 0
         for part_label, part_staged, part_rows in _stage_zone_parts(
-                con, staged, year, parts, skip):
+                con, staged, year, parts, skip, remote_rows):
             if part_staged is None:
                 skipped += part_rows
                 continue
