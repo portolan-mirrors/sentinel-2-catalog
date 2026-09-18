@@ -418,14 +418,19 @@ def test_split_and_name_do_not_mix():
 
 def test_docs_name_every_zone_part():
     """The zone ranges are documented by hand in the collection docs, so this
-    pins the prose to the constant: every part file name and its zone range
-    must appear where a reader will look for them."""
+    pins the prose to the constants: every part file name of both tiers, its
+    zone range, and the year each tier starts must appear where a reader
+    will look for them."""
     for doc in ("catalog/sentinel-2-l2a/AGENTS.md",
                 "catalog/sentinel-2-l2a/README.md"):
         text = (ROOT / doc).read_text()
-        for label, lo, hi in ZONE_PARTS:
+        for label, lo, hi in (*ZONE_PARTS, *ZONE_PARTS_8):
             assert f"{label}.parquet" in text, (doc, label)
             assert f"{lo}–{hi}" in text or f"{lo}-{hi}" in text, (doc, label)
+        assert str(ZONE_SPLIT_FROM) in text and str(ZONE_SPLIT_8_FROM) in text
+    root = (ROOT / "README.md").read_text()
+    for label, _, _ in (*ZONE_PARTS, *ZONE_PARTS_8):
+        assert label in root, label
 
 
 def test_app_mirrors_both_zone_tiers():

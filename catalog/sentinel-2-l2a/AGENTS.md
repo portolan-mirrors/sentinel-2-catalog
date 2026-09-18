@@ -17,30 +17,46 @@ public `sentinel-cogs` bucket on AWS, and every COG URL is already in the
 
 ```
 https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/items.parquet   2015-2018
-https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z01-20.parquet   2019 onward, four parts
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z01-20.parquet   2019-2020, four parts
 https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z21-35.parquet
 https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z36-46.parquet
 https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z47-60.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z01-15.parquet   2021 onward, eight parts
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z16-20.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z21-31.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z32-35.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z36-40.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z41-46.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z47-52.parquet
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/z53-60.parquet
 https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=YYYY/live.parquet    current year only
 ```
 
-A year's archive is one of two shapes. 2015-2018 are a single `items.parquet`
-each. From 2019 the archive is four files, split by the UTM zone of
-`s2:mgrs_tile` (the leading one or two digits of the tile id):
+A year's archive is one of three shapes, and the year tells you which.
+2015-2018 are a single `items.parquet` each. From 2019 the archive is split
+by the UTM zone of `s2:mgrs_tile` (the leading one or two digits of the tile
+id): 2019 and 2020 into four files, and from 2021 into eight, whose
+boundaries sit inside the four (every quartile edge is also an octant edge):
 
-| part file        | UTM zones |
-| ---------------- | --------- |
-| `z01-20.parquet` | 1–20      |
-| `z21-35.parquet` | 21–35     |
-| `z36-46.parquet` | 36–46     |
-| `z47-60.parquet` | 47–60     |
+| 2019–2020 part   | UTM zones | 2021+ part       | UTM zones |
+| ---------------- | --------- | ---------------- | --------- |
+| `z01-20.parquet` | 1–20      | `z01-15.parquet` | 1–15      |
+|                  |           | `z16-20.parquet` | 16–20     |
+| `z21-35.parquet` | 21–35     | `z21-31.parquet` | 21–31     |
+|                  |           | `z32-35.parquet` | 32–35     |
+| `z36-46.parquet` | 36–46     | `z36-40.parquet` | 36–40     |
+|                  |           | `z41-46.parquet` | 41–46     |
+| `z47-60.parquet` | 47–60     | `z47-52.parquet` | 47–52     |
+|                  |           | `z53-60.parquet` | 53–60     |
 
-The boundaries are fixed for every year (they balance the 2018 row
-distribution at 27/26/22/25%), so the part that holds a tile is known from
-the tile id alone: `31UFU` is zone 31, always in `z21-35.parquet`. The current
-year also has `live.parquet`, the tail fetched daily since the last
-consolidation. No two parts of a year overlap, so a glob over the year reads
-each scene once, whichever shape the year has:
+The boundaries are fixed (both tiers balance the 2018 row distribution: the
+four at 27/26/22/25%, the eight at 10–15% each; the eight exist because a
+quarter of a 2021-sized year no longer built inside one CI job), so the part
+that holds a tile is known from the tile id and the year alone: `31UFU` is
+zone 31, in `z21-35.parquet` for 2019–2020 and `z21-31.parquet` from 2021.
+The current year also has `live.parquet`, the tail fetched daily since the
+last consolidation. No two parts of a year overlap, so a glob over the year
+reads each scene once, whichever shape the year has:
 
 ```sql
 read_parquet('.../sentinel-2-l2a/year=*/*.parquet', hive_partitioning=true)
@@ -80,15 +96,15 @@ Column names with a colon are not identifiers. Quote them: `"eo:cloud_cover"`,
 not `eo:cloud_cover`.
 
 **Read only the part containing your tile's zone.** The glob above opens every
-part of the year and lets the `s2:mgrs_tile` filter discard three quarters of
-it by row-group statistics. When you know the tile, skip them entirely: pick
-the file by zone. Zone 31 is in `z21-35.parquet`, so the same query over 2021
-touches one file:
+part of the year and lets the `s2:mgrs_tile` filter discard the rest of it by
+row-group statistics. When you know the tile, skip them entirely: pick the
+file by zone and year. Zone 31 in 2021 is in `z21-31.parquet`, so the same
+query touches one file:
 
 ```sql
 SELECT id, datetime, "eo:cloud_cover",
        json_extract_string(assets, '$.visual.href') AS visual_cog
-FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=2021/z21-35.parquet')
+FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=2021/z21-31.parquet')
 WHERE "s2:mgrs_tile" = '31UFU'
   AND _month BETWEEN 8 AND 10
   AND "eo:cloud_cover" < 10
@@ -97,10 +113,11 @@ LIMIT 20;
 ```
 
 To choose the file in code, parse the zone with `^\d{1,2}` and take the range
-that contains it; for a year before 2019 the file is `items.parquet`
-regardless of zone. Add `live.parquet` for the current year. A bounding box
-spans the zone ranges its longitudes fall in (each UTM zone is six degrees
-wide), so a regional bbox query names one or two parts; a global query globs.
+that contains it from the year's tier: the four ranges for 2019–2020, the
+eight from 2021; for a year before 2019 the file is `items.parquet` regardless
+of zone. Add `live.parquet` for the current year. A bounding box spans the
+zone ranges its longitudes fall in (each UTM zone is six degrees wide), so a
+regional bbox query names one or two parts; a global query globs.
 The per-year item (`year=YYYY/YYYY.json`) lists every part of that year as its
 own asset, with its own row count and time range, if you would rather discover
 than assume.

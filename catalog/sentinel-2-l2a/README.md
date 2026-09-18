@@ -42,25 +42,38 @@ sentinel-2-l2a/
   collection.json
   year=2017/items.parquet      one file per year through 2018
   year=2018/items.parquet
-  year=2019/z01-20.parquet     four files per year from 2019, by UTM zone
+  year=2019/z01-20.parquet     four files per year for 2019-2020, by UTM zone
   year=2019/z21-35.parquet
   year=2019/z36-46.parquet
   year=2019/z47-60.parquet
+  year=2020/z01-20.parquet … z47-60.parquet
+  year=2021/z01-15.parquet     eight files per year from 2021, by UTM zone
+  year=2021/z16-20.parquet
+  year=2021/z21-31.parquet
+  year=2021/z32-35.parquet
+  year=2021/z36-40.parquet
+  year=2021/z41-46.parquet
+  year=2021/z47-52.parquet
+  year=2021/z53-60.parquet
   …
-  year=2026/z01-20.parquet … z47-60.parquet
+  year=2026/z01-15.parquet … z53-60.parquet
   year=2026/live.parquet       rolling tail since the last consolidation
 ```
 
 One directory per year Earth Search actually holds items for, so the listing
 starts where its record does — see Coverage below.
 
-A year's archive is one file through 2018 and four from 2019, split by the UTM
-zone of `s2:mgrs_tile` (the leading digits of the tile id): `z01-20.parquet`
-holds zones 1–20, `z21-35.parquet` zones 21–35, `z36-46.parquet` zones 36–46,
-`z47-60.parquet` zones 47–60. The split is what keeps a 7-million-scene year
-buildable, and it is also a spatial index for free: a tile id names its part,
-so a query for `31UFU` in 2021 can open `year=2021/z21-35.parquet` alone and
-skip the other three quarters of the year. The current year also carries
+A year's archive is one file through 2018, and from 2019 it is split by the
+UTM zone of `s2:mgrs_tile` (the leading digits of the tile id). 2019 and 2020
+are four files: `z01-20.parquet` holds zones 1–20, `z21-35.parquet` zones
+21–35, `z36-46.parquet` zones 36–46, `z47-60.parquet` zones 47–60. From 2021 a
+year is eight, nested inside those four: `z01-15.parquet` (zones 1–15),
+`z16-20.parquet` (16–20), `z21-31.parquet` (21–31), `z32-35.parquet` (32–35),
+`z36-40.parquet` (36–40), `z41-46.parquet` (41–46), `z47-52.parquet` (47–52),
+`z53-60.parquet` (53–60). The split is what keeps an 8-million-scene year
+buildable, and it is also a spatial index for free: a tile id and a year name
+the part, so a query for `31UFU` in 2021 can open `year=2021/z21-31.parquet`
+alone and skip the other seven eighths of the year. The current year also carries
 `live.parquet`, rebuilt daily from the Earth Search API and folded into the
 archive parts once a month. No two parts of a year overlap, so a glob over
 `year=*/*.parquet` reads each scene exactly once and includes yesterday,
