@@ -113,21 +113,58 @@ def build_footprint_table(con, sources, dest: Path) -> None:
     files = _sources_sql(sources)
     con.execute(f"""
       COPY (
-        SELECT "s2:mgrs_tile" AS mgrs_tile,
-               ST_Envelope(ST_Extent_Agg(geometry)) AS geometry
-        FROM read_parquet([{files}], union_by_name=true)
-        -- Earth Search reports some dateline scenes with west > east
-        -- bboxes (e.g. [179.36, -41.61, -179.85, -40.61]), which makes
-        -- bbox[3] - bbox[1] negative -- it slips under a `< 20` filter
-        -- meant to catch WIDE antimeridian wraps, and the resulting
-        -- geometry (built from that same bbox upstream) really does span
-        -- -180..180, blowing the tile's envelope across the whole world.
-        -- Test the geometry's actual width instead of trusting the bbox
-        -- arithmetic, and belt-and-braces reject any west > east bbox
-        -- outright regardless of what the geometry looks like.
-        WHERE ST_XMax(geometry) - ST_XMin(geometry) < 20
-          AND bbox[3] >= bbox[1]
-        GROUP BY 1
+        WITH scenes AS (
+          SELECT "s2:mgrs_tile" AS mgrs_tile,
+                 -- Earth Search geometries can poke slightly past the
+                 -- dateline (xmin of -180.6 observed); clamp here so no
+                 -- output envelope ever leaks outside [-180, 180].
+                 GREATEST(ST_XMin(geometry), -180.0) AS x0,
+                 LEAST(ST_XMax(geometry), 180.0) AS x1,
+                 ST_YMin(geometry) AS y0,
+                 ST_YMax(geometry) AS y1
+          FROM read_parquet([{files}], union_by_name=true)
+          -- Earth Search reports some dateline scenes with west > east
+          -- bboxes (e.g. [179.36, -41.61, -179.85, -40.61]), which makes
+          -- bbox[3] - bbox[1] negative -- it slips under a `< 20` filter
+          -- meant to catch WIDE antimeridian wraps, and the resulting
+          -- geometry (built from that same bbox upstream) really does span
+          -- -180..180, blowing the tile's envelope across the whole world.
+          -- Test the geometry's actual width instead of trusting the bbox
+          -- arithmetic, and belt-and-braces reject any west > east bbox
+          -- outright regardless of what the geometry looks like.
+          WHERE ST_XMax(geometry) - ST_XMin(geometry) < 20
+            AND bbox[3] >= bbox[1]
+        ),
+        tiles AS (
+          SELECT mgrs_tile,
+                 MIN(x0) AS x0, MAX(x1) AS x1,
+                 MIN(y0) AS y0, MAX(y1) AS y1,
+                 -- The per-scene filter above leaves every scene narrow and
+                 -- valid, but the ~33 MGRS tiles in UTM zones 1 and 60 that
+                 -- sit on the dateline have scenes on BOTH sides of it
+                 -- (some at +179.x, some at -179.x), so a plain envelope
+                 -- of their union spans the whole world. Flag those tiles
+                 -- and compute their extent in a longitude frame shifted so
+                 -- the dateline is interior: lon' = lon + 360 for lon < 0,
+                 -- giving [sx0, sx1] within (0, 360) with sx1 > sx0.
+                 BOOL_OR(x1 > 170) AND BOOL_OR(x0 < -170) AS straddles,
+                 MIN(CASE WHEN x0 < 0 THEN x0 + 360 ELSE x0 END) AS sx0,
+                 MAX(CASE WHEN x0 < 0 THEN x1 + 360 ELSE x1 END) AS sx1
+          FROM scenes
+          GROUP BY 1
+        )
+        SELECT mgrs_tile,
+               CASE
+                 WHEN NOT straddles THEN ST_MakeEnvelope(x0, y0, x1, y1)
+                 -- everything west of the dateline: one box back in [-180, 0)
+                 WHEN sx0 >= 180 THEN ST_MakeEnvelope(sx0 - 360, y0, sx1 - 360, y1)
+                 -- everything east of it: one box in (0, 180]
+                 WHEN sx1 <= 180 THEN ST_MakeEnvelope(sx0, y0, sx1, y1)
+                 -- genuinely across it: split at +-180 into two pieces
+                 ELSE ST_Union(ST_MakeEnvelope(sx0, y0, 180, y1),
+                               ST_MakeEnvelope(-180, y0, sx1 - 360, y1))
+               END AS geometry
+        FROM tiles
       ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd)
     """)
 

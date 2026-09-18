@@ -177,6 +177,105 @@ def test_antimeridian_excluded_from_footprints_but_counted_in_stats():
         assert counts.get("31ABC") == 1
 
 
+def test_dateline_straddling_tile_gets_split_envelope():
+    """MGRS tiles in UTM zones 1 and 60 have scenes that are each narrow and
+    valid (they pass the per-scene width filter) but sit on BOTH sides of
+    the dateline -- e.g. tile 1CDK has scenes at lon +179.4 and at -179.9.
+    A plain envelope of their union spanned -179.9..+179.9, painting a
+    world-wide band across the tileset. Such a tile must instead get a
+    two-piece MULTIPOLYGON split at +-180, each piece narrow; a tile whose
+    scenes all sit just west of the dateline keeps a single narrow box; a
+    scene poking past -180 (Earth Search emits -180.6) is clamped; and
+    nothing in the output ever leaves [-180, 180]."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            -- straddler: one scene each side of the dateline
+            ('S1', '01CDK', [179.4, -80, 180, -79]::DOUBLE[],
+             ST_MakeEnvelope(179.4, -80, 180, -79)),
+            ('S2', '01CDK', [-180, -80, -179.6, -79]::DOUBLE[],
+             ST_MakeEnvelope(-180, -80, -179.6, -79)),
+            -- all-west tile: two narrow scenes at -179.x
+            ('W1', '01CDL', [-179.9, -78, -179.5, -77]::DOUBLE[],
+             ST_MakeEnvelope(-179.9, -78, -179.5, -77)),
+            ('W2', '01CDL', [-179.8, -78, -179.3, -77]::DOUBLE[],
+             ST_MakeEnvelope(-179.8, -78, -179.3, -77)),
+            -- clamp: a scene reported past -180 on the west side
+            ('C1', '01CDM', [-180.6, -76, -179.7, -75]::DOUBLE[],
+             ST_MakeEnvelope(-180.6, -76, -179.7, -75)),
+            ('C2', '01CDM', [179.5, -76, 180.3, -75]::DOUBLE[],
+             ST_MakeEnvelope(179.5, -76, 180.3, -75)),
+            -- ordinary narrow tile, far from the dateline
+            ('N1', '31ABC', [3.9, 51.9, 4.1, 52.1]::DOUBLE[],
+             ST_MakeEnvelope(3.9, 51.9, 4.1, 52.1)),
+            -- per-scene wrap (west > east bbox): still excluded outright
+            ('X1', '60GYV', [179.36, -41.61, -179.85, -40.61]::DOUBLE[],
+             ST_MakeEnvelope(-179.85, -41.61, 179.36, -40.61))
+          ) t(id, "s2:mgrs_tile", bbox, geometry)
+          ) TO '{src}' (FORMAT PARQUET)
+        """)
+        footprints = Path(td) / "mgrs-tiles.parquet"
+        build_footprint_table(con, [str(src)], footprints)
+
+        rows = {r[0]: r[1:] for r in con.execute(f"""
+          SELECT mgrs_tile, ST_GeometryType(geometry)::VARCHAR,
+                 ST_XMin(geometry), ST_XMax(geometry),
+                 ST_YMin(geometry), ST_YMax(geometry)
+          FROM read_parquet('{footprints}')
+        """).fetchall()}
+        assert set(rows) == {"01CDK", "01CDL", "01CDM", "31ABC"}, (
+            "the per-scene antimeridian wrap must still be excluded")
+
+        # Straddler: two pieces, overall extent touches both +-180, but
+        # neither piece is anywhere near a world-wide band.
+        kind, xmin, xmax, ymin, ymax = rows["01CDK"]
+        assert kind == "MULTIPOLYGON", kind
+        assert xmin == -180 and xmax == 180
+        assert (ymin, ymax) == (-80, -79)
+        pieces = con.execute(f"""
+          SELECT ST_XMin(UNNEST(ST_Dump(geometry)).geom),
+                 ST_XMax(UNNEST(ST_Dump(geometry)).geom)
+          FROM read_parquet('{footprints}')
+          WHERE mgrs_tile = '01CDK'
+          ORDER BY 1
+        """).fetchall()
+        assert len(pieces) == 2, pieces
+        for px0, px1 in pieces:
+            assert px1 - px0 < 1, f"piece {px0}..{px1} is not narrow"
+        assert pieces[0] == (-180, -179.6)
+        assert pieces[1] == (179.4, 180)
+
+        # All-west tile: one narrow box within [-180, -179].
+        kind, xmin, xmax, _, _ = rows["01CDL"]
+        assert kind == "POLYGON", kind
+        assert -180 <= xmin < xmax <= -179, (xmin, xmax)
+        assert xmax - xmin < 1
+
+        # Clamped straddler: pieces reach exactly +-180 and no further.
+        kind, xmin, xmax, _, _ = rows["01CDM"]
+        assert kind == "MULTIPOLYGON", kind
+        pieces = con.execute(f"""
+          SELECT ST_XMin(UNNEST(ST_Dump(geometry)).geom),
+                 ST_XMax(UNNEST(ST_Dump(geometry)).geom)
+          FROM read_parquet('{footprints}')
+          WHERE mgrs_tile = '01CDM'
+          ORDER BY 1
+        """).fetchall()
+        assert pieces == [(-180, -179.7), (179.5, 180)], pieces
+
+        # Ordinary tile: unchanged plain envelope.
+        assert rows["31ABC"] == ("POLYGON", 3.9, 4.1, 51.9, 52.1)
+
+        # Nothing in the output leaks past the dateline.
+        lo, hi = con.execute(f"""
+          SELECT MIN(ST_XMin(geometry)), MAX(ST_XMax(geometry))
+          FROM read_parquet('{footprints}')
+        """).fetchone()
+        assert lo >= -180 and hi <= 180, (lo, hi)
+
+
 def test_footprints_pmtiles_layer_is_mgrs():
     """End to end: build a tiny fixture through build_footprints() (real
     tippecanoe, via gpio pmtiles create -- no mocking) and confirm the
