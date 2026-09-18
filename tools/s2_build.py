@@ -2,21 +2,40 @@
 """Compact chunks (and/or the seed archive) into published year parts.
 
     sentinel-2-l2a/year=<YYYY>/items.parquet   (--name overrides, e.g. live.parquet)
-    sentinel-2-l2a/year=<YYYY>/z01-20.parquet  (--split zones: four parts by
-                          z21-35.parquet   UTM zone of s2:mgrs_tile, see
+    sentinel-2-l2a/year=<YYYY>/z01-20.parquet  (--split zones, 2019-2020: four
+                          z21-35.parquet   parts by UTM zone of s2:mgrs_tile,
                           z36-46.parquet   ZONE_PARTS; spec Amendment 3)
                           z47-60.parquet
+    sentinel-2-l2a/year=<YYYY>/z01-15.parquet  (--split zones, 2021 onward:
+                          z16-20.parquet   eight parts, ZONE_PARTS_8, nested
+                          z21-31.parquet   inside the quartile boundaries)
+                          z32-35.parquet
+                          z36-40.parquet
+                          z41-46.parquet
+                          z47-52.parquet
+                          z53-60.parquet
 
 Without --split the year is one file, which is how 2015-2018 are published
 and how `live.parquet` is always built. With `--split zones` the year is
 staged ONCE (dedupe + helper columns, exactly as without), then each zone
-range is copied out of that staged file into its own staged part and put
-through the same gpio sort/write/check/rename pipeline on its own -- so the
-sort, the spill and the output only ever hold a quarter of the year. That is
-what lets a 7M-row year build on a free runner: 2019 as one file spilled
-past the runner's 51.9 GB disk in gpio's sort. A range with no rows writes
-no file. A row whose tile has no parseable zone belongs to no part, and
-rather than drop it the build stops.
+range of zone_parts_for(year) is copied out of that staged file into its own
+staged part and put through the same gpio sort/write/check/rename pipeline
+on its own -- so the sort, the spill and the output only ever hold a
+fraction of the year. That is what lets a 7M-row year build on a free
+runner: 2019 as one file spilled past the runner's 51.9 GB disk in gpio's
+sort. Four parts were enough for 2019-2020; 2021 (8.65M rows, ~94 min per
+quartile at zstd 18) ran past the 6-hour job ceiling with three of four
+parts built, so from 2021 a year is eight parts of ~50 min each. A range
+with no rows writes no file. A row whose tile has no parseable zone belongs
+to no part, and rather than drop it the build stops.
+
+Two flags make a build resumable across job timeouts, so a part that is
+finished is never lost: `--skip-existing-url BASE` HEADs
+BASE/year=YYYY/<part>.parquet before each part and skips one that is already
+published (200); `--on-part-done CMD` runs CMD with the finished part's path
+after its gpio check, which is how the workflow uploads each part the moment
+it exists rather than after the whole year. A CMD that fails stops the
+build: an upload that did not happen is not a part that is published.
 
 Rows are deduped by id keeping the highest s2:generation_time, then sorted
 (_month, _hilbert): month-first keeps month pruning inside a year file,
@@ -70,19 +89,29 @@ timeout.
 from __future__ import annotations
 
 import argparse
+import http.client
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from s2_fetch import UA as _FETCH_UA, with_retries
 from s2_schema import COLUMNS
+
+# The same client name every other tool here sends (Source Cooperative's CDN
+# answers 403 to Python-urllib's default); s2_fetch's copy carries a POST
+# Content-Type that a HEAD has no use for.
+UA = {"User-Agent": _FETCH_UA["User-Agent"]}
 
 ROW_GROUP = 100_000
 # The one knob. zstd decompression cost is flat across levels, so a reader
@@ -128,6 +157,47 @@ ZONE_PARTS = (
 # before the split existed and stay that way; the workflows pass --split
 # zones for every year from this one on.
 ZONE_SPLIT_FROM = 2019
+# The eight-part tier: every quartile boundary above is also a boundary here,
+# so an octant is always inside exactly one quartile and a reader that knows
+# a tile's zone picks one file in either tier. Balanced on the same 2018
+# distribution (10-15% each). 2019 and 2020 are published as quartiles and
+# stay that way; from ZONE_SPLIT_8_FROM a year is these eight.
+ZONE_PARTS_8 = (
+    ("z01-15", 1, 15),
+    ("z16-20", 16, 20),
+    ("z21-31", 21, 31),
+    ("z32-35", 32, 35),
+    ("z36-40", 36, 40),
+    ("z41-46", 41, 46),
+    ("z47-52", 47, 52),
+    ("z53-60", 53, 60),
+)
+ZONE_SPLIT_8_FROM = 2021
+
+
+def zone_parts_for(year: int) -> tuple[tuple[str, int, int], ...]:
+    """The zone parts a year is published as: () for a single items.parquet
+    (before ZONE_SPLIT_FROM), ZONE_PARTS for 2019-2020, ZONE_PARTS_8 from
+    ZONE_SPLIT_8_FROM. Every caller that needs a year's part list -- the
+    build, the generators, the workflows -- asks here, so no caller can pick
+    a tier by hand."""
+    if year >= ZONE_SPLIT_8_FROM:
+        return ZONE_PARTS_8
+    if year >= ZONE_SPLIT_FROM:
+        return ZONE_PARTS
+    return ()
+
+
+def archive_part_names() -> tuple[str, ...]:
+    """Every file stem an archive part can have, across all tiers and in
+    advertised order: items, then the quartiles, then the octants. A year
+    holds exactly one tier of these (never live.parquet, which is the
+    current year's tail and not an archive part). The probing workflows
+    enumerate this list because a HEAD is cheap and a hand-typed list would
+    drift."""
+    return ("items",
+            *(label for label, _, _ in ZONE_PARTS),
+            *(label for label, _, _ in ZONE_PARTS_8))
 # The UTM zone of a scene, from the leading one or two digits of its MGRS
 # tile id ('1VCJ', '31UFU'). NULL when the id does not start with a digit.
 ZONE_SQL = """TRY_CAST(regexp_extract("s2:mgrs_tile", '^(\\d{1,2})', 1) AS INTEGER)"""
@@ -233,13 +303,75 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
         f"{time.monotonic() - t0:,.1f}s")
 
 
-def _stage_zone_parts(con, staged: Path, year: int) -> list[tuple[str, Path, int]]:
-    """Copy each ZONE_PARTS range out of the staged year into its own staged
-    file. Returns (label, path, rows) for the ranges that have rows, and
-    removes the whole-year staged file once they all exist so the disk never
-    holds the year twice on top of a sort spill. A row with no parseable zone
-    would land in no part; rather than publish a year that is quietly short,
-    the build stops on the first one."""
+def published_part(base: str, year: int, name: str, tries: int = 8) -> bool:
+    """Is BASE/year=YYYY/<name> already published? One HEAD, with the
+    s2_fetch retry/backoff on network errors and 5xx answers.
+
+    True on 200, False on 404. Anything else stops the build: a 403, a
+    persistent 5xx or an unreachable host is a question that went unanswered,
+    and guessing either way is wrong -- "not published" would rebuild and
+    re-upload an hour of work at best, and "published" would skip a part
+    that is not there and leave the year short on the bucket.
+    """
+    url = f"{base.rstrip('/')}/year={year}/{name}"
+
+    def head() -> int:
+        req = urllib.request.Request(url, method="HEAD", headers=UA)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            if e.code >= 500:
+                raise  # transient on the server's side: back off and re-ask
+            return e.code
+
+    try:
+        code = with_retries(head, tries)
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException,
+            ConnectionError) as e:
+        raise SystemExit(
+            f"year={year}/{name}: cannot ask {url} whether it is already "
+            f"published ({e}); refusing to guess")
+    if code == 200:
+        return True
+    if code == 404:
+        return False
+    raise SystemExit(
+        f"year={year}/{name}: HEAD {url} answered {code}, not 200 or 404; "
+        f"refusing to guess whether it is published")
+
+
+def run_part_hook(cmd: list[str], part: Path, year: int) -> None:
+    """Run the --on-part-done command with the finished part's path appended
+    (`shlex.split(CMD) + [path]`, stdio inherited so an upload's progress
+    lands in the job log). A non-zero exit stops the build: the workflow
+    uses this to upload each part as it is finished, and a part whose upload
+    failed must not be counted as done -- the next resume would HEAD it,
+    find it missing, and rebuild it, which is the right outcome, but only
+    if this run stops here instead of spending hours on parts whose uploads
+    will fail the same way."""
+    t0 = time.monotonic()
+    say(f"year={year}/{part.name}: running {shlex.join(cmd)} {part}")
+    r = subprocess.run(cmd + [str(part)])
+    if r.returncode != 0:
+        raise SystemExit(
+            f"year={year}/{part.name}: --on-part-done command exited "
+            f"{r.returncode}; stopping the build")
+    say(f"year={year}/{part.name}: on-part-done ok, "
+        f"{time.monotonic() - t0:,.1f}s")
+
+
+def _stage_zone_parts(con, staged: Path, year: int,
+                      parts: tuple[tuple[str, int, int], ...],
+                      skip: set[str]) -> list[tuple[str, Path | None, int]]:
+    """Copy each range of `parts` out of the staged year into its own staged
+    file. Returns (label, path, rows) for the ranges that have rows -- path
+    None for a label in `skip`, which is only counted (its rows still have
+    to add up) and never copied -- and removes the whole-year staged file
+    once they all exist so the disk never holds the year twice on top of a
+    sort spill. A row with no parseable zone would land in no part; rather
+    than publish a year that is quietly short, the build stops on the first
+    one."""
     lost = con.execute(
         f"SELECT count(*) FROM read_parquet('{staged}') "
         f"WHERE {ZONE_SQL} IS NULL OR {ZONE_SQL} NOT BETWEEN 1 AND 60"
@@ -249,9 +381,17 @@ def _stage_zone_parts(con, staged: Path, year: int) -> list[tuple[str, Path, int
             f"year={year}: {lost:,} row(s) with no UTM zone in "
             f"s2:mgrs_tile fall outside every zone part; refusing to "
             f"drop them")
-    parts = []
-    for label, lo, hi in ZONE_PARTS:
+    out = []
+    for label, lo, hi in parts:
         name = f"{label}.parquet"
+        if label in skip:
+            n = con.execute(
+                f"SELECT count(*) FROM read_parquet('{staged}') "
+                f"WHERE {ZONE_SQL} BETWEEN {lo} AND {hi}").fetchone()[0]
+            say(f"year={year}/{name}: already published, skipping "
+                f"({n:,} rows in zones {lo}-{hi} left to the published part)")
+            out.append((label, None, n))
+            continue
         part_staged = staged.with_name(name)
         t0 = time.monotonic()
         con.execute(f"""
@@ -269,19 +409,45 @@ def _stage_zone_parts(con, staged: Path, year: int) -> list[tuple[str, Path, int
         say(f"year={year}/{name}: staged {n:,} rows (zones {lo}-{hi}), "
             f"{part_staged.stat().st_size / 1e6:,.0f} MB, "
             f"{time.monotonic() - t0:,.1f}s")
-        parts.append((label, part_staged, n))
+        out.append((label, part_staged, n))
     staged.unlink()
-    return parts
+    return out
 
 
 def build_year(con, files: list[str], year: int, outdir: Path,
                name: str = "items.parquet", memory: str = "8GB",
-               split: str | None = None) -> int:
+               split: str | None = None, skip_existing_url: str | None = None,
+               on_part_done: list[str] | None = None,
+               probe=published_part) -> tuple[int, int]:
+    """Build one year. Returns (rows written, parts skipped as already
+    published). With --split zones the parts are zone_parts_for(year); a
+    year below ZONE_SPLIT_FROM has none and the split is refused rather
+    than silently written whole. `probe` is published_part, injectable for
+    tests."""
     lst = ",".join(f"'{f}'" for f in files)
     dest = outdir / f"year={year}"
     dest.mkdir(parents=True, exist_ok=True)
     final = dest / name
     label = "zones" if split == "zones" else name
+    parts = ()
+    if split == "zones":
+        parts = zone_parts_for(year)
+        if not parts:
+            raise SystemExit(
+                f"--split zones: {year} is before {ZONE_SPLIT_FROM} and has "
+                f"no zone parts; it is published as one items.parquet")
+    # Ask the bucket before staging anything: a year whose every part is
+    # already up costs one HEAD per part and no minutes, and a rerun after a
+    # timeout builds only what the last run did not finish uploading.
+    skip: set[str] = set()
+    if skip_existing_url:
+        wanted = [f"{lb}.parquet" for lb, _, _ in parts] if parts else [name]
+        skip = {n[:-len(".parquet")] for n in wanted
+                if probe(skip_existing_url, year, n)}
+        if len(skip) == len(wanted):
+            say(f"year={year}/{label}: every part already published "
+                f"({', '.join(wanted)}); nothing to build")
+            return 0, len(skip)
     with tempfile.TemporaryDirectory() as td:
         staged = Path(td) / "rows.parquet"
         t0 = time.monotonic()
@@ -307,29 +473,37 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         if n == 0:
             if not any(dest.iterdir()):
                 shutil.rmtree(dest, ignore_errors=True)
-            return 0
+            return 0, 0
         if split != "zones":
             _sort_and_check(con, staged, final, year, memory)
             print(f"  year={year}/{name}: {n:,} rows, "
                   f"{final.stat().st_size / 1e6:,.0f} MB", flush=True)
-            return n
-        # Four parts, one at a time: each staged range is sorted, written,
-        # checked and deleted before the next one's sort starts, so the
-        # peak is one range's spill plus the other ranges waiting on disk,
-        # never a whole year's sort.
-        written = 0
-        for part_label, part_staged, part_rows in _stage_zone_parts(con, staged, year):
+            if on_part_done:
+                run_part_hook(on_part_done, final, year)
+            return n, 0
+        # The parts one at a time: each staged range is sorted, written,
+        # checked, handed to --on-part-done and deleted before the next
+        # one's sort starts, so the peak is one range's spill plus the other
+        # ranges waiting on disk, never a whole year's sort.
+        written = skipped = 0
+        for part_label, part_staged, part_rows in _stage_zone_parts(
+                con, staged, year, parts, skip):
+            if part_staged is None:
+                skipped += part_rows
+                continue
             part_final = dest / f"{part_label}.parquet"
             _sort_and_check(con, part_staged, part_final, year, memory)
             part_staged.unlink()
             print(f"  year={year}/{part_final.name}: {part_rows:,} rows, "
                   f"{part_final.stat().st_size / 1e6:,.0f} MB", flush=True)
+            if on_part_done:
+                run_part_hook(on_part_done, part_final, year)
             written += part_rows
-        if written != n:
+        if written + skipped != n:
             raise SystemExit(
                 f"year={year}: staged {n:,} rows but the zone parts hold "
-                f"{written:,}")
-    return n
+                f"{written + skipped:,}")
+    return written, len(skip)
 
 
 def main() -> int:
@@ -341,12 +515,23 @@ def main() -> int:
     ap.add_argument("--name", default="items.parquet")
     ap.add_argument("--memory", default="8GB")
     ap.add_argument("--split", choices=["zones"],
-                    help="write the year as ZONE_PARTS files by UTM zone "
-                         "instead of one --name file (years >= "
-                         f"{ZONE_SPLIT_FROM})")
+                    help="write the year as zone parts by UTM zone instead "
+                         f"of one --name file: {len(ZONE_PARTS)} parts from "
+                         f"{ZONE_SPLIT_FROM}, {len(ZONE_PARTS_8)} from "
+                         f"{ZONE_SPLIT_8_FROM} (zone_parts_for)")
+    ap.add_argument("--skip-existing-url", metavar="BASE",
+                    help="HEAD BASE/year=YYYY/<part>.parquet before each "
+                         "part; 200 skips it, 404 builds it, anything else "
+                         "stops the build")
+    ap.add_argument("--on-part-done", metavar="CMD",
+                    help="after a part passes gpio check, run shlex.split(CMD) "
+                         "+ [part path]; a non-zero exit stops the build")
     a = ap.parse_args()
     if a.split and a.name != "items.parquet":
         ap.error("--split zones names its own parts; --name does not apply")
+    hook = shlex.split(a.on_part_done) if a.on_part_done else None
+    if a.on_part_done and not hook:
+        ap.error("--on-part-done needs a command")
 
     outdir = Path(a.out).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -364,11 +549,15 @@ def main() -> int:
             f"FROM read_parquet([{lst}], union_by_name=true) ORDER BY y"
         ).fetchall()]
 
-    total = 0
+    total = skipped = 0
     for y in years:
-        total += build_year(con, files, y, outdir, a.name, a.memory, a.split)
-    print(f"TOTAL {total:,} rows across {len(years)} year(s)")
-    if total == 0:
+        rows, skips = build_year(con, files, y, outdir, a.name, a.memory,
+                                 a.split, a.skip_existing_url, hook)
+        total += rows
+        skipped += skips
+    print(f"TOTAL {total:,} rows across {len(years)} year(s)"
+          + (f", {skipped} part(s) already published" if skipped else ""))
+    if total == 0 and not skipped:
         print("no rows matched: nothing was written", file=sys.stderr)
         return 1
     return 0

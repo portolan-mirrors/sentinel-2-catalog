@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 import duckdb
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -237,15 +238,22 @@ def test_gpio_check_still_gates_the_build():
 
 
 # ---------------------------------------------------------------------------
-# --split zones (spec Amendment 3): a year lands as four UTM-zone parts.
+# --split zones (spec Amendment 3): a year lands as UTM-zone parts.
 # ---------------------------------------------------------------------------
+# The fixture years are chosen by tier: 2020 is a quartile year (ZONE_PARTS),
+# 2021 the first octant year (ZONE_PARTS_8), and a year before ZONE_SPLIT_FROM
+# has no parts at all.
 sys.path.insert(0, str(ROOT / "tools"))
-from s2_build import ZONE_PARTS  # noqa: E402
+from s2_build import (  # noqa: E402
+    ZONE_PARTS, ZONE_PARTS_8, ZONE_SPLIT_8_FROM, ZONE_SPLIT_FROM,
+    archive_part_names, zone_parts_for,
+)
 
 ZONE_LABELS = [label for label, _, _ in ZONE_PARTS]
+OCTANT_LABELS = [label for label, _, _ in ZONE_PARTS_8]
 
 
-def _mk_zone_chunk(con, path, zones, per_zone=3, year=2024, prefix=""):
+def _mk_zone_chunk(con, path, zones, per_zone=3, year=2020, prefix=""):
     """`per_zone` scenes in each UTM zone of `zones`, spread over months and
     longitudes so a part's (_month, _hilbert) order is checkable. Tile ids
     take the upstream shape: no zero padding ('1VCJ', '31UFU')."""
@@ -269,11 +277,11 @@ def _mk_zone_chunk(con, path, zones, per_zone=3, year=2024, prefix=""):
     """)
 
 
-def _build_split(out, chunks, extra=()):
+def _build_split(out, chunks, extra=(), year=2020):
     env = dict(os.environ, S2_ZSTD_LEVEL=str(LEVEL_LOW))
     return subprocess.run(
         [sys.executable, "tools/s2_build.py", "--sources", str(chunks.parent),
-         "--years", "2024", "--out", str(out), *extra],
+         "--years", str(year), "--out", str(out), *extra],
         cwd=ROOT, env=env, capture_output=True, text=True)
 
 
@@ -296,7 +304,7 @@ def test_split_zones_writes_one_sorted_part_per_range():
         # deduped across the split, so the part total is the distinct count.
         _mk_zone_chunk(con, chunks / "b.parquet", [1])
         con.execute(f"""
-            COPY (SELECT * REPLACE ('2024-06-01T00:00:00Z' AS "s2:generation_time")
+            COPY (SELECT * REPLACE ('2020-06-01T00:00:00Z' AS "s2:generation_time")
                   FROM read_parquet('{chunks / "b.parquet"}'))
             TO '{chunks / "b.parquet"}' (FORMAT PARQUET)""")
         distinct = con.execute(
@@ -307,7 +315,7 @@ def test_split_zones_writes_one_sorted_part_per_range():
         out = Path(td) / "publish"
         proc = _build_split(out, chunks, ["--split", "zones"])
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        year_dir = out / "year=2024"
+        year_dir = out / "year=2020"
         assert sorted(p.name for p in year_dir.iterdir()) == \
             [f"{label}.parquet" for label in ZONE_LABELS]
 
@@ -325,9 +333,9 @@ def test_split_zones_writes_one_sorted_part_per_range():
                                  capture_output=True, text=True)
             assert chk.returncode == 0, chk.stdout + chk.stderr
             total += len(rows)
-            for line in (f"year=2024/{label}.parquet: staged",
-                         f"year=2024/{label}.parquet: sorted",
-                         f"year=2024/{label}.parquet: gpio check all passed"):
+            for line in (f"year=2020/{label}.parquet: staged",
+                         f"year=2020/{label}.parquet: sorted",
+                         f"year=2020/{label}.parquet: gpio check all passed"):
                 assert line in proc.stdout, line
         assert total == distinct
         # The dedupe kept the newer generation for zone 1.
@@ -335,7 +343,7 @@ def test_split_zones_writes_one_sorted_part_per_range():
             f"SELECT DISTINCT \"s2:generation_time\" FROM "
             f"read_parquet('{year_dir / 'z01-20.parquet'}') "
             f"WHERE \"s2:mgrs_tile\" = '1UFU'").fetchall()
-        assert gens == [("2024-06-01T00:00:00Z",)]
+        assert gens == [("2020-06-01T00:00:00Z",)]
 
 
 def test_split_zones_writes_nothing_for_an_empty_range():
@@ -348,9 +356,9 @@ def test_split_zones_writes_nothing_for_an_empty_range():
         out = Path(td) / "publish"
         proc = _build_split(out, chunks, ["--split", "zones"])
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert sorted(p.name for p in (out / "year=2024").iterdir()) == \
+        assert sorted(p.name for p in (out / "year=2020").iterdir()) == \
             ["z01-20.parquet", "z21-35.parquet", "z47-60.parquet"]
-        assert "year=2024/z36-46.parquet: no rows, skipped" in proc.stdout
+        assert "year=2020/z36-46.parquet: no rows, skipped" in proc.stdout
 
 
 def test_split_zones_refuses_a_tile_it_cannot_place():
@@ -373,7 +381,7 @@ def test_split_zones_refuses_a_tile_it_cannot_place():
         proc = _build_split(out, chunks, ["--split", "zones"])
         assert proc.returncode != 0
         assert "1 row(s) with no UTM zone" in proc.stderr
-        assert not list((out / "year=2024").glob("*.parquet"))
+        assert not list((out / "year=2020").glob("*.parquet"))
 
 
 def test_without_split_the_year_is_one_file_as_before():
@@ -388,11 +396,11 @@ def test_without_split_the_year_is_one_file_as_before():
         out = Path(td) / "publish"
         proc = _build_split(out, chunks)
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert [p.name for p in (out / "year=2024").iterdir()] == \
+        assert [p.name for p in (out / "year=2020").iterdir()] == \
             ["items.parquet"]
         keys = con.execute(
             f"SELECT _month, _hilbert FROM "
-            f"read_parquet('{out / 'year=2024' / 'items.parquet'}')").fetchall()
+            f"read_parquet('{out / 'year=2020' / 'items.parquet'}')").fetchall()
         assert len(keys) == len(zones) * 3
         assert keys == sorted(keys)
 
@@ -418,3 +426,283 @@ def test_docs_name_every_zone_part():
         for label, lo, hi in ZONE_PARTS:
             assert f"{label}.parquet" in text, (doc, label)
             assert f"{lo}–{hi}" in text or f"{lo}-{hi}" in text, (doc, label)
+
+
+# ---------------------------------------------------------------------------
+# The eight-part tier (Task 19), and the two flags that make a build resume.
+# ---------------------------------------------------------------------------
+
+def test_zone_parts_for_picks_the_tier_by_year():
+    assert zone_parts_for(ZONE_SPLIT_FROM - 1) == ()
+    assert zone_parts_for(2015) == ()
+    assert zone_parts_for(ZONE_SPLIT_FROM) == ZONE_PARTS
+    assert zone_parts_for(ZONE_SPLIT_8_FROM - 1) == ZONE_PARTS
+    assert zone_parts_for(ZONE_SPLIT_8_FROM) == ZONE_PARTS_8
+    assert zone_parts_for(2026) == ZONE_PARTS_8
+    assert ZONE_SPLIT_FROM == 2019 and ZONE_SPLIT_8_FROM == 2021
+    # The octants tile 1..60 exactly and nest inside the quartiles: every
+    # quartile boundary is an octant boundary, so a tile's octant is always
+    # inside its quartile and a reader picks one file in either tier.
+    for parts in (ZONE_PARTS, ZONE_PARTS_8):
+        edges = [(lo, hi) for _, lo, hi in parts]
+        assert edges[0][0] == 1 and edges[-1][1] == 60
+        assert all(a[1] + 1 == b[0] for a, b in zip(edges, edges[1:]))
+    octant_starts = {lo for _, lo, _ in ZONE_PARTS_8}
+    assert all(lo in octant_starts for _, lo, _ in ZONE_PARTS)
+    assert archive_part_names() == ("items", *ZONE_LABELS, *OCTANT_LABELS)
+    assert len(set(archive_part_names())) == 13
+
+
+def test_split_zones_writes_eight_parts_from_2021():
+    """The pilot-shaped fixture, one scene per zone 1..60 plus a duplicate
+    to dedupe, lands as exactly the ZONE_PARTS_8 files: sum == distinct
+    input, every part holds only its zones, every part sorted and passing
+    `gpio check all`, and no quartile file anywhere."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    zones = list(range(1, 61))
+    year = ZONE_SPLIT_8_FROM
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", zones, per_zone=2, year=year)
+        _mk_zone_chunk(con, chunks / "b.parquet", [7], per_zone=2, year=year)
+        distinct = con.execute(
+            f"SELECT count(DISTINCT id) FROM read_parquet('{chunks}/*.parquet')"
+        ).fetchone()[0]
+        assert distinct == len(zones) * 2
+
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks, ["--split", "zones"], year=year)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        year_dir = out / f"year={year}"
+        assert sorted(p.name for p in year_dir.iterdir()) == \
+            sorted(f"{label}.parquet" for label in OCTANT_LABELS)
+
+        total = 0
+        for label, lo, hi in ZONE_PARTS_8:
+            part = year_dir / f"{label}.parquet"
+            rows = con.execute(
+                f'SELECT "s2:mgrs_tile", _month, _hilbert '
+                f"FROM read_parquet('{part}')").fetchall()
+            assert rows, label
+            assert {_zone(r[0]) for r in rows} == set(range(lo, hi + 1)), label
+            keys = [(r[1], r[2]) for r in rows]
+            assert keys == sorted(keys), label
+            chk = subprocess.run(["gpio", "check", "all", str(part)],
+                                 capture_output=True, text=True)
+            assert chk.returncode == 0, chk.stdout + chk.stderr
+            total += len(rows)
+        assert total == distinct
+        assert f"TOTAL {distinct:,} rows" in proc.stdout
+
+
+def test_split_zones_refuses_a_year_with_no_parts():
+    """--split zones on a year before ZONE_SPLIT_FROM has no tier to write;
+    writing it whole under a flag that says "split" would be a surprise."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", [3], year=2017)
+        proc = _build_split(Path(td) / "publish", chunks,
+                            ["--split", "zones"], year=2017)
+        assert proc.returncode != 0
+        assert "no zone parts" in proc.stderr
+        assert not (Path(td) / "publish" / "year=2017").exists() or \
+            not list((Path(td) / "publish" / "year=2017").glob("*.parquet"))
+
+
+class _Bucket:
+    """A stand-in for the bucket's public base: HEAD answers per name from
+    `codes` (default 404), every request is logged."""
+
+    def __init__(self, codes: dict[str, int]):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        self.codes, self.seen = codes, []
+        bucket = self
+
+        class H(BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                name = self.path.rsplit("/", 1)[-1]
+                bucket.seen.append((self.headers.get("User-Agent"), self.path))
+                self.send_response(bucket.codes.get(name, 404))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = HTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.srv.server_port}/sentinel-2-l2a"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+
+
+def test_skip_existing_builds_only_the_unpublished_parts():
+    """Resume after a timeout: the parts the bucket already has (HEAD 200)
+    are skipped with a log line and never written; the 404 ones are built;
+    the part total still has to add up to the staged rows, skipped parts
+    included; --on-part-done runs once per BUILT part, with its path."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    year = ZONE_SPLIT_8_FROM
+    published = {"z01-15.parquet": 200, "z36-40.parquet": 200}
+    bucket = _Bucket(published)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            chunks = Path(td) / "chunks" / "api"
+            chunks.mkdir(parents=True)
+            _mk_zone_chunk(con, chunks / "a.parquet", list(range(1, 61)),
+                           per_zone=1, year=year)
+            out = Path(td) / "publish"
+            log = Path(td) / "hook.log"
+            hook = (f"{sys.executable} -c \"import sys; open(sys.argv[1], 'a')"
+                    f".write(sys.argv[2] + chr(10))\" {log}")
+            proc = _build_split(out, chunks, [
+                "--split", "zones", "--skip-existing-url", bucket.url,
+                "--on-part-done", hook], year=year)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            year_dir = out / f"year={year}"
+            built = sorted(p.name for p in year_dir.iterdir())
+            assert built == sorted(f"{lb}.parquet" for lb in OCTANT_LABELS
+                                   if f"{lb}.parquet" not in published)
+            for name in published:
+                assert f"year={year}/{name}: already published, skipping" \
+                    in proc.stdout
+            # 60 rows staged: 15 + 5 skipped, 40 written, and the sum checked.
+            assert "TOTAL 40 rows across 1 year(s), 2 part(s) already published" \
+                in proc.stdout
+            # One HEAD per part, with the catalog's client name, before any
+            # staging happened.
+            assert sorted(path for _, path in bucket.seen) == sorted(
+                f"/sentinel-2-l2a/year={year}/{lb}.parquet" for lb in OCTANT_LABELS)
+            assert all(ua.startswith("sentinel-2-catalog-tools/")
+                       for ua, _ in bucket.seen)
+            # The hook ran once per built part, in order, with the final
+            # (resolved: --out is) path.
+            assert log.read_text().splitlines() == \
+                [str(year_dir.resolve() / name) for name in
+                 (f"{lb}.parquet" for lb in OCTANT_LABELS)
+                 if name not in published]
+    finally:
+        bucket.close()
+
+
+def test_skip_existing_skips_a_fully_published_year_without_staging():
+    year = ZONE_SPLIT_8_FROM
+    bucket = _Bucket({f"{lb}.parquet": 200 for lb in OCTANT_LABELS})
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            chunks = Path(td) / "chunks" / "api"
+            chunks.mkdir(parents=True)
+            con = duckdb.connect()
+            con.execute("INSTALL spatial; LOAD spatial;")
+            _mk_zone_chunk(con, chunks / "a.parquet", [3], year=year)
+            out = Path(td) / "publish"
+            proc = _build_split(out, chunks, [
+                "--split", "zones", "--skip-existing-url", bucket.url], year=year)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert "every part already published" in proc.stdout
+            assert "staged" not in proc.stdout
+            assert not list((out / f"year={year}").glob("*.parquet"))
+            assert "8 part(s) already published" in proc.stdout
+    finally:
+        bucket.close()
+
+
+def test_skip_existing_applies_to_a_single_file_year_too():
+    bucket = _Bucket({"items.parquet": 200})
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            chunks = Path(td) / "chunks" / "api"
+            chunks.mkdir(parents=True)
+            con = duckdb.connect()
+            con.execute("INSTALL spatial; LOAD spatial;")
+            _mk_zone_chunk(con, chunks / "a.parquet", [3], year=2017)
+            proc = _build_split(Path(td) / "publish", chunks,
+                                ["--skip-existing-url", bucket.url], year=2017)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert "every part already published (items.parquet)" in proc.stdout
+            assert [p for _, p in bucket.seen] == \
+                ["/sentinel-2-l2a/year=2017/items.parquet"]
+    finally:
+        bucket.close()
+
+
+def test_skip_existing_stops_on_an_answer_that_is_not_200_or_404():
+    """A 5xx is retried (s2_fetch's backoff) and then fatal; a 403 is fatal
+    at once. Neither may be read as "not published" -- that would rebuild
+    and re-upload a finished part -- nor as "published", which would leave
+    the year short on the bucket."""
+    from s2_build import published_part
+    bucket = _Bucket({"z01-15.parquet": 500, "z16-20.parquet": 403})
+    try:
+        with pytest.raises(SystemExit) as caught:
+            published_part(bucket.url, 2021, "z01-15.parquet", tries=2)
+        assert "500" in str(caught.value) and "refusing" in str(caught.value)
+        assert len(bucket.seen) == 2  # tried, backed off, tried again
+        with pytest.raises(SystemExit) as caught:
+            published_part(bucket.url, 2021, "z16-20.parquet", tries=2)
+        assert "403" in str(caught.value)
+        assert len(bucket.seen) == 3  # a 403 is not retried
+        assert published_part(bucket.url, 2021, "z21-31.parquet") is False
+        # An unreachable host is not an answer either.
+        with pytest.raises(SystemExit) as caught:
+            published_part("http://127.0.0.1:9/x", 2021, "z21-31.parquet", tries=1)
+        assert "cannot ask" in str(caught.value)
+    finally:
+        bucket.close()
+
+
+def test_on_part_done_failure_halts_the_year():
+    """A hook that fails (the upload did not happen) must stop the build
+    after that part, not carry on to the next one: exit non-zero, the
+    failed part is on disk (it passed its check), no later part exists."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    year = ZONE_SPLIT_8_FROM
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", [3, 18, 25, 58], year=year)
+        out = Path(td) / "publish"
+        log = Path(td) / "hook.log"
+        # Succeeds for the first part, fails on the second.
+        hook = (f"{sys.executable} -c \"import sys; f=open(sys.argv[1], 'a'); "
+                f"f.write(sys.argv[2] + chr(10)); f.close(); "
+                f"sys.exit(0 if 'z01-15' in sys.argv[2] else 3)\" {log}")
+        proc = _build_split(out, chunks, [
+            "--split", "zones", "--on-part-done", hook], year=year)
+        assert proc.returncode != 0
+        assert "--on-part-done command exited 3" in proc.stderr
+        year_dir = out / f"year={year}"
+        assert sorted(p.name for p in year_dir.iterdir()) == \
+            ["z01-15.parquet", "z16-20.parquet"]
+        assert log.read_text().splitlines() == [
+            str(year_dir.resolve() / "z01-15.parquet"),
+            str(year_dir.resolve() / "z16-20.parquet")]
+        assert "z21-31.parquet: staged" not in proc.stdout or \
+            not (year_dir / "z21-31.parquet").exists()
+
+
+def test_on_part_done_runs_for_a_single_file_year():
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", [3], year=2017)
+        out = Path(td) / "publish"
+        log = Path(td) / "hook.log"
+        hook = (f"{sys.executable} -c \"import sys; open(sys.argv[1], 'a')"
+                f".write(sys.argv[2] + chr(10))\" {log}")
+        proc = _build_split(out, chunks, ["--on-part-done", hook], year=2017)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert log.read_text().splitlines() == \
+            [str(out.resolve() / "year=2017" / "items.parquet")]
