@@ -47,7 +47,11 @@ RAMP = [
 # A bbox that spans the antimeridian is published as [-180, …, 180, …], so its
 # average longitude is 0 and its centre would paint a false meridian down the
 # middle of the Atlantic. A Sentinel-2 scene is about one degree wide, so any
-# bbox this wide is one of those.
+# bbox this wide is one of those. Earth Search also reports some dateline
+# scenes the other way around, with west > east (e.g.
+# [179.36, -41.61, -179.85, -40.61]) -- bbox[3] - bbox[1] is then negative,
+# which slips under this same threshold, so west > east bboxes are rejected
+# outright rather than relying on the width arithmetic alone.
 MAX_SPAN_DEGREES = 10
 
 
@@ -61,7 +65,8 @@ def counts(con: duckdb.DuckDBPyConnection, sources: list[str]) -> dict[tuple[int
                                     / 180 * {HEIGHT}) AS INTEGER), 0), {HEIGHT - 1}) AS iy,
           count(*) AS n
         FROM read_parquet(?)
-        WHERE bbox IS NOT NULL AND bbox[3] - bbox[1] < {MAX_SPAN_DEGREES}
+        WHERE bbox IS NOT NULL AND bbox[3] >= bbox[1]
+          AND bbox[3] - bbox[1] < {MAX_SPAN_DEGREES}
         GROUP BY 1, 2
         """,
         [sources],

@@ -116,7 +116,17 @@ def build_footprint_table(con, sources, dest: Path) -> None:
         SELECT "s2:mgrs_tile" AS mgrs_tile,
                ST_Envelope(ST_Extent_Agg(geometry)) AS geometry
         FROM read_parquet([{files}], union_by_name=true)
-        WHERE bbox[3] - bbox[1] < 20
+        -- Earth Search reports some dateline scenes with west > east
+        -- bboxes (e.g. [179.36, -41.61, -179.85, -40.61]), which makes
+        -- bbox[3] - bbox[1] negative -- it slips under a `< 20` filter
+        -- meant to catch WIDE antimeridian wraps, and the resulting
+        -- geometry (built from that same bbox upstream) really does span
+        -- -180..180, blowing the tile's envelope across the whole world.
+        -- Test the geometry's actual width instead of trusting the bbox
+        -- arithmetic, and belt-and-braces reject any west > east bbox
+        -- outright regardless of what the geometry looks like.
+        WHERE ST_XMax(geometry) - ST_XMin(geometry) < 20
+          AND bbox[3] >= bbox[1]
         GROUP BY 1
       ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd)
     """)

@@ -129,7 +129,13 @@ def test_antimeridian_excluded_from_footprints_but_counted_in_stats():
     to the footprint table -- tested directly against DuckDB output, no
     tippecanoe or gpio involved -- but the exclusion is a geometry-rendering
     fix, not a data-quality filter: the same scene must still be counted in
-    mgrs-monthly.parquet's scene_count."""
+    mgrs-monthly.parquet's scene_count.
+
+    Also covers the real production shape: Earth Search reports some
+    dateline scenes with west > east in the bbox itself (e.g.
+    [179.36, -41.61, -179.85, -40.61] for tile 60GYV), which makes
+    bbox[3] - bbox[1] negative and used to slip under the `< 20` filter
+    while the geometry it produced really did span -180..180."""
     con = connect()
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "items.parquet"
@@ -140,20 +146,24 @@ def test_antimeridian_excluded_from_footprints_but_counted_in_stats():
              ST_GeomFromText('POLYGON((3.9 51.9,4.1 51.9,4.1 52.1,3.9 52.1,3.9 51.9))')),
             ('W1', '60ZZZ', TIMESTAMPTZ '2024-08-02 00:00:00+00', 20.0,
              [-179.5, 10, 179.5, 11]::DOUBLE[],
-             ST_GeomFromText('POLYGON((-179.5 10,179.5 10,179.5 11,-179.5 11,-179.5 10))'))
+             ST_GeomFromText('POLYGON((-179.5 10,179.5 10,179.5 11,-179.5 11,-179.5 10))')),
+            ('W2', '60GYV', TIMESTAMPTZ '2024-08-03 00:00:00+00', 5.0,
+             [179.36, -41.61, -179.85, -40.61]::DOUBLE[],
+             ST_MakeEnvelope(-179.85, -41.61, 179.36, -40.61))
           ) t(id, "s2:mgrs_tile", datetime, "eo:cloud_cover", bbox, geometry)
           ) TO '{src}' (FORMAT PARQUET)
         """)
 
-        # Footprints: the antimeridian-wrapping tile is absent.
+        # Footprints: both antimeridian-wrapping tiles are absent.
         footprints = Path(td) / "mgrs-tiles.parquet"
         build_footprint_table(con, [str(src)], footprints)
         tiles = {r[0] for r in con.execute(
             f"SELECT mgrs_tile FROM read_parquet('{footprints}')").fetchall()}
         assert tiles == {"31ABC"}, (
-            "the antimeridian-wrapping tile must be excluded from footprints")
+            "the antimeridian-wrapping tiles must be excluded from "
+            "footprints, including the west > east bbox shape")
 
-        # Stats: the same scene is still counted.
+        # Stats: the same scenes are still counted.
         out = Path(td) / "stats"
         _run([src], out)
         counts = dict(con.execute(
@@ -162,6 +172,8 @@ def test_antimeridian_excluded_from_footprints_but_counted_in_stats():
         assert counts.get("60ZZZ") == 1, (
             "the antimeridian scene must still be counted in scene_count "
             "even though it has no footprint polygon")
+        assert counts.get("60GYV") == 1, (
+            "the west > east antimeridian scene must still be counted too")
         assert counts.get("31ABC") == 1
 
 
