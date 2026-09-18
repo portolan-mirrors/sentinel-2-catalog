@@ -144,7 +144,20 @@ jobs:
           set -euo pipefail
           mapfile -t URLS <<< "${{ steps.enumerate.outputs.urls }}"
           python3 tools/s2_stats.py --sources "${URLS[@]}" \
-            --out ./staging/publish/stats --footprints
+            --out ./staging/publish/stats --footprints \
+            --keep-footprint-table
+
+      # mgrs-tiles.parquet (the ~33k-polygon tile-envelope table behind
+      # mgrs.pmtiles) is kept so the tileset can be rebuilt and A/B-tested
+      # locally without rescanning every published year part, but it must
+      # never reach the bucket: upload_data.py uploads every .parquet under
+      # --data-dir (./staging/publish), with no exception for intermediates.
+      # Move it out of that tree before the upload step runs.
+      - name: Move the footprint table out of the publish dir
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          mv ./staging/publish/stats/mgrs-tiles.parquet ./staging/
 
       - name: Assume the Source Cooperative write role
         if: steps.guard.outputs.published == 'true'
@@ -157,3 +170,15 @@ jobs:
       - name: Upload data
         if: steps.guard.outputs.published == 'true'
         run: python3 tools/upload_data.py --confirm --data-dir ./staging/publish
+
+      # Uploaded as a workflow artifact (not to the bucket) so the tileset
+      # can be independently rebuilt and compared locally -- tippecanoe vs
+      # tylertoo A/B -- without rescanning 20+ GB of published parts.
+      - name: Upload the MGRS tile-envelope table as a workflow artifact
+        if: steps.guard.outputs.published == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mgrs-tiles
+          path: ./staging/mgrs-tiles.parquet
+          retention-days: 14
+          if-no-files-found: error

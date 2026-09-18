@@ -142,7 +142,7 @@ def pmtiles_command(fp: Path, pmtiles: Path) -> list[str]:
             "--layer", "mgrs"]
 
 
-def build_footprints(con, sources, out: Path):
+def build_footprints(con, sources, out: Path, keep_footprint_table: bool = False):
     fp = (out / "mgrs-tiles.parquet").resolve()
     pmtiles = (out / "mgrs.pmtiles").resolve()
     build_footprint_table(con, sources, fp)
@@ -154,7 +154,15 @@ def build_footprints(con, sources, out: Path):
     # rerun does not fail on an existing file.
     pmtiles.unlink(missing_ok=True)
     subprocess.run(pmtiles_command(fp, pmtiles), check=True)
-    fp.unlink()
+    # mgrs-tiles.parquet was only ever a pmtiles-build intermediate, so the
+    # default stays "delete it" -- current behavior, and nothing new lands
+    # in the publish dir uninvited. --keep-footprint-table leaves it so the
+    # tileset can be rebuilt/A-B-tested locally without rescanning every
+    # published year part; the caller (the publish-stats workflow) is then
+    # responsible for moving it out of the publish dir before upload_data.py
+    # runs, since that script uploads every .parquet under --data-dir.
+    if not keep_footprint_table:
+        fp.unlink()
     print(f"  mgrs.pmtiles written ({pmtiles.stat().st_size / 1e6:,.1f} MB)")
 
 
@@ -165,6 +173,15 @@ def main() -> int:
     ap.add_argument("--footprints", action="store_true")
     ap.add_argument("--merge-years", help="comma list recomputed from sources")
     ap.add_argument("--existing", help="current stats parquet (path or URL)")
+    ap.add_argument(
+        "--keep-footprint-table", action="store_true",
+        help=(
+            "leave mgrs-tiles.parquet (the tile-envelope GeoParquet behind "
+            "mgrs.pmtiles) in --out instead of deleting it. Default is off "
+            "(current behavior: delete). Not published to the bucket -- the "
+            "caller must move it out of the publish dir before uploading."
+        ),
+    )
     a = ap.parse_args()
     con = connect()
     merge = [int(y) for y in a.merge_years.split(",")] if a.merge_years else None
@@ -172,7 +189,7 @@ def main() -> int:
         raise SystemExit("--merge-years requires --existing")
     build_stats(con, a.sources, Path(a.out), merge, a.existing)
     if a.footprints:
-        build_footprints(con, a.sources, Path(a.out))
+        build_footprints(con, a.sources, Path(a.out), a.keep_footprint_table)
     return 0
 
 

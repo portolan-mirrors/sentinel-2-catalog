@@ -203,6 +203,9 @@ def test_footprints_pmtiles_layer_is_mgrs():
         build_footprints(con, [str(src)], out)
         archive = out / "mgrs.pmtiles"
         assert archive.exists(), "build_footprints must write mgrs.pmtiles"
+        assert not (out / "mgrs-tiles.parquet").exists(), (
+            "the footprint table is an intermediate: default behavior "
+            "(keep_footprint_table=False) must delete it")
 
         try:
             from pmtiles.reader import MmapSource, Reader
@@ -217,3 +220,32 @@ def test_footprints_pmtiles_layer_is_mgrs():
         layers = metadata["vector_layers"]
         assert layers[0]["id"] == "mgrs"
         assert "mgrs_tile" in layers[0]["fields"]
+
+
+def test_keep_footprint_table_flag():
+    """--keep-footprint-table (build_footprints(..., keep_footprint_table=True))
+    leaves mgrs-tiles.parquet next to mgrs.pmtiles instead of deleting it, so
+    the tileset can be rebuilt and A/B-tested locally without rescanning the
+    full published archive. Default (False, current behavior) still deletes
+    it -- covered by test_footprints_pmtiles_layer_is_mgrs above."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            ('N1', '31ABC',
+             [3.9, 51.9, 4.1, 52.1]::DOUBLE[],
+             ST_GeomFromText('POLYGON((3.9 51.9,4.1 51.9,4.1 52.1,3.9 52.1,3.9 51.9))'))
+          ) t(id, "s2:mgrs_tile", bbox, geometry)
+          ) TO '{src}' (FORMAT PARQUET)
+        """)
+        out = Path(td) / "stats"
+        out.mkdir()
+        build_footprints(con, [str(src)], out, keep_footprint_table=True)
+        assert (out / "mgrs.pmtiles").exists()
+        fp = out / "mgrs-tiles.parquet"
+        assert fp.exists(), (
+            "--keep-footprint-table must leave mgrs-tiles.parquet in --out")
+        tiles = {r[0] for r in con.execute(
+            f"SELECT mgrs_tile FROM read_parquet('{fp}')").fetchall()}
+        assert tiles == {"31ABC"}
