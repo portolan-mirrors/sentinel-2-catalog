@@ -23,10 +23,12 @@ sys.path.insert(0, str(ROOT / "tools"))
 from make_items import (  # noqa: E402
     ABSENT, PRESENT, UNKNOWN, build_item, connect, discover, remote_probe,
 )
-from s2_build import ZONE_PARTS  # noqa: E402
+from s2_build import ZONE_PARTS, ZONE_PARTS_8  # noqa: E402
 
 ZONE_NAMES = [f"{label}.parquet" for label, _, _ in ZONE_PARTS]
 ZONE_KEYS = [f"data-{label}" for label, _, _ in ZONE_PARTS]
+OCTANT_NAMES = [f"{label}.parquet" for label, _, _ in ZONE_PARTS_8]
+OCTANT_KEYS = [f"data-{label}" for label, _, _ in ZONE_PARTS_8]
 
 
 def prober(state, size=None, **by_name):
@@ -91,14 +93,17 @@ def test_published_part_is_used_when_present():
 
 
 def test_every_published_part_is_a_candidate():
-    """A year may hold the legacy file, the four zone parts and the tail;
-    whatever answers PRESENT is read, in the advertised order."""
+    """A year may hold the legacy file, the four zone quartiles, the eight
+    zone octants and the tail -- fourteen candidates; whatever answers
+    PRESENT is read, in the advertised order."""
     with tempfile.TemporaryDirectory() as td:
         year_dir = staged_live(Path(td))
         parts = discover(year_dir, 2026, True, None, prober(PRESENT, 1))
     assert [p["name"] for p in parts] == \
-        ["items.parquet", *ZONE_NAMES, "live.parquet"]
-    assert [p["key"] for p in parts] == ["data", *ZONE_KEYS, "live"]
+        ["items.parquet", *ZONE_NAMES, *OCTANT_NAMES, "live.parquet"]
+    assert [p["key"] for p in parts] == \
+        ["data", *ZONE_KEYS, *OCTANT_KEYS, "live"]
+    assert len(parts) == 14
 
 
 def test_absent_part_is_skipped_when_nothing_recorded_it():
@@ -212,14 +217,16 @@ def test_committed_json_round_trips_through_the_fallback():
         "sentinel-2a", "sentinel-2b", "sentinel-2c"]
 
 
-def staged_zone_parts(directory: Path, year: int = 2026) -> Path:
-    """Four tiny zone parts and nothing else: the shape of a year from 2019."""
+def staged_zone_parts(directory: Path, year: int = 2026,
+                      tier=ZONE_PARTS) -> Path:
+    """Tiny zone parts of one tier and nothing else: the shape of a year
+    from 2019 (four quartiles) or from 2021 (eight octants)."""
     con = duckdb.connect()
     con.execute("SET TimeZone='UTC'")
     con.execute("INSTALL spatial; LOAD spatial;")
     year_dir = directory / f"year={year}"
     year_dir.mkdir(parents=True)
-    for i, (label, lo, hi) in enumerate(ZONE_PARTS):
+    for i, (label, lo, hi) in enumerate(tier):
         rows = ", ".join(
             f"('{label}_{z}', TIMESTAMPTZ '{year}-0{i + 1}-{z % 28 + 1:02d} "
             f"10:00:00+00', 'sentinel-2{'ab'[z % 2]}', '{z}UFU', "
@@ -257,6 +264,44 @@ def test_zone_split_year_gets_one_asset_per_part():
     assert item["properties"]["s2:platforms"] == ["sentinel-2a", "sentinel-2b"]
     # The bbox spans every part (zone 1 sits at -177, zone 60 at 177).
     assert item["bbox"][0] <= -177 and item["bbox"][2] >= 177
+
+
+def test_octant_year_gets_one_asset_per_part():
+    """An eight-part year (2021 onward): eight assets, no quartile asset,
+    no items asset, totals summed over the octants."""
+    with tempfile.TemporaryDirectory() as td:
+        year_dir = staged_zone_parts(Path(td), 2021, ZONE_PARTS_8)
+        parts = discover(year_dir, 2021, False, None)
+        assert [(p["key"], p["source"]) for p in parts] == \
+            [(key, "local") for key in OCTANT_KEYS]
+        item = build_item(connect(), 2021, parts, None)
+
+    assets = item["assets"]
+    assert list(assets) == OCTANT_KEYS
+    assert not set(assets) & {"data", *ZONE_KEYS}
+    for label, lo, hi in ZONE_PARTS_8:
+        asset = assets[f"data-{label}"]
+        assert asset["href"] == f"./{label}.parquet"
+        assert asset["title"] == f"2021 scenes, UTM zones {lo}\u2013{hi}"
+        assert asset["table:row_count"] == hi - lo + 1
+    assert item["properties"]["table:row_count"] == 60
+    assert item["properties"]["start_datetime"].startswith("2021-01-")
+    assert item["properties"]["end_datetime"].startswith("2021-08-")
+    assert item["bbox"][0] <= -177 and item["bbox"][2] >= 177
+
+
+def test_octant_year_is_discovered_remotely_among_fourteen_candidates():
+    """--remote-baseline on an octant year with only live staged: the
+    eight octants answer PRESENT, the other five candidates 404, and the
+    year is the eight remote parts plus the local tail."""
+    with tempfile.TemporaryDirectory() as td:
+        year_dir = staged_live(Path(td))
+        parts = discover(year_dir, 2026, True, None, prober(
+            ABSENT, **{name: (PRESENT, 100 + i)
+                       for i, name in enumerate(OCTANT_NAMES)}))
+    assert [(p["key"], p["source"]) for p in parts] == \
+        [*((key, "remote") for key in OCTANT_KEYS), ("live", "local")]
+    assert [p["size"] for p in parts][:8] == list(range(100, 108))
 
 
 def test_zone_part_round_trips_through_the_fallback():

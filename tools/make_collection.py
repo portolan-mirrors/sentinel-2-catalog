@@ -46,7 +46,9 @@ from make_items import (  # noqa: E402
     PUBLIC, UA, as_dt, connect, discover, load_httpfs, part_stats,
 )
 from publish import load_config  # noqa: E402
-from s2_build import ZONE_PARTS, ZONE_SPLIT_FROM  # noqa: E402
+from s2_build import (  # noqa: E402
+    ZONE_PARTS, ZONE_PARTS_8, ZONE_SPLIT_8_FROM, ZONE_SPLIT_FROM,
+)
 from s2_schema import COLUMNS  # noqa: E402
 
 S3 = "s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog"
@@ -81,24 +83,30 @@ TYPE_NAMES = {
 
 
 def zone_parts_text() -> str:
-    """The zone-part layout, in prose, from the one constant that defines it.
+    """The zone-part layout, in prose, from the constants that define it.
 
     The partition extension has one key here, `year`, because that is the
     only hive directory. The zone split is a second level of file naming
     inside a year, not a `zone=` directory, so it is described in words on
     the year key rather than declared as a key that would imply a path
-    segment nobody publishes.
+    segment nobody publishes. Two tiers: the quartiles of ZONE_PARTS for
+    2019-2020 and the octants of ZONE_PARTS_8 from 2021, whose boundaries
+    nest inside the quartiles'.
     """
-    ranges = ", ".join(f"{label}.parquet (zones {lo}\u2013{hi})"
-                       for label, lo, hi in ZONE_PARTS)
-    return (f"Years before {ZONE_SPLIT_FROM} are one items.parquet each; from "
-            f"{ZONE_SPLIT_FROM} each year is four files split by the UTM zone "
-            f"of s2:mgrs_tile (the leading one or two digits of the tile id): "
-            f"{ranges}. The current year adds live.parquet, the tail fetched "
-            f"daily since the last consolidation. There is no zone= "
-            f"directory: every part sits in year=YYYY/ and matches "
-            f"partition:glob, and a reader with a tile id opens only the part "
-            f"whose zone range holds it.")
+    quartiles = ", ".join(f"{label}.parquet (zones {lo}\u2013{hi})"
+                          for label, lo, hi in ZONE_PARTS)
+    octants = ", ".join(f"{label}.parquet (zones {lo}\u2013{hi})"
+                        for label, lo, hi in ZONE_PARTS_8)
+    return (f"Years before {ZONE_SPLIT_FROM} are one items.parquet each. "
+            f"From {ZONE_SPLIT_FROM} each year is split by the UTM zone of "
+            f"s2:mgrs_tile (the leading one or two digits of the tile id): "
+            f"{ZONE_SPLIT_FROM}\u2013{ZONE_SPLIT_8_FROM - 1} into "
+            f"{len(ZONE_PARTS)} files, {quartiles}; from {ZONE_SPLIT_8_FROM} "
+            f"into {len(ZONE_PARTS_8)} files, {octants}. The current year "
+            f"adds live.parquet, the tail fetched daily since the last "
+            f"consolidation. There is no zone= directory: every part sits "
+            f"in year=YYYY/ and matches partition:glob, and a reader with a "
+            f"tile id opens only the part whose zone range holds it.")
 
 
 def table_columns() -> list[dict]:

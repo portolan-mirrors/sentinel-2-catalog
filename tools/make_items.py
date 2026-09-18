@@ -35,13 +35,15 @@ things:
         the committed item recorded for that part rather than writing a
         smaller year. See discover() for the three cases.
 
-A year takes one of two shapes (spec Amendment 3), and both are discovered
-from the same candidate list: 2015-2018 are one `items.parquet`; from 2019
-the archive is four zone parts `z01-20.parquet` .. `z47-60.parquet`, split
-by the UTM zone of `s2:mgrs_tile` (s2_build.ZONE_PARTS). Either shape may
-add `live.parquet`. Every part present becomes its own asset, with its own
-row count, time range and size, so a client with a tile id can pick the one
-part its zone lives in and the year's totals are the sum of the parts.
+A year takes one of three shapes (spec Amendment 3), and all are discovered
+from the same candidate list: 2015-2018 are one `items.parquet`; 2019-2020
+are four zone quartiles `z01-20.parquet` .. `z47-60.parquet`
+(s2_build.ZONE_PARTS); from 2021 eight zone octants `z01-15.parquet` ..
+`z53-60.parquet` (ZONE_PARTS_8), split by the UTM zone of `s2:mgrs_tile`.
+Any shape may add `live.parquet`. Every part present becomes its own asset,
+with its own row count, time range and size, so a client with a tile id can
+pick the one part its zone lives in and the year's totals are the sum of
+the parts.
 
 Collection item links are not written here. make_collection.py globs the item
 files it finds and links every one, so the two tools cannot disagree about
@@ -61,7 +63,7 @@ from pathlib import Path
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from s2_build import ZONE_PARTS  # noqa: E402
+from s2_build import ZONE_PARTS, ZONE_PARTS_8  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -76,17 +78,21 @@ UA = {"User-Agent": "sentinel-2-catalog-tools/1.0 "
 # Every part name a year can hold, in the order they are advertised:
 # (asset key, file name, title template, roles). `items.parquet` is the
 # consolidated archive of a year published before the zone split; the four
-# `z*.parquet` files are the archive of a year from 2019, one per ZONE_PARTS
-# range; `live.parquet` is the rolling tail fetched daily and folded back in
-# monthly. A year holds one archive shape, never both, and the archive and
-# the tail do not overlap: a consolidation rewrites the archive parts and
-# resets live.parquet, so a year's row count is the sum of its parts.
+# quartile `z*.parquet` files are the archive of 2019-2020, one per
+# ZONE_PARTS range, and the eight octants the archive of a year from 2021,
+# one per ZONE_PARTS_8 range; `live.parquet` is the rolling tail fetched
+# daily and folded back in monthly. A year holds one archive shape, never
+# two, and the archive and the tail do not overlap: a consolidation
+# rewrites the archive parts and resets live.parquet, so a year's row count
+# is the sum of its parts. Fourteen candidates, of which a year has at most
+# nine; a probe is one HEAD, so the misses cost nothing worth a table of
+# which year has which.
 PARTS = (
     ("data", "items.parquet", "{year} scenes, GeoParquet 2.0",
      ["data"]),
     *((f"data-{label}", f"{label}.parquet",
        f"{{year}} scenes, UTM zones {lo}\u2013{hi}", ["data"])
-      for label, lo, hi in ZONE_PARTS),
+      for label, lo, hi in (*ZONE_PARTS, *ZONE_PARTS_8)),
     ("live", "live.parquet",
      "Rolling tail since the last consolidation, refreshed daily", ["data"]),
 )
