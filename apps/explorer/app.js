@@ -2,7 +2,8 @@
 //   stats/mgrs-monthly.parquet  – choropleth + timeline
 //   stats/mgrs.pmtiles          – MGRS tile footprints
 //   sentinel-2-l2a/year=*/…     – item queries (Task 12; one part per year
-//                                 by the tile's UTM zone from 2019, Task 18)
+//                                 by the tile's UTM zone from 2019, Task 18;
+//                                 eight parts from 2021, Task 19)
 // There is no API, no server and no database behind this page: DuckDB-WASM
 // issues HTTP range reads straight at the object store.
 import maplibregl from "https://esm.sh/maplibre-gl@4.7.1";
@@ -296,28 +297,47 @@ map.on("click", "mgrs-fill", (e) => {
   timelineFor(tile);
 });
 
-// The zone parts of a year from 2019: [file stem, first zone, last zone],
-// mirrored from tools/s2_build.py ZONE_PARTS (spec Amendment 3) because the
-// browser cannot import it. A year before 2019 is one items.parquet; from
-// 2019 it is these four files, split by the UTM zone of the tile id, so a
-// query for one tile needs exactly one of them.
+// The zone parts of a year: [file stem, first zone, last zone], mirrored
+// from tools/s2_build.py because the browser cannot import it (spec
+// Amendment 3; tests/test_build.py pins every name and both years to this
+// file). A year before ZONE_SPLIT_FROM is one items.parquet; from 2019 it
+// is the four ZONE_PARTS quartiles; from ZONE_SPLIT_8_FROM the eight
+// ZONE_PARTS_8 octants, whose boundaries nest inside the quartiles'. Every
+// tier is split by the UTM zone of the tile id, so a query for one tile
+// needs exactly one file of whichever tier the year has.
 const ZONE_PARTS = [["z01-20", 1, 20], ["z21-35", 21, 35],
   ["z36-46", 36, 46], ["z47-60", 47, 60]];
+const ZONE_SPLIT_FROM = 2019;
+const ZONE_PARTS_8 = [["z01-15", 1, 15], ["z16-20", 16, 20],
+  ["z21-31", 21, 31], ["z32-35", 32, 35], ["z36-40", 36, 40],
+  ["z41-46", 41, 46], ["z47-52", 47, 52], ["z53-60", 53, 60]];
+const ZONE_SPLIT_8_FROM = 2021;
 
-// The zone part holding a tile: its UTM zone is the leading one or two
-// digits of the id ("1VCJ" is zone 1, "31UFU" is zone 31).
-function zonePartFor(tile) {
-  const zone = Number(tile.match(/^\d{1,2}/)[0]);
-  const hit = ZONE_PARTS.find(([, lo, hi]) => zone >= lo && zone <= hi);
+// The tier a year is published in, as s2_build.zone_parts_for(year):
+// null before the split, then the quartiles, then the octants.
+function zonePartsFor(year) {
+  if (year >= ZONE_SPLIT_8_FROM) return ZONE_PARTS_8;
+  if (year >= ZONE_SPLIT_FROM) return ZONE_PARTS;
+  return null;
+}
+
+// The archive file holding a tile in a year: its UTM zone is the leading
+// one or two digits of the id ("1VCJ" is zone 1, "31UFU" is zone 31), and
+// the year picks the tier. items.parquet before the split.
+function archivePartFor(tile, year) {
+  const parts = zonePartsFor(year);
+  if (!parts) return "items";
+  const digits = tile.match(/^\d{1,2}/);
+  const zone = digits ? Number(digits[0]) : NaN;
+  const hit = parts.find(([, lo, hi]) => zone >= lo && zone <= hi);
   return hit ? hit[0] : null;
 }
 
 // Which parts actually exist. `read_parquet` over a list fails outright on a
 // missing file, and the parts are genuinely optional: live.parquet only exists
-// for the current year once the daily refresh has run, a year with no scenes
-// has no items.parquet at all, and a year holds either items.parquet or the
-// zone parts, never both. So each candidate is probed once with a HEAD (a
-// CORS-simple request, no preflight) and the answer is cached.
+// for the current year once the daily refresh has run, and a year that is not
+// published yet has no archive part at all. So each candidate is probed once
+// with a HEAD (a CORS-simple request, no preflight) and the answer is cached.
 const partProbes = new Map();
 const partExists = (url) => {
   if (!partProbes.has(url)) {
@@ -331,18 +351,18 @@ const partExists = (url) => {
 };
 
 // Every part that could hold `tile` in the years y0..y1, filtered to the ones
-// that exist. Per year that is the legacy items.parquet OR the one zone part
-// the tile's zone falls in -- the other three zone parts are never probed,
-// let alone read -- plus live.parquet for the current year. Probe-based
-// rather than keyed on the year, so the app needs no idea which years were
-// published in which shape.
+// that exist. Per year that is exactly one archive file -- items.parquet, or
+// the one zone part of the year's tier the tile's zone falls in; the other
+// parts of the year are never probed, let alone read -- plus live.parquet for
+// the current year. The tier comes from the year (the thresholds are
+// constants mirrored above); the probe only asks whether the year is
+// published yet.
 async function partUrls(y0, y1, tile) {
-  const zonePart = zonePartFor(tile);
   const candidates = [];
   for (let y = y0; y <= y1; y++) {
     const dir = `${BASE}/sentinel-2-l2a/year=${y}`;
-    candidates.push(`${dir}/items.parquet`);
-    if (zonePart) candidates.push(`${dir}/${zonePart}.parquet`);
+    const archive = archivePartFor(tile, y);
+    if (archive) candidates.push(`${dir}/${archive}.parquet`);
     if (y === CURRENT_YEAR) candidates.push(`${dir}/live.parquet`);
   }
   const present = await Promise.all(candidates.map(partExists));

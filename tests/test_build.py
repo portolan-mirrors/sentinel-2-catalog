@@ -428,6 +428,20 @@ def test_docs_name_every_zone_part():
             assert f"{lo}–{hi}" in text or f"{lo}-{hi}" in text, (doc, label)
 
 
+def test_app_mirrors_both_zone_tiers():
+    """The explorer cannot import s2_build, so it carries a copy of both
+    tuples and both thresholds. Pin every octant and quartile name, and the
+    two years, to the file so a retune here cannot leave the app reading
+    the wrong part."""
+    js = (ROOT / "apps/explorer/app.js").read_text()
+    for label, lo, hi in ZONE_PARTS:
+        assert f'["{label}", {lo}, {hi}]' in js, label
+    for label, lo, hi in ZONE_PARTS_8:
+        assert f'["{label}", {lo}, {hi}]' in js, label
+    assert f"const ZONE_SPLIT_FROM = {ZONE_SPLIT_FROM};" in js
+    assert f"const ZONE_SPLIT_8_FROM = {ZONE_SPLIT_8_FROM};" in js
+
+
 # ---------------------------------------------------------------------------
 # The eight-part tier (Task 19), and the two flags that make a build resume.
 # ---------------------------------------------------------------------------
