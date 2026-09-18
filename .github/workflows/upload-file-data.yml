@@ -1,0 +1,58 @@
+name: upload-file-data
+
+# Publish a locally built data product. The file reaches CI as a plain
+# https URL (in practice an asset on a scratch GitHub release, uploaded with
+# `gh release upload`, deleted afterwards); it lands in the catalog-relative
+# directory given and passes through upload_data.py's suffix gate exactly
+# like every other upload.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "https URL of the file to publish"
+        required: true
+      name:
+        description: "File name to publish it as, e.g. mgrs.pmtiles"
+        required: true
+      dest:
+        description: "Catalog-relative directory, e.g. stats"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: catalog-write
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet boto3
+      - name: Fetch the file
+        env:
+          URL: ${{ inputs.url }}
+          NAME: ${{ inputs.name }}
+          DEST: ${{ inputs.dest }}
+        run: |
+          set -euo pipefail
+          case "$NAME" in */*|..*) echo "::error::name must be a bare file name"; exit 1;; esac
+          mkdir -p "staging/publish/$DEST"
+          curl -fsSL --retry 3 -o "staging/publish/$DEST/$NAME" "$URL"
+          ls -la "staging/publish/$DEST"
+      - name: Assume the Source Cooperative write role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-file
+          aws-region: us-west-2
+      - name: Upload
+        run: python3 tools/upload_data.py --confirm --data-dir staging/publish
