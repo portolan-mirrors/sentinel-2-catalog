@@ -13,6 +13,8 @@ and the upload pool. It adds one thing, a second walk root.
     python3 tools/upload_data.py            # dry run: what would change
     python3 tools/upload_data.py --confirm  # upload; needs AWS credentials
     python3 tools/upload_data.py --confirm --force   # re-upload everything
+    python3 tools/upload_data.py --confirm --only sentinel-2-l2a/year=2021/z01-15.parquet
+                                            # one staged file, the moment it exists
 
 Set ``data_dir`` in ``catalog.publish.yaml`` to the staging directory that
 holds the data. The template ships no staging tree, so this script exits with
@@ -100,20 +102,40 @@ def is_data_publishable(rel: Path) -> bool:
 
 
 def collect_data_uploads(
-    config: dict[str, str], root: Path = ROOT
+    config: dict[str, str], root: Path = ROOT, only: str | None = None
 ) -> list[Upload]:
     """Every staged data file that would be uploaded, in sorted order.
 
     The walk is rooted at ``data_dir`` and nothing else. Keys go under the
     same ``write_prefix`` the catalog publishes to, so the data sits beside
     the metadata that describes it.
+
+    ``only`` narrows the walk to one file, named relative to ``data_dir`` or
+    absolutely; it still has to pass both gates, so ``--only`` cannot
+    publish a file the walk would not. A file outside ``data_dir``, or
+    one that is not there, exits with a message rather than uploading
+    nothing quietly -- the caller is a build that has just finished that
+    part and is about to count it as published.
     """
     _, prefix = split_s3_uri(config["write_prefix"])
     base = data_root(config, root)
+    if only is not None:
+        target = Path(only)
+        target = (target if target.is_absolute() else base / target).resolve()
+        try:
+            rel = target.relative_to(base)
+        except ValueError:
+            sys.exit(f"--only {only} is not under data_dir {base}")
+        if not target.is_file():
+            sys.exit(f"--only {only}: no such file under {base}")
+        if not is_data_publishable(rel):
+            sys.exit(f"--only {only}: not a publishable data file "
+                     f"(suffixes: {', '.join(sorted(PUBLISHABLE_SUFFIXES))})")
+        candidates = [target]
+    else:
+        candidates = [p for p in sorted(base.rglob("*")) if p.is_file()]
     uploads = []
-    for path in sorted(base.rglob("*")):
-        if not path.is_file():
-            continue
+    for path in candidates:
         rel = path.relative_to(base)
         if not is_data_publishable(rel):
             continue
@@ -143,6 +165,16 @@ def main() -> int:
             "tree beside it, so the two disagree without this."
         ),
     )
+    parser.add_argument(
+        "--only",
+        metavar="PATH",
+        help=(
+            "upload just this staged file (relative to data_dir, or "
+            "absolute and under it). s2_build.py --on-part-done hands each "
+            "finished year part here so it is published the moment it "
+            "exists, not after the whole year."
+        ),
+    )
     args = parser.parse_args()
 
     config = load_config()
@@ -159,7 +191,7 @@ def main() -> int:
         return 1
 
     bucket, prefix = split_s3_uri(config["write_prefix"])
-    uploads = collect_data_uploads(config)
+    uploads = collect_data_uploads(config, only=args.only)
     if not uploads:
         print(f"nothing under {base}/ to upload", file=sys.stderr)
         return 1

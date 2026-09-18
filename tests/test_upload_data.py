@@ -138,6 +138,44 @@ with tempfile.TemporaryDirectory() as tmp:
         "an absolute data_dir walks the same tree",
     )
 
+    # --- --only narrows the walk to one file, through both gates ---------
+    one = collect_data_uploads(config, root, only="roads/part-1.parquet")
+    check(
+        [u.key for u in one] == ["a/prefix/roads/part-1.parquet"],
+        f"--only relative to data_dir uploads that file alone: {one}",
+    )
+    one = collect_data_uploads(
+        config, root, only=str(root / "staging/roads/part-1.parquet"))
+    check(
+        [u.key for u in one] == ["a/prefix/roads/part-1.parquet"],
+        f"--only with an absolute path under data_dir: {one}",
+    )
+    check(
+        one[0].content_type == "application/vnd.apache.parquet",
+        "--only keeps the content type",
+    )
+    check(
+        "not under data_dir" in exit_message(
+            lambda: collect_data_uploads(
+                config, root, only=str(root / "elsewhere/stray.parquet"))),
+        "--only outside data_dir exits with a message",
+    )
+    check(
+        "no such file" in exit_message(
+            lambda: collect_data_uploads(config, root, only="roads/none.parquet")),
+        "--only on a missing file exits with a message",
+    )
+    check(
+        "not a publishable" in exit_message(
+            lambda: collect_data_uploads(config, root, only="scratch/notes.md")),
+        "--only cannot get past the suffix gate",
+    )
+    check(
+        "not a publishable" in exit_message(
+            lambda: collect_data_uploads(config, root, only=".work/tmp.parquet")),
+        "--only cannot get past the dotdir rule",
+    )
+
     # --- an absent or wrong data_dir exits with a message ---------------
     message = exit_message(lambda: data_root(dict(config, data_dir=""), root))
     check("data_dir" in message, f"an empty data_dir names the key: {message}")
@@ -196,6 +234,26 @@ with tempfile.TemporaryDirectory() as tmp:
     check(
         f"data_dir:    {root.resolve()}/" in out.getvalue(),
         f"the CLI --data-dir wins over the unset config: {out.getvalue()!r}",
+    )
+
+    # --only through main(): a second staged file is not in the run.
+    write(root / "part-1.parquet")
+    out = io.StringIO()
+    upload_data.load_config = lambda *a, **k: no_data_dir_config
+    sys.argv = ["upload_data.py", "--force", "--data-dir", str(root),
+                "--only", str(root / "part-1.parquet")]
+    try:
+        with redirect_stdout(out):
+            code = upload_data.main()
+    finally:
+        upload_data.load_config = real_load
+        sys.argv = argv
+    check(code == 0, f"--only dry run succeeds, got {code}")
+    check(
+        "1 file(s) staged, 1 to upload" in out.getvalue()
+        and "would upload  a/prefix/part-1.parquet" in out.getvalue()
+        and "part-0" not in out.getvalue(),
+        f"--only uploads that one file: {out.getvalue()!r}",
     )
 
 # --- the AWS session prefers ambient env credentials over the profile --
