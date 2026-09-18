@@ -4,15 +4,17 @@ name: consolidate-month
 # (the lookback has long since covered month-end by then). Rewrites the
 # year's archive and empties live.
 #
-# The archive of a year from 2019 (s2_build.ZONE_SPLIT_FROM) is four
-# UTM-zone parts, z01-20 .. z47-60 (spec Amendment 3); before that it is
-# one items.parquet. This job downloads whichever shape the year has, merges
-# live in, and writes the same shape back -- so for 2019+ the merge is
-# `--split zones` over every existing part plus live, and the four parts
-# are re-uploaded. On the first consolidation of a year a part may not be
-# published yet (404), and that is fine; any other failure to fetch a part
-# is fatal, because a part left out of the merge would be rewritten from
-# live's rows alone and overwrite months of scenes on upload.
+# The archive of a year from 2019 (s2_build.ZONE_SPLIT_FROM) is UTM-zone
+# parts -- four quartiles for 2019-2020, eight octants from 2021
+# (ZONE_SPLIT_8_FROM; spec Amendment 3) -- and before that one
+# items.parquet. s2_build.zone_parts_for(Y) says which, and this job asks
+# it rather than keeping its own table. It downloads whichever shape the
+# year has, merges live in, and writes the same shape back -- so for 2019+
+# the merge is `--split zones` over every existing part plus live, and the
+# parts are re-uploaded. On the first consolidation of a year a part may
+# not be published yet (404), and that is fine; any other failure to fetch
+# a part is fatal, because a part left out of the merge would be rewritten
+# from live's rows alone and overwrite months of scenes on upload.
 #
 # Bootstrap guard: same reasoning as refresh-daily.yml -- nothing is
 # published on a fresh repo until publish-backfill has run once, so the
@@ -68,12 +70,14 @@ jobs:
           mkdir -p staging
           Y="${{ inputs.year }}"; [ -z "$Y" ] && Y=$(date -u +%Y)
           BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
-          # The zone-part names and the first zone-split year come from
-          # tools/s2_build.py, so this job cannot drift from the builder.
-          read -r SPLIT_FROM ZONE_NAMES <<< "$(python3 -c '
+          # This year's zone-part names come from tools/s2_build.py
+          # (zone_parts_for picks the tier by year; empty means the year is
+          # one items.parquet), so this job cannot drift from the builder.
+          ZONE_NAMES=$(python3 -c '
           import sys; sys.path.insert(0, "tools")
-          from s2_build import ZONE_PARTS, ZONE_SPLIT_FROM
-          print(ZONE_SPLIT_FROM, " ".join(label for label, _, _ in ZONE_PARTS))')"
+          from s2_build import zone_parts_for
+          print(" ".join(label for label, _, _ in zone_parts_for(int(sys.argv[1]))))' "$Y")
+          echo "year=$Y archive parts: ${ZONE_NAMES:-items}"
           # fetch <name>: download year=$Y/<name>.parquet to staging/<name>-prev.parquet.
           # Returns 1 only on a 404 (never published); any other failure --
           # a non-200 HEAD, or a GET that fails or is cut short -- kills the
@@ -100,7 +104,7 @@ jobs:
           }
           SRC=""
           SPLIT=""
-          if [ "$Y" -ge "$SPLIT_FROM" ]; then
+          if [ -n "$ZONE_NAMES" ]; then
             SPLIT="--split zones"
             for P in $ZONE_NAMES; do
               if fetch "$P"; then SRC="$SRC staging/$P-prev.parquet"; fi

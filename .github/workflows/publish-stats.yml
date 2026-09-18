@@ -81,14 +81,15 @@ jobs:
 
       # Resolve the "every published year part" glob by hand: probe every
       # archive part name a year can hold -- items.parquet for a year
-      # published whole (2015-2018), the four z*.parquet UTM-zone parts for
-      # a year from 2019 (spec Amendment 3; the names come from
-      # tools/s2_build.py ZONE_PARTS so this list cannot drift from the
-      # builder) -- from 2015 (Sentinel-2's launch year) through the current
-      # year with a HEAD request, plus the current year's live.parquet if
-      # refresh-daily has published one yet. A 404 is a part that does not
-      # exist for that year, which is the normal case for five of the six
-      # names; any other answer is a part this run cannot see and would
+      # published whole (2015-2018), the four z*.parquet UTM-zone quartiles
+      # for 2019-2020, the eight octants from 2021 (spec Amendment 3; the
+      # names come from tools/s2_build.py archive_part_names() so this list
+      # cannot drift from the builder) -- from 2015 (Sentinel-2's launch
+      # year) through the current year with a HEAD request, plus the
+      # current year's live.parquet if refresh-daily has published one
+      # yet. A 404 is a part that does not exist for that year, which is
+      # the normal case for most of the thirteen names; any other answer
+      # is a part this run cannot see and would
       # silently leave out of the stats, so it fails the job. Loud failure
       # too if the guard passed (catalog.json exists) but this finds
       # nothing -- that combination means the catalog is published but
@@ -102,8 +103,8 @@ jobs:
           CURRENT_YEAR=$(date -u +%Y)
           ARCHIVE_NAMES=$(python3 -c '
           import sys; sys.path.insert(0, "tools")
-          from s2_build import ZONE_PARTS
-          print(" ".join(["items", *(label for label, _, _ in ZONE_PARTS)]))')
+          from s2_build import archive_part_names
+          print(" ".join(archive_part_names()))')
           # probe <year> <name>: 0 if year=<year>/<name>.parquet is published,
           # 1 if it answers 404; anything else stops the job.
           probe() {

@@ -79,9 +79,10 @@ jobs:
             --out ./staging/publish/sentinel-2-l2a --name live.parquet
       # The current year's sources are its published archive parts plus the
       # live.parquet just built. The archive is items.parquet for a year
-      # published whole (2015-2018) or the four z*.parquet UTM-zone parts
-      # from 2019 (spec Amendment 3); the names come from tools/s2_build.py
-      # ZONE_PARTS so this cannot drift from the builder. Every name is
+      # published whole (2015-2018), the four z*.parquet UTM-zone quartiles
+      # for 2019-2020, or the eight octants from 2021 (spec Amendment 3);
+      # the names come from tools/s2_build.py archive_part_names() so this
+      # cannot drift from the builder. Every name is
       # probed: 404 means that shape is not this year's, any other non-200
       # is a part this run cannot see and fails the job, and a current year
       # with no archive part at all is a broken catalog, not a smaller
@@ -94,8 +95,8 @@ jobs:
           BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog
           ARCHIVE_NAMES=$(python3 -c '
           import sys; sys.path.insert(0, "tools")
-          from s2_build import ZONE_PARTS
-          print(" ".join(["items", *(label for label, _, _ in ZONE_PARTS)]))')
+          from s2_build import archive_part_names
+          print(" ".join(archive_part_names()))')
           SRC=()
           for NAME in $ARCHIVE_NAMES; do
             URL="$BASE/sentinel-2-l2a/year=$Y/$NAME.parquet"

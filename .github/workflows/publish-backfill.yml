@@ -14,15 +14,34 @@ name: publish-backfill
 #               runner: it downloads only that year's slice artifacts (by
 #               id, since actions/download-artifact needs a run id or it
 #               only sees the CURRENT run's artifacts, and the slices were
-#               uploaded by backfill.yml's run, not this one), builds that
-#               year's parquet, assumes the Source Cooperative role, and
-#               uploads. Only one year's chunks and one year's built parquet
-#               are ever on a runner at once -- the whole point of doing
-#               this per year rather than bulk-downloading ~135 slices onto
-#               one 14 GB disk. max-parallel 1 also means each year gets its
-#               own OIDC session, so a session covering the entire multi-year
-#               run is never required (a real risk with one long-lived
-#               session: STS sessions expire well under the run's length).
+#               uploaded by backfill.yml's run, not this one), assumes the
+#               Source Cooperative role, and builds that year's parquet
+#               part by part, uploading each part the moment it passes its
+#               check (s2_build.py --on-part-done) and skipping any part
+#               the bucket already has (--skip-existing-url). So a job that
+#               hits the six-hour ceiling has published everything it
+#               finished, and re-dispatching the year builds only the rest:
+#               2021 (8.65M rows) once timed out with three quartile parts
+#               built and nothing uploaded, because the upload ran after
+#               the whole year. Only one year's chunks and one year's built
+#               parquet are ever on a runner at once -- the whole point of
+#               doing this per year rather than bulk-downloading ~135 slices
+#               onto one 14 GB disk. max-parallel 1 also means each year
+#               gets its own OIDC session, so a session covering the entire
+#               multi-year run is never required.
+#
+#               Sessions. The role's MaxSessionDuration is Source
+#               Cooperative's setting and not readable from here
+#               (iam:GetRole is denied to every identity this repo holds,
+#               checked 2026-09-18), so the assume step asks for six hours
+#               and, if the role refuses, falls back to the default hour
+#               (assume-long / assume-default below; the run log shows
+#               which one took). Neither is what the per-part uploads rely
+#               on: tools/upload_part.py mints a fresh one-hour session
+#               from the runner's OIDC token before every upload, and the
+#               final safety upload re-assumes the role right before it
+#               runs. A part can only ever be uploaded on credentials
+#               minutes old.
 #
 #   finalize    Regenerates catalog/ metadata from the PUBLISHED parts over
 #               HTTP (--remote-baseline in both generators), validates it,
@@ -174,27 +193,77 @@ jobs:
           done
           echo "chunk files for ${{ matrix.year }}: $(find staging/chunks/api -name '*.parquet' | wc -l)"
 
-      # s2_fetch.py names each chunk <start>_<end>.parquet, so the year
-      # prefix on the glob selects exactly this year's files -- s2_build.py
-      # never has to rescan a chunk dir holding every other year too.
-      #
-      # Years from 2019 (s2_build.ZONE_SPLIT_FROM) are built as four
-      # UTM-zone parts, z01-20 .. z47-60 (spec Amendment 3): a whole 2019
-      # (7.17M rows) spilled past the runner's disk in gpio's sort, and a
-      # quarter of a year is 2017-sized, which builds in about an hour.
-      # 2015-2018 are already published as one items.parquet each and stay
-      # on the single-file path.
-      - name: Build year=${{ matrix.year }}
-        id: build
+      - name: Check year ${{ matrix.year }} has chunks to build
+        id: chunks
         run: |
           set -euo pipefail
           Y="${{ matrix.year }}"
           NONEMPTY=$(find staging/chunks/api -maxdepth 1 -name "${Y}-*.parquet" -size +0c | wc -l)
           if [ "$NONEMPTY" -eq 0 ]; then
             echo "no non-empty chunks for $Y (Earth Search has ~none this early); nothing to build"
-            echo "built=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # Source Cooperative's bucket is reached by assuming a role it has
+      # approved, so there is no long-lived key to leak or rotate. Every
+      # matrix entry is its own runner and mints its own token here, so no
+      # year's upload ever depends on a session assumed for another year.
+      # Assumed BEFORE the build because the build uploads as it goes.
+      # Six hours first (the job's ceiling), one retry so a role that
+      # caps sessions lower says so in seconds rather than after the
+      # action's twelve backed-off attempts; then the default hour. See
+      # the Sessions note at the top.
+      - name: Assume the Source Cooperative write role (six-hour session)
+        id: assume-long
+        if: steps.chunks.outputs.present == 'true'
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.year }}
+          aws-region: us-west-2
+          role-duration-seconds: 21600
+          retry-max-attempts: 1
+      - name: Assume the Source Cooperative write role (default session)
+        id: assume-default
+        if: steps.chunks.outputs.present == 'true' && steps.assume-long.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.year }}
+          aws-region: us-west-2
+
+      # s2_fetch.py names each chunk <start>_<end>.parquet, so the year
+      # prefix on the glob selects exactly this year's files -- s2_build.py
+      # never has to rescan a chunk dir holding every other year too.
+      #
+      # Years from s2_build.ZONE_SPLIT_FROM (2019) are built as UTM-zone
+      # parts (spec Amendment 3): a whole 2019 (7.17M rows) spilled past the
+      # runner's disk in gpio's sort. s2_build picks the tier by year --
+      # four parts for 2019-2020 (published, untouched), eight from
+      # ZONE_SPLIT_8_FROM (2021), because a quartile of an 8.65M-row year
+      # is ~94 min at zstd 18 and four of them do not fit the ceiling with
+      # anything to spare. 2015-2018 are already published as one
+      # items.parquet each and stay on the single-file path.
+      #
+      # --skip-existing-url: a part the bucket already has (HEAD 200) is
+      # not rebuilt, so a year re-dispatched after a timeout does only the
+      # parts the last run did not finish uploading. --on-part-done: each
+      # part is uploaded by tools/upload_part.py as soon as it passes gpio
+      # check, on a session minted for that upload; a failed upload stops
+      # the year (non-zero exit), never continues silently.
+      - name: Build year=${{ matrix.year }}, uploading each part as it is done
+        id: build
+        if: steps.chunks.outputs.present == 'true'
+        env:
+          PUBLIC_BASE: https://data.source.coop/portolan-mirrors/sentinel-2-catalog
+          S2_UPLOAD_ROLE_ARN: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
+          S2_UPLOAD_SESSION_NAME: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.year }}-part
+        run: |
+          set -euo pipefail
+          Y="${{ matrix.year }}"
           SPLIT=""
           SPLIT_FROM=$(python3 -c 'import sys; sys.path.insert(0, "tools"); from s2_build import ZONE_SPLIT_FROM; print(ZONE_SPLIT_FROM)')
           if [ "$Y" -ge "$SPLIT_FROM" ]; then
@@ -202,22 +271,25 @@ jobs:
           fi
           # $SPLIT is unquoted on purpose: empty or two words.
           python3 tools/s2_build.py --sources staging/chunks/api/${Y}-*.parquet \
-            --years "$Y" --out staging/publish/sentinel-2-l2a --memory 12GB $SPLIT
+            --years "$Y" --out staging/publish/sentinel-2-l2a --memory 12GB $SPLIT \
+            --skip-existing-url "$PUBLIC_BASE/sentinel-2-l2a" \
+            --on-part-done "python3 tools/upload_part.py --data-dir staging/publish"
           echo "built=true" >> "$GITHUB_OUTPUT"
 
-      # Source Cooperative's bucket is reached by assuming a role it has
-      # approved, so there is no long-lived key to leak or rotate. Every
-      # matrix entry is its own runner and mints its own token here, so no
-      # year's upload ever depends on a session assumed for another year.
-      - name: Assume the Source Cooperative write role
+      # Safety net, expected to upload nothing: every part was uploaded by
+      # --on-part-done, and upload_data's change detection (size for a
+      # multipart ETag; the listing runs on the env credentials, which
+      # aws_session prefers over the config profile) sees each one already
+      # there. Re-assumed first, because the session above may be hours
+      # old by now.
+      - name: Assume the Source Cooperative write role for the safety upload
         if: steps.build.outputs.built == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.year }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.year }}-final
           aws-region: us-west-2
-
-      - name: Upload year ${{ matrix.year }}
+      - name: Upload anything year ${{ matrix.year }} still has staged
         if: steps.build.outputs.built == 'true'
         run: python3 tools/upload_data.py --confirm --data-dir staging/publish
 
