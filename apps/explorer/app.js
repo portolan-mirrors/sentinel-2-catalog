@@ -46,10 +46,10 @@ export const BASE = new URLSearchParams(location.search).get("base")
 //  - months/YYYY-MM.parquet: one month's rows with the paint columns, sorted
 //    by tile, ~100-150 KB. Fetched whole when that month is shown, then
 //    kept registered so a revisit is free.
-//  - mgrs-monthly.parquet: the full table, ~21 MB, sorted by tile in 10k-row
+//  - mgrs-monthly.parquet: the full table, ~21 MB, sorted by tile in 50k-row
 //    groups. Only ever range-read over httpfs with WHERE mgrs_tile = ..., the
-//    way the scene search reads the year parts: one tile's history is one
-//    or two row groups, not the file.
+//    way the scene search reads the year parts: one tile's history is a
+//    ~55 KB footer plus one row group's column chunks, not the file.
 const STATS = `${BASE}/stats/mgrs-monthly.parquet`;
 const TIMELINE = `${BASE}/stats/timeline.parquet`;
 const TIMELINE_FILE = "timeline.parquet";
@@ -504,9 +504,15 @@ async function paintMonth() {
 // All tiles: the timeline file, already in memory, one row per month. One
 // tile: the full table over httpfs, WHERE mgrs_tile = ... — DuckDB reads
 // the footer, keeps only the row groups whose mgrs_tile range covers the
-// tile (the table is sorted by tile), and range-reads those.
+// tile (the table is sorted by tile), and range-reads those. That is
+// several network round trips, so like paintMonth() only the latest call
+// may touch the bars or the status line: click tile A then B and A's
+// answer, landing last, must not replace B's.
+let timelineSeq = 0;
+
 export async function timelineFor(tile) {
   const bars = $("bars");
+  const seq = ++timelineSeq;
   let rows;
   try {
     if (tile) say(`Reading tile ${tile}'s history…`);
@@ -520,10 +526,12 @@ export async function timelineFor(tile) {
          FROM read_parquet('${TIMELINE_FILE}') ORDER BY 1, 2`);
     rows = res.toArray();
   } catch (err) {
+    if (seq !== timelineSeq) return;
     bars.replaceChildren(el("p", "hint", `Timeline unavailable — ${err.message}`));
     if (tile) say(`Could not read tile ${tile}'s history from ${STATS} — ${err.message}`, true);
     return;
   }
+  if (seq !== timelineSeq) return;
   if (tile) {
     const scenes = rows.reduce((t, r) => t + Number(r.n), 0);
     say(`Tile ${tile}: ${rows.length} months, ${scenes.toLocaleString()} scenes — `
