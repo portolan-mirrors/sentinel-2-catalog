@@ -46,6 +46,21 @@ re-compressed in one job is 8-12 hours, past every runner ceiling -- and
 each job only ever has its own part's rows to sort. A label that is not in
 the year's tier stops the build naming the valid ones.
 
+`--exclude-ids-from URL [URL ...]` drops, before the sort, every staged row
+whose `id` a listed published part already holds. This is how
+refresh-daily.yml keeps `live.parquet` disjoint from the same year's archive
+parts: the five-day lookback re-fetches days the last consolidation already
+folded into the octants, and without this every one of those scenes was
+published twice for up to five days after each consolidation (49,942 of
+live's 84,675 rows on 2026-09-19), which broke the "a glob reads each scene
+once" promise and inflated the current month's stats. Only the `id` column
+is read, and only the row groups whose `_month` is among the months the
+staged rows span, so the read is a few range requests per part, not the
+part. A URL that answers 404 is skipped with a log line (a year whose
+archive is not published yet has nothing to exclude); any other answer
+stops the build, because a silently skipped archive part recreates the
+overlap it exists to remove.
+
 Rows are deduped by id keeping the highest s2:generation_time, then sorted
 (_month, _hilbert): month-first keeps month pruning inside a year file,
 Hilbert-within-month keeps row-group bboxes tight for spatial pruning. The
@@ -276,6 +291,11 @@ def connect(mem: str, tmp: Path) -> duckdb.DuckDBPyConnection:
     verbatim; build_year() borrows it for gpio's --write-memory too."""
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
+    # _month is month(datetime) in the session zone. The published parts
+    # were built on UTC runners; pin it so a build anywhere else buckets the
+    # same rows into the same months, which --exclude-ids-from relies on
+    # when it matches staged months against the archive's _month.
+    con.execute("SET TimeZone='UTC';")
     con.execute(f"SET memory_limit='{mem}'; SET temp_directory='{tmp}';")
     con.execute("SET preserve_insertion_order=false;")
     return con
@@ -365,17 +385,18 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
         tmp.unlink(missing_ok=True)
 
 
-def published_part(base: str, year: int, name: str, tries: int = 8) -> bool:
-    """Is BASE/year=YYYY/<name> already published? One HEAD, with the
-    s2_fetch retry/backoff on network errors and 5xx answers.
+def published_url(url: str, tries: int = 8, what: str = "") -> bool:
+    """Is `url` published? One HEAD, with the s2_fetch retry/backoff on
+    network errors and 5xx answers.
 
     True on 200, False on 404. Anything else stops the build: a 403, a
     persistent 5xx or an unreachable host is a question that went unanswered,
     and guessing either way is wrong -- "not published" would rebuild and
     re-upload an hour of work at best, and "published" would skip a part
-    that is not there and leave the year short on the bucket.
+    that is not there and leave the year short on the bucket. `what` names
+    the part in the refusal (published_part passes year=YYYY/<name>).
     """
-    url = f"{base.rstrip('/')}/year={year}/{name}"
+    label = what or url
 
     def head() -> int:
         req = urllib.request.Request(url, method="HEAD", headers=UA)
@@ -392,15 +413,22 @@ def published_part(base: str, year: int, name: str, tries: int = 8) -> bool:
     except (urllib.error.URLError, TimeoutError, http.client.HTTPException,
             ConnectionError) as e:
         raise SystemExit(
-            f"year={year}/{name}: cannot ask {url} whether it is already "
+            f"{label}: cannot ask {url} whether it is already "
             f"published ({e}); refusing to guess")
     if code == 200:
         return True
     if code == 404:
         return False
     raise SystemExit(
-        f"year={year}/{name}: HEAD {url} answered {code}, not 200 or 404; "
+        f"{label}: HEAD {url} answered {code}, not 200 or 404; "
         f"refusing to guess whether it is published")
+
+
+def published_part(base: str, year: int, name: str, tries: int = 8) -> bool:
+    """Is BASE/year=YYYY/<name> already published? published_url() on the
+    part's URL, with the same 200/404/anything-else semantics."""
+    return published_url(f"{base.rstrip('/')}/year={year}/{name}", tries,
+                         what=f"year={year}/{name}")
 
 
 def published_rows(con, url: str) -> int:
@@ -541,21 +569,84 @@ def _stage_zone_parts(con, staged: Path, year: int,
     return out, dropped
 
 
+def exclude_published_ids(con, staged: Path, urls: list[str], year: int,
+                          label: str, probe_url=published_url) -> int:
+    """Drop from the staged year every row whose id one of `urls` (published
+    archive parts of the same year) already holds. Returns the number
+    dropped; the staged file is rewritten in place only when that is > 0.
+
+    Each URL is HEADed first through `probe_url` (published_url: 200 reads,
+    404 skips with a log line, anything else stops the build). The ids are
+    read with DuckDB httpfs, projecting only `id` and filtering on `_month`
+    to the months the staged rows span: the parts are sorted (_month, ...)
+    so the filter prunes on row-group statistics and the read is a few
+    range requests per part rather than the part. `_month` is the same
+    session-UTC month(datetime) on both sides (see connect()). The join is
+    an ANTI JOIN, not NOT IN, so a NULL id in either file cannot empty the
+    result."""
+    months = [r[0] for r in con.execute(
+        f"SELECT DISTINCT _month FROM read_parquet('{staged}') ORDER BY 1"
+    ).fetchall()]
+    present = []
+    for url in urls:
+        if probe_url(url):
+            present.append(url)
+        else:
+            say(f"year={year}/{label}: {url} is not published (404); "
+                f"nothing to exclude from it")
+    if not present:
+        return 0
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    lst = ",".join(f"'{u}'" for u in present)
+    month_list = ",".join(str(m) for m in months)
+    t0 = time.monotonic()
+    con.execute("DROP TABLE IF EXISTS excluded_ids")
+    con.execute(f"""
+        CREATE TEMP TABLE excluded_ids AS
+        SELECT DISTINCT id FROM read_parquet([{lst}])
+        WHERE _month IN ({month_list})
+    """)
+    held = con.execute("SELECT count(*) FROM excluded_ids").fetchone()[0]
+    say(f"year={year}/{label}: {held:,} id(s) read from {len(present)} "
+        f"published part(s) for month(s) {month_list}, "
+        f"{time.monotonic() - t0:,.1f}s")
+    dropped = con.execute(f"""
+        SELECT count(*) FROM read_parquet('{staged}') s
+        SEMI JOIN excluded_ids e USING (id)""").fetchone()[0]
+    if dropped:
+        kept = staged.with_name(".rows.kept.parquet")
+        con.execute(f"""
+            COPY (SELECT s.* FROM read_parquet('{staged}') s
+                  ANTI JOIN excluded_ids e USING (id))
+            TO '{kept}'
+              (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {ROW_GROUP})
+        """)
+        os.replace(kept, staged)
+    con.execute("DROP TABLE excluded_ids")
+    say(f"year={year}/{label}: {dropped:,} row(s) dropped whose id the "
+        f"published archive already holds")
+    return dropped
+
+
 def build_year(con, files: list[str], year: int, outdir: Path,
                name: str = "items.parquet", memory: str = "8GB",
                split: str | None = None, skip_existing_url: str | None = None,
                on_part_done: list[str] | None = None,
                probe=published_part, remote_rows=published_rows,
-               only_parts: tuple[str, ...] | None = None) -> tuple[int, int]:
+               only_parts: tuple[str, ...] | None = None,
+               exclude_ids_from: list[str] | None = None,
+               probe_url=published_url) -> tuple[int, int]:
     """Build one year. Returns (rows written, parts skipped as already
     published). With --split zones the parts are zone_parts_for(year); a
     year below ZONE_SPLIT_FROM has none and the split is refused rather
     than silently written whole. `only_parts` narrows those to the named
     labels (only_zone_parts) and the other ranges' rows are dropped.
-    `probe` (published_part) and `remote_rows` (published_rows) are
-    injectable for tests. A year whose every part is published is skipped
-    before staging, on the HEADs alone: the point of the flag is that
-    re-dispatching a finished year costs nothing."""
+    `exclude_ids_from` (--exclude-ids-from) drops staged rows whose id a
+    listed published part holds, see exclude_published_ids(). `probe`
+    (published_part), `remote_rows` (published_rows) and `probe_url`
+    (published_url) are injectable for tests. A year whose every part is
+    published is skipped before staging, on the HEADs alone: the point of
+    the flag is that re-dispatching a finished year costs nothing."""
     lst = ",".join(f"'{f}'" for f in files)
     label = "zones" if split == "zones" else name
     # Every refusal comes before the year directory exists, so a refused
@@ -609,6 +700,9 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         say(f"year={year}/{label}: staged {n:,} rows, "
             f"{staged.stat().st_size / 1e6:,.0f} MB, "
             f"{time.monotonic() - t0:,.1f}s")
+        if n and exclude_ids_from:
+            n -= exclude_published_ids(con, staged, exclude_ids_from, year,
+                                       label, probe_url)
         if n == 0:
             if not any(dest.iterdir()):
                 shutil.rmtree(dest, ignore_errors=True)
@@ -675,6 +769,11 @@ def main() -> int:
     ap.add_argument("--on-part-done", metavar="CMD",
                     help="after a part passes gpio check, run shlex.split(CMD) "
                          "+ [part path]; a non-zero exit stops the build")
+    ap.add_argument("--exclude-ids-from", metavar="URL", nargs="+",
+                    help="published parts of the same year (URLs); staged "
+                         "rows whose id one of them holds are dropped before "
+                         "the sort. 404 skips a URL, anything else stops "
+                         "the build")
     a = ap.parse_args()
     global _row_group_size
     _row_group_size = a.row_group_size
@@ -712,7 +811,8 @@ def main() -> int:
     for y in years:
         rows, skips = build_year(con, files, y, outdir, a.name, a.memory,
                                  a.split, a.skip_existing_url, hook,
-                                 only_parts=only_parts)
+                                 only_parts=only_parts,
+                                 exclude_ids_from=a.exclude_ids_from)
         total += rows
         skipped += skips
     print(f"TOTAL {total:,} rows across {len(years)} year(s)"

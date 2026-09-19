@@ -55,8 +55,10 @@ quarter of a 2021-sized year no longer built inside one CI job), so the part
 that holds a tile is known from the tile id and the year alone: `31UFU` is
 zone 31, in `z21-35.parquet` for 2019–2020 and `z21-31.parquet` from 2021.
 The current year also has `live.parquet`, the tail fetched daily since the
-last consolidation. No two parts of a year overlap, so a glob over the year
-reads each scene once, whichever shape the year has:
+last consolidation. Its daily rebuild drops every id the year's archive parts
+already hold, so no two parts of a year overlap. A glob over the year reads
+each scene once, whichever shape the year has, and a client can always
+dedupe on `id` anyway; it is safe and removes nothing:
 
 ```sql
 read_parquet('.../sentinel-2-l2a/year=*/*.parquet', hive_partitioning=true)
@@ -233,10 +235,11 @@ Do not build an asset URL from a template. Read the href.
 A scene can be fetched more than once: the daily refresh re-reads a five-day
 window, and a reprocessed product keeps its id. Rows are deduped by `id`,
 keeping the highest `s2:generation_time` (`NULLS LAST`), when each year is
-built. So `id` is unique within a part, and the parts of a year do not overlap
-(a scene has one tile, and a tile one zone), so `id` is unique within a year.
-Across the whole table, treat `id` as unique and report it if you ever find
-otherwise.
+built. So `id` is unique within a part. The parts of a year do not overlap:
+a scene has one tile, and a tile one zone, and the daily `live.parquet`
+rebuild drops every id the year's archive parts hold. So `id` is unique
+within a year. Across the whole table, treat `id` as unique and report it if
+you ever find otherwise.
 
 ## What this collection does not do
 

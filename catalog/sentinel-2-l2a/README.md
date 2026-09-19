@@ -75,9 +75,11 @@ buildable, and it is also a spatial index for free: a tile id and a year name
 the part, so a query for `31UFU` in 2021 can open `year=2021/z21-31.parquet`
 alone and skip the other seven eighths of the year. The current year also carries
 `live.parquet`, rebuilt daily from the Earth Search API and folded into the
-archive parts once a month. No two parts of a year overlap, so a glob over
-`year=*/*.parquet` reads each scene exactly once and includes yesterday,
-whichever shape the year has.
+archive parts once a month. The daily rebuild drops every id the year's
+archive parts already hold, so no two parts of a year overlap. A glob over
+`year=*/*.parquet` therefore reads each scene exactly once and includes
+yesterday, whichever shape the year has. A client can always dedupe on `id`
+anyway; it is safe and it removes nothing.
 
 Each `year=YYYY/YYYY.json` item states that year's measured row count, time
 range, footprint bounds and platforms, so a client can choose a year without

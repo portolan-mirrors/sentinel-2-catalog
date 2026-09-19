@@ -992,3 +992,122 @@ def test_tile_sort_from_2026_pins_a_tile_month_to_few_row_groups():
                 FROM read_parquet('{f}')
               ) GROUP BY 1, 2)""").fetchone()[0]
         assert spans <= 2, f"a tile-month spans {spans} row groups; expected contiguous"
+
+
+# ---------------------------------------------------------------------------
+# --exclude-ids-from: live.parquet stays disjoint from the year's archive.
+# ---------------------------------------------------------------------------
+
+def _archive_fixture(con, td: Path):
+    """A published archive part for 2024 holding A and D in March and B in
+    May, built by the tool itself so it carries the real `_month` column,
+    served from <td>/bucket. Returns (chunks dir for the live build, bucket
+    dir). The live chunks hold A, B and C, all in March: A is in the
+    archive's March (dropped); B is only in the archive's May, which the
+    exclusion must not consult for a March-only live (kept); C is new
+    (kept)."""
+    archive = td / "archive" / "api"
+    archive.mkdir(parents=True)
+    _mk_chunk(con, archive / "a.parquet", [
+        ("A", "2024-03-05 10:00:00+00", "2024-03-05T12:00:00Z", 4.0, 52.0),
+        ("D", "2024-03-20 10:00:00+00", "2024-03-20T12:00:00Z", 5.0, 52.0),
+        ("B", "2024-05-05 10:00:00+00", "2024-05-05T12:00:00Z", 6.0, 52.0),
+    ])
+    proc = _build(td / "bucket", archive, LEVEL_LOW)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    chunks = td / "chunks" / "api"
+    chunks.mkdir(parents=True)
+    _mk_chunk(con, chunks / "a.parquet", [
+        ("A", "2024-03-05 10:00:00+00", "2024-03-05T12:00:00Z", 4.0, 52.0),
+        ("B", "2024-03-15 10:00:00+00", "2024-03-15T12:00:00Z", 6.0, 52.0),
+        ("C", "2024-03-25 10:00:00+00", "2024-03-25T12:00:00Z", 7.0, 52.0),
+    ])
+    return chunks, td / "bucket"
+
+
+def _build_live(out, chunks, urls):
+    env = dict(os.environ, S2_ZSTD_LEVEL=str(LEVEL_LOW))
+    return subprocess.run(
+        [sys.executable, "tools/s2_build.py", "--sources", str(chunks.parent),
+         "--years", "2024", "--out", str(out), "--name", "live.parquet",
+         "--exclude-ids-from", *urls],
+        cwd=ROOT, env=env, capture_output=True, text=True)
+
+
+def test_exclude_ids_drops_archived_rows_and_consults_only_staged_months():
+    """Rows whose id the published archive holds are dropped, rows it does
+    not hold are kept, only the staged rows' months are read from the
+    archive (B sits in the archive's May and survives a March-only live),
+    a 404 URL is skipped with a log line, and the dropped count is logged.
+    The ids are read over HTTP with DuckDB, as in production."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks, bucket_dir = _archive_fixture(con, Path(td))
+        bucket = _Bucket(root=bucket_dir)
+        try:
+            out = Path(td) / "publish"
+            archive_url = f"{bucket.url}/year=2024/items.parquet"
+            missing_url = f"{bucket.url}/year=2024/z01-15.parquet"
+            proc = _build_live(out, chunks, [archive_url, missing_url])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            live = out / "year=2024" / "live.parquet"
+            ids = [r[0] for r in con.execute(
+                f"SELECT id FROM read_parquet('{live}') ORDER BY id").fetchall()]
+            assert ids == ["B", "C"]
+            assert (f"year=2024/live.parquet: {missing_url} is not published "
+                    f"(404); nothing to exclude from it") in proc.stdout
+            # Only March was consulted: A and D, not May's B.
+            assert ("2 id(s) read from 1 published part(s) for month(s) 3"
+                    in proc.stdout), proc.stdout
+            assert ("year=2024/live.parquet: 1 row(s) dropped whose id the "
+                    "published archive already holds") in proc.stdout
+            assert "TOTAL 2 rows" in proc.stdout
+            # One probe HEAD per URL with the catalog's client name; DuckDB's
+            # own requests carry its agent.
+            probes = [path for ua, path in bucket.seen
+                      if ua.startswith("sentinel-2-catalog-tools/")]
+            assert sorted(probes) == ["/sentinel-2-l2a/year=2024/items.parquet",
+                                      "/sentinel-2-l2a/year=2024/z01-15.parquet"]
+        finally:
+            bucket.close()
+
+
+def test_exclude_ids_keeps_everything_when_no_url_is_published():
+    """Every URL 404s (a year whose archive is not up yet): nothing is read,
+    nothing is dropped, and the build is the plain one."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks, _ = _archive_fixture(con, Path(td))
+        bucket = _Bucket()
+        try:
+            out = Path(td) / "publish"
+            proc = _build_live(out, chunks, [f"{bucket.url}/year=2024/items.parquet"])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            ids = [r[0] for r in con.execute(
+                f"SELECT id FROM read_parquet('{out / 'year=2024' / 'live.parquet'}') "
+                f"ORDER BY id").fetchall()]
+            assert ids == ["A", "B", "C"]
+            assert "is not published (404)" in proc.stdout
+            assert "id(s) read" not in proc.stdout
+        finally:
+            bucket.close()
+
+
+def test_exclude_ids_stops_on_an_answer_that_is_not_200_or_404():
+    """A 403 on an exclusion URL is fatal: an archive part skipped silently
+    would republish its scenes in live, the overlap this flag removes."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks, bucket_dir = _archive_fixture(con, Path(td))
+        bucket = _Bucket({"items.parquet": 403}, root=bucket_dir)
+        try:
+            out = Path(td) / "publish"
+            proc = _build_live(out, chunks, [f"{bucket.url}/year=2024/items.parquet"])
+            assert proc.returncode != 0
+            assert "403" in proc.stderr and "refusing" in proc.stderr
+            assert not (out / "year=2024" / "live.parquet").exists()
+        finally:
+            bucket.close()

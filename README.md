@@ -105,10 +105,11 @@ DuckDB's HTTP timeout on another. The snippets on this page are range-pruned
 reads (tile, month and year predicates) by design; raise `http_timeout` and
 `http_retries` before you scan wider.
 
-`live.parquet` can repeat scenes the current year's archive parts already
-hold, because the daily fetch re-reads a five-day window. On 2026-09-19 that
-was 49,942 of its 84,675 rows. The monthly consolidation removes them; until
-it runs, a glob over the current year should dedupe on `id`.
+`live.parquet` and the current year's archive parts are disjoint. The daily
+rebuild re-reads a five-day window from Earth Search and drops every id the
+archive parts already hold. The two can overlap only for the few hours
+between a consolidation and the next refresh. Deduping on `id` is always
+safe, and removes nothing when nothing overlaps.
 
 ## Two collections
 
