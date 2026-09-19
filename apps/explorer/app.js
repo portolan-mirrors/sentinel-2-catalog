@@ -23,6 +23,15 @@ import { openCog, cogTileLayer } from "./cog.js";
 import { dayRange } from "./rangeslider.js";
 // deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
 // transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
+// A classic script that failed to load is a missing global, not an import
+// error, so it is checked here and said out loud rather than thrown.
+if (!window.deck?.MapboxOverlay) {
+  const el = document.getElementById("status");
+  el.textContent = "deck.gl did not load (cdn.jsdelivr.net/npm/deck.gl@9.4.0/dist.min.js is "
+    + "blocked or unreachable) — the map cannot be drawn. Reload once the CDN is reachable.";
+  el.classList.add("error");
+  throw new Error("deck.gl bundle missing");
+}
 const { MapboxOverlay, GeoJsonLayer, MVTLayer } = window.deck;
 
 // ?base=http://localhost:8081 points the whole app at a local publish tree,
@@ -154,11 +163,21 @@ async function fetchMvt(url, { loadOptions, signal }) {
 // bounding boxes, is microseconds anywhere — so the choropleth is not
 // pickable at all, and MapLibre's mousemove/click events drive hover and
 // selection.
+// The archive is one z0 tile today, so the index is built exactly once; a
+// deeper archive would hand every zoom's copy of the same polygons through
+// fetchMvt, so tiles are indexed by (z, x, y) once and the index keeps only
+// the first zoom it saw — the coarsest, which is enough for a hit test.
 const hitIndex = {
   cell: 2,                       // degrees
   grid: new Map(),               // "cx,cy" -> [polygon ids]
   polys: [],                     // {tile, rings: [[lon, lat, ...]], bbox}
+  seen: new Set(),               // "z/x/y" already indexed
+  zoom: null,                    // the one zoom level indexed
   add(polygons, z, tx, ty) {
+    const key = `${z}/${tx}/${ty}`;
+    if (this.seen.has(key) || (this.zoom !== null && z !== this.zoom)) return;
+    this.seen.add(key);
+    this.zoom = z;
     const { positions, polygonIndices, primitivePolygonIndices, featureIds, properties } = polygons;
     const P = positions.value, size = positions.size;
     const n = 2 ** z;
@@ -237,7 +256,8 @@ let selectedTile = null;
 function fillColor(f) {
   const s = lookup.get(f.properties.mgrs_tile);
   if (!s) return UNPAINTED;
-  if (s.cc > maxCloud) return DIMMED;
+  // A NULL clearest-scene cloud cover is "unknown", not "over the slider".
+  if (s.cc !== null && s.cc > maxCloud) return DIMMED;
   return RAMP_LUT[Math.round(s.v)];
 }
 
@@ -300,7 +320,8 @@ map.on("mousemove", (e) => {
   if (hoverFrame) return;
   hoverFrame = requestAnimationFrame(() => {
     hoverFrame = 0;
-    setHovered(hoverAt ? hitIndex.at(hoverAt.lng, hoverAt.lat) : null);
+    // .wrap(): on a world copy past ±180 the index is still in -180..180.
+    setHovered(hoverAt ? hitIndex.at(hoverAt.wrap().lng, hoverAt.lat) : null);
   });
 });
 map.on("mouseout", () => { hoverAt = null; setHovered(null); });
@@ -375,7 +396,14 @@ async function paintMonth() {
   }
   const metric = $("metric").value;
   const next = new Map();
-  for (const r of rows) next.set(r.mgrs_tile, { v: onRamp(metric, r.v), cc: Number(r.cc) });
+  for (const r of rows) {
+    // A NULL metric (every pre-rebuild row's cover, a NULL cloud cover) is
+    // left unpainted: Number(null) is 0, which would read as "0% filled"
+    // or "0% cloud". A NULL clearest-scene cover is kept as null so the
+    // slider never dims what it cannot judge.
+    if (r.v == null) continue;
+    next.set(r.mgrs_tile, { v: onRamp(metric, r.v), cc: r.cc == null ? null : Number(r.cc) });
+  }
   lookup = next;
   repaint();
   markActiveBar();
@@ -384,8 +412,10 @@ async function paintMonth() {
       + `Pick a month with bars in the timeline below.`);
     return;
   }
+  const unpainted = rows.length - next.size;
   say(`${rows.length.toLocaleString()} MGRS tiles imaged in ${ym} — `
-    + `filtered in the browser from the stats file, no API call.`);
+    + `filtered in the browser from the stats file, no API call.`
+    + (unpainted ? ` ${unpainted.toLocaleString()} have no ${metric} value and stay grey.` : ""));
 }
 
 export async function timelineFor(tile) {
@@ -532,13 +562,22 @@ async function init() {
     const [yy, mm] = ym.split("-").map(Number);
     return new Date(Date.UTC(yy, mm, 0)).toISOString().slice(0, 10);
   };
+  // The stats file can lag the item parts (it is rebuilt on its own
+  // schedule), so the window's upper bound is the newer of the stats' last
+  // month and the last published item year: one cached HEAD per year past
+  // the stats, the same probe the search uses.
+  const newestYear = await newestPublishedYear(Number(span.newest.slice(0, 4)));
+  const max = newestYear > Number(span.newest.slice(0, 4))
+    ? (newestYear === CURRENT_YEAR ? new Date().toISOString().slice(0, 10) : `${newestYear}-12-31`)
+    : lastDay(span.newest);
   dateRange = dayRange({ container: $("dayrange"), from: $("date0"), to: $("date1"),
-    min: `${span.oldest}-01`, max: lastDay(span.newest) });
+    min: `${span.oldest}-01`, max });
   dateRange.set(`${span.newest}-01`, new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10));
   await Promise.all([paintMonth(), timelineFor(null)]);
 }
 
-await init();
+// init() runs at the end of the module: it probes the item years with the
+// scene query's constants and helpers, which are defined below.
 
 // ---------------------------------------------------------------------------
 // The scene query. Click a tile, pick a window, and DuckDB-WASM range-reads the
@@ -559,7 +598,7 @@ const ITEM_RE = /^[A-Za-z0-9_.-]+$/;
 const CURRENT_YEAR = new Date().getUTCFullYear();
 
 map.on("click", (e) => {
-  const tile = hitIndex.at(e.lngLat.lng, e.lngLat.lat)?.tile;
+  const tile = hitIndex.at(e.lngLat.wrap().lng, e.lngLat.lat)?.tile;
   if (!TILE_RE.test(tile ?? "")) return;
   selectedTile = tile;
   $("query").querySelector(".hint").textContent =
@@ -628,6 +667,24 @@ const partExists = (url) => {
 // the current year. The tier comes from the year (the thresholds are
 // constants mirrored above); the probe only asks whether the year is
 // published yet.
+// The last year with any published archive part, from `from` upward: the
+// zone-1 part of each year's tier is probed (a year is published whole, so
+// one part stands for the year), plus live.parquet for the current year.
+// Years are probed in order and the walk stops at the first unpublished
+// one, so a page load costs one 404 (which Chrome logs), not one per
+// future year.
+async function newestPublishedYear(from) {
+  let newest = from;
+  for (let y = from + 1; y <= CURRENT_YEAR; y++) {
+    const dir = `${BASE}/sentinel-2-l2a/year=${y}`;
+    const probes = [`${dir}/${archivePartFor("1CDK", y)}.parquet`];
+    if (y === CURRENT_YEAR) probes.push(`${dir}/live.parquet`);
+    if (!(await Promise.all(probes.map(partExists))).some(Boolean)) break;
+    newest = y;
+  }
+  return newest;
+}
+
 async function partUrls(y0, y1, tile) {
   const candidates = [];
   for (let y = y0; y <= y1; y++) {
@@ -692,14 +749,19 @@ function apiMirror(tile, d0, d1, cc) {
 }
 
 // Asset hrefs are remote-derived strings going into an href, so only real
-// http(s) URLs are linked; anything else (javascript:, data:, missing) is
-// dropped rather than rendered.
+// https URLs are linked; anything else (javascript:, data:, http: — which
+// this https page could not fetch anyway, missing) is dropped rather than
+// rendered. A protocol check only: a mirror on another host must still work.
 function assetHref(assets, key) {
   const href = assets?.[key]?.href;
   if (typeof href !== "string") return null;
   try {
     const u = new URL(href);
-    return u.protocol === "https:" || u.protocol === "http:" ? href : null;
+    if (u.protocol !== "https:") return null;
+    if (!/(^|\.)(amazonaws\.com|source\.coop)$/.test(u.hostname)) {
+      console.warn(`asset ${key} on an unexpected host: ${u.hostname}`);
+    }
+    return href;
   } catch {
     return null;
   }
@@ -935,3 +997,5 @@ async function runQuery() {
 }
 
 $("run").addEventListener("click", runQuery);
+
+await init();

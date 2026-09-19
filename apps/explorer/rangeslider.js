@@ -50,6 +50,10 @@ export function dayRange({ container, from, to, min, max, onChange }) {
     let d0 = dayOf(from.value), d1 = dayOf(to.value);
     if (d0 > d1) d1 = d0;
     a.value = d0; b.value = d1;
+    // A date outside the bounds, or an end before the start, was clamped
+    // above; the calendars take the clamped value so the two never diverge.
+    from.value = iso(lo + d0 * DAY);
+    to.value = iso(lo + d1 * DAY);
     paint();
     onChange?.(from.value, to.value);
   };
