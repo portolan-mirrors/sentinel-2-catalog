@@ -23,7 +23,7 @@
     "cloud cover",
     "mgrs"
   ],
-  "updated": "2026-09-19T15:43:53Z",
+  "updated": "2026-09-19T20:15:18Z",
   "providers": [
     {
       "name": "European Space Agency (ESA)",
@@ -1291,6 +1291,12 @@
       "href": "./year=2024/2024.json",
       "type": "application/geo+json",
       "title": "Sentinel-2 L2A scenes, 2024"
+    },
+    {
+      "rel": "item",
+      "href": "./year=2025/2025.json",
+      "type": "application/geo+json",
+      "title": "Sentinel-2 L2A scenes, 2025"
     },
     {
       "rel": "item",
