@@ -99,9 +99,12 @@ not `eo:cloud_cover`.
 part of the year and lets the `s2:mgrs_tile` filter discard the rest of it by
 row-group statistics. Row-group size differs by vintage: parts published
 through 2023 carry ~100k-row groups (a tile lookup reads ~14 MB per group it
-touches); parts from 2024 on carry ~6k-row groups (~0.85 MB per hit). Both
-read identically; only bytes-per-hit differ, and the older years are rebuilt
-when a larger machine allows. When you know the tile, skip them entirely: pick the
+touches); parts from 2024 on carry ~6k-row groups (~0.85 MB per hit). Sort order also
+differs by vintage: through 2025 rows are ordered (_month, _hilbert); from 2026
+they are ordered (_month, s2:mgrs_tile, _hilbert), so one tile's scenes for a
+month sit in a single small row group and a tile lookup is one range request.
+All vintages read identically; only bytes and requests per hit differ, and the
+older years are rebuilt when a larger machine allows. When you know the tile, skip them entirely: pick the
 file by zone and year. Zone 31 in 2021 is in `z21-31.parquet`, so the same
 query touches one file:
 

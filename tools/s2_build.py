@@ -192,6 +192,23 @@ ZONE_PARTS_8 = (
 )
 ZONE_SPLIT_8_FROM = 2021
 
+# Sort key by vintage. Measured on published parts (2026-09-19): a tile-and-
+# window lookup took 5.0 s against 2020's 100k-row groups and 6.8 s against
+# 2024's ~6k-row groups -- small groups alone bought nothing, because Hilbert
+# order within a month scatters one tile's scenes across ~13 neighbours'
+# groups and each group is a request. Sorting by tile within the month pins a
+# tile-month to one small group, which is what the catalog's primary query
+# ("scenes over my tile in this window") wants; _hilbert stays as the
+# tiebreak so bbox queries inside a tile keep their locality. Years published
+# before this changed keep (_month, _hilbert) until a rebuild.
+TILE_SORT_FROM = 2026
+
+
+def sort_key(year: int) -> str:
+    """The gpio --sort column list for a year's parts."""
+    return ("_month,s2:mgrs_tile,_hilbert" if year >= TILE_SORT_FROM
+            else "_month,_hilbert")
+
 
 def zone_parts_for(year: int) -> tuple[tuple[str, int, int], ...]:
     """The zone parts a year is published as: () for a single items.parquet
@@ -291,7 +308,7 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
         con.execute(f"SET memory_limit='{GPIO_HANDOFF}';")
         r = subprocess.run(
             ["gpio", "sort", "column", str(staged), str(tmp),
-             "_month,_hilbert", "--geoparquet-version", "2.0",
+             sort_key(year), "--geoparquet-version", "2.0",
              "--compression", "zstd",
              "--compression-level", str(ZSTD_LEVEL),
              "--row-group-size", str(_row_group_size),
@@ -300,7 +317,7 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
         if r.returncode != 0:
             print(r.stdout[-1500:], r.stderr[-1500:], file=sys.stderr)
             raise SystemExit(f"gpio sort failed for {year}")
-        say(f"year={year}/{name}: sorted (_month, _hilbert) and written "
+        say(f"year={year}/{name}: sorted ({sort_key(year)}) and written "
             f"zstd-{ZSTD_LEVEL}, {tmp.stat().st_size / 1e6:,.0f} MB, "
             f"{time.monotonic() - t0:,.1f}s")
         # Best-practices gate on the artifact itself: compression, row

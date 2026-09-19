@@ -113,7 +113,7 @@ LEVEL_LOW, LEVEL_HIGH = 1, 15
 SMALL_ROWS = 50_000
 
 
-def _mk_big_chunk(con, path, rows=BIG_ROWS):
+def _mk_big_chunk(con, path, rows=BIG_ROWS, year=2024, tiles=("31UFU",)):
     """One chunk of `rows` synthetic scenes: dates spread over a year (so
     _month spans 1-12), footprints scattered over the globe by a pair of
     coprime strides (so _hilbert is well mixed and an unsorted write is
@@ -124,10 +124,10 @@ def _mk_big_chunk(con, path, rows=BIG_ROWS):
           SELECT NULL::VARCHAR AS thumbnail_url, 'Feature' AS type,
                  '1.1.0' AS stac_version, []::VARCHAR[] AS stac_extensions,
                  'S2A_' || i AS id,
-                 TIMESTAMPTZ '2024-01-01 00:00:00+00'
+                 TIMESTAMPTZ '{year}-01-01 00:00:00+00'
                    + INTERVAL (i % 365) DAY AS datetime,
-                 '2024-01-01T12:00:00Z' AS "s2:generation_time",
-                 '31UFU' AS "s2:mgrs_tile",
+                 '{year}-01-01T12:00:00Z' AS "s2:generation_time",
+                 list_value({", ".join(repr(t) for t in tiles)})[1 + i % {len(tiles)}] AS "s2:mgrs_tile",
                  (i % 100)::DOUBLE AS "eo:cloud_cover",
                  '{{"visual":{{"href":"https://sentinel-cogs.s3.us-west-2.'
                  || 'amazonaws.com/sentinel-s2-l2a-cogs/31/U/FU/2024/1/S2A_'
@@ -140,14 +140,14 @@ def _mk_big_chunk(con, path, rows=BIG_ROWS):
     """)
 
 
-def _build(out, chunks, level, env=None):
+def _build(out, chunks, level, env=None, years="2024"):
     """Run the CLI the way the workflows do, with zstd pinned through the
     S2_ZSTD_LEVEL test hook. Every test passes a level: the published default
     is 18, which no test can afford to wait for."""
     env = dict(env or os.environ, S2_ZSTD_LEVEL=str(level))
     return subprocess.run(
         [sys.executable, "tools/s2_build.py", "--sources", str(chunks.parent),
-         "--years", "2024", "--out", str(out)],
+         "--years", years, "--out", str(out)],
         cwd=ROOT, env=env, capture_output=True, text=True)
 
 
@@ -831,3 +831,36 @@ def test_on_part_done_runs_for_a_single_file_year():
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert log.read_text().splitlines() == \
             [str(out.resolve() / "year=2017" / "items.parquet")]
+
+
+def test_tile_sort_from_2026_pins_a_tile_month_to_few_row_groups():
+    """From TILE_SORT_FROM on, parts sort (_month, s2:mgrs_tile, _hilbert):
+    within a month every row of one tile is contiguous, so a tile-month
+    lookup touches one (rarely two) small row groups instead of every
+    group the month spans. The 2024 fixture above keeps the old key."""
+    from s2_build import sort_key, TILE_SORT_FROM
+    assert sort_key(TILE_SORT_FROM - 1) == "_month,_hilbert"
+    assert sort_key(TILE_SORT_FROM) == "_month,s2:mgrs_tile,_hilbert"
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_big_chunk(con, chunks / "a.parquet", rows=60_000, year=TILE_SORT_FROM,
+                      tiles=("31UFU", "32UMV", "33UUP", "34UDA"))
+        out = Path(td) / "publish"
+        proc = _build(out, chunks, LEVEL_LOW, years=str(TILE_SORT_FROM))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        f = out / f"year={TILE_SORT_FROM}" / "items.parquet"
+        keys = con.execute(f"""SELECT _month, "s2:mgrs_tile", _hilbert
+                               FROM read_parquet('{f}')""").fetchall()
+        assert keys == sorted(keys), "rows must be ordered by (_month, tile, _hilbert)"
+        # A tile-month is contiguous, so it spans at most ceil(rows_in_tile_month / 6144) + 1 groups.
+        spans = con.execute(f"""
+            SELECT max(g) FROM (
+              SELECT _month, "s2:mgrs_tile", count(DISTINCT rg) AS g FROM (
+                SELECT _month, "s2:mgrs_tile",
+                       (row_number() OVER (ORDER BY _month, "s2:mgrs_tile", _hilbert) - 1) // 6144 AS rg
+                FROM read_parquet('{f}')
+              ) GROUP BY 1, 2)""").fetchone()[0]
+        assert spans <= 2, f"a tile-month spans {spans} row groups; expected contiguous"
