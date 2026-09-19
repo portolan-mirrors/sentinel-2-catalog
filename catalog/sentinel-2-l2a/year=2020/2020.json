@@ -1,0 +1,124 @@
+{
+  "type": "Feature",
+  "stac_version": "1.1.0",
+  "stac_extensions": [
+    "https://stac-extensions.github.io/table/v1.2.0/schema.json",
+    "https://stac-extensions.github.io/file/v2.1.0/schema.json"
+  ],
+  "id": "2020",
+  "collection": "sentinel-2-l2a",
+  "bbox": [
+    -180.0,
+    -82.8534,
+    180.0,
+    82.8185
+  ],
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          -180.0,
+          -82.8534
+        ],
+        [
+          180.0,
+          -82.8534
+        ],
+        [
+          180.0,
+          82.8185
+        ],
+        [
+          -180.0,
+          82.8185
+        ],
+        [
+          -180.0,
+          -82.8534
+        ]
+      ]
+    ]
+  },
+  "properties": {
+    "title": "Sentinel-2 L2A scenes, 2020",
+    "datetime": null,
+    "start_datetime": "2020-01-01T00:00:04.168Z",
+    "end_datetime": "2020-12-31T23:59:06.560Z",
+    "table:row_count": 8055956,
+    "s2:platforms": [
+      "sentinel-2a",
+      "sentinel-2b"
+    ]
+  },
+  "assets": {
+    "data-z01-20": {
+      "href": "./z01-20.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2020 scenes, UTM zones 1\u201320",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2020-01-01T09:04:52.852Z",
+      "end_datetime": "2020-12-31T23:30:26.752Z",
+      "table:row_count": 2237777,
+      "file:size": 621210327
+    },
+    "data-z21-35": {
+      "href": "./z21-35.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2020 scenes, UTM zones 21\u201335",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2020-01-01T05:41:00.650Z",
+      "end_datetime": "2020-12-31T15:10:13.822Z",
+      "table:row_count": 2070745,
+      "file:size": 572609829
+    },
+    "data-z36-46": {
+      "href": "./z36-46.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2020 scenes, UTM zones 36\u201346",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2020-01-01T02:17:06.903Z",
+      "end_datetime": "2020-12-31T09:16:31.568Z",
+      "table:row_count": 1739665,
+      "file:size": 477214079
+    },
+    "data-z47-60": {
+      "href": "./z47-60.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2020 scenes, UTM zones 47\u201360",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2020-01-01T00:00:04.168Z",
+      "end_datetime": "2020-12-31T23:59:06.560Z",
+      "table:row_count": 2007769,
+      "file:size": 551590504
+    }
+  },
+  "links": [
+    {
+      "rel": "root",
+      "href": "../../catalog.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
+    },
+    {
+      "rel": "parent",
+      "href": "../collection.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A scenes (item index)"
+    },
+    {
+      "rel": "collection",
+      "href": "../collection.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A scenes (item index)"
+    }
+  ]
+}

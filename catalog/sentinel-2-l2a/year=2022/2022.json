@@ -1,0 +1,172 @@
+{
+  "type": "Feature",
+  "stac_version": "1.1.0",
+  "stac_extensions": [
+    "https://stac-extensions.github.io/table/v1.2.0/schema.json",
+    "https://stac-extensions.github.io/file/v2.1.0/schema.json"
+  ],
+  "id": "2022",
+  "collection": "sentinel-2-l2a",
+  "bbox": [
+    -180.0,
+    -82.8502,
+    180.0,
+    82.8167
+  ],
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          -180.0,
+          -82.8502
+        ],
+        [
+          180.0,
+          -82.8502
+        ],
+        [
+          180.0,
+          82.8167
+        ],
+        [
+          -180.0,
+          82.8167
+        ],
+        [
+          -180.0,
+          -82.8502
+        ]
+      ]
+    ]
+  },
+  "properties": {
+    "title": "Sentinel-2 L2A scenes, 2022",
+    "datetime": null,
+    "start_datetime": "2022-01-01T00:05:05.793Z",
+    "end_datetime": "2022-12-31T23:59:05.733Z",
+    "table:row_count": 4217292,
+    "s2:platforms": [
+      "sentinel-2a",
+      "sentinel-2b"
+    ]
+  },
+  "assets": {
+    "data-z01-15": {
+      "href": "./z01-15.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2022 scenes, UTM zones 1\u201315",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2022-01-01T13:34:33.685Z",
+      "end_datetime": "2022-12-31T23:30:25.620Z",
+      "table:row_count": 663801,
+      "file:size": 187231594
+    },
+    "data-z16-20": {
+      "href": "./z16-20.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2022 scenes, UTM zones 16\u201320",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2022-01-01T08:35:01.347Z",
+      "end_datetime": "2022-12-31T16:55:20.689Z",
+      "table:row_count": 514521,
+      "file:size": 142701261
+    },
+    "data-z21-31": {
+      "href": "./z21-31.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2022 scenes, UTM zones 21\u201331",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2022-01-01T08:29:38.738Z",
+      "end_datetime": "2022-12-31T15:10:12.661Z",
+      "table:row_count": 681731,
+      "file:size": 189795338
+    },
+    "data-z32-35": {
+      "href": "./z32-35.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2022 scenes, UTM zones 32\u201335",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2022-01-01T08:13:50.525Z",
+      "end_datetime": "2022-12-31T10:56:40.698Z",
+      "table:row_count": 412713,
+      "file:size": 112421078
+    },
+    "data-z36-40": {
+      "href": "./z36-40.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2022 scenes, UTM zones 36\u201340",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2022-01-01T05:07:27.353Z",
+      "end_datetime": "2022-12-31T09:16:32.223Z",
+      "table:row_count": 461687,
+      "file:size": 127343910
+    },
+    "data-z41-46": {
+      "href": "./z41-46.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2022 scenes, UTM zones 41\u201346",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2022-01-01T01:48:05.659Z",
+      "end_datetime": "2022-12-31T07:33:40.980Z",
+      "table:row_count": 432730,
+      "file:size": 119852854
+    },
+    "data-z47-52": {
+      "href": "./z47-52.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2022 scenes, UTM zones 47\u201352",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2022-01-01T00:05:26.762Z",
+      "end_datetime": "2022-12-31T23:19:24.623Z",
+      "table:row_count": 558463,
+      "file:size": 155180214
+    },
+    "data-z53-60": {
+      "href": "./z53-60.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2022 scenes, UTM zones 53\u201360",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2022-01-01T00:05:05.793Z",
+      "end_datetime": "2022-12-31T23:59:05.733Z",
+      "table:row_count": 491646,
+      "file:size": 139787912
+    }
+  },
+  "links": [
+    {
+      "rel": "root",
+      "href": "../../catalog.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
+    },
+    {
+      "rel": "parent",
+      "href": "../collection.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A scenes (item index)"
+    },
+    {
+      "rel": "collection",
+      "href": "../collection.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A scenes (item index)"
+    }
+  ]
+}

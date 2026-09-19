@@ -441,6 +441,10 @@ async function paintMonth() {
   const [y, m] = ($("month").value || "").split("-").map(Number);
   if (!y || !m) return;
   const ym = `${y}-${String(m).padStart(2, "0")}`;
+  // Said once, on whichever paintMonth() call happens to be first (the
+  // default-month load), then never again.
+  const note = lagNote;
+  lagNote = "";
   say(`Reading ${ym} from mgrs-monthly.parquet…`);
   let rows;
   try {
@@ -470,14 +474,16 @@ async function paintMonth() {
   markActiveBar();
   if (!rows.length) {
     say(`No tile-months for ${ym} in the published stats. `
-      + `Pick a month with bars in the timeline below.`);
+      + `Pick a month with bars in the timeline below.`
+      + (note ? ` ${note}` : ""));
     return;
   }
   const unpainted = rows.length - next.size;
   say(`${rows.length.toLocaleString()} MGRS tiles imaged in ${ym} — `
     + `filtered in the browser from the stats file, no API call.`
     + (unpainted ? ` ${unpainted.toLocaleString()} have no ${metric} value and stay grey.` : "")
-    + ` ${filterLine()}.`);
+    + ` ${filterLine()}.`
+    + (note ? ` ${note}` : ""));
 }
 
 export async function timelineFor(tile) {
@@ -596,19 +602,14 @@ function setCoverUi(has) {
 
 let dateRange = null;
 
+// Set once in init() when the stats file lags the newest published item
+// year, and appended to the very next paintMonth() status line so the lag
+// is said once on load, not repeated on every later month switch.
+let lagNote = "";
+
 function lastDayOfMonth(ym) {
   const [yy, mm] = ym.split("-").map(Number);
   return new Date(Date.UTC(yy, mm, 0)).toISOString().slice(0, 10);
-}
-
-// The last month with any stats row in `year`, or null if the stats file
-// has no rows for that year at all (used when the newest published item
-// year is ahead of the stats file's own newest year).
-async function newestMonthInYear(year) {
-  const res = await conn.query(
-    `SELECT max(month::INT) AS m FROM read_parquet('${STATS_FILE}') WHERE year = ${Number(year)}`);
-  const m = res.toArray()[0]?.m;
-  return m == null ? null : Number(m);
 }
 
 // The scene query's window is scoped to whichever month is on screen (not
@@ -671,24 +672,33 @@ async function init() {
   }
   const month = $("month");
   // The stats file can lag the item parts (it is rebuilt on its own
-  // schedule): the default month is the newest one with published item
-  // parts (one cached HEAD per year past the stats, the same probe the
-  // search uses), preferring the newest month the stats file actually has
-  // for that year, else that year's December. A month with no stats row
-  // just paints unpainted (the NULL-metric rule above), so this never
-  // crashes when the backfill has not caught up yet.
+  // schedule, one cached HEAD per year past the stats to find how far
+  // publishing has gone, the same probe the search uses): the default
+  // month is always span.newest, the newest month the stats file actually
+  // has rows for (computed in newestMonth() above with year/month cast to
+  // INT before the year*100+month arithmetic — SMALLINT overflows past
+  // year 327). Never default to a month the stats haven't reached yet,
+  // which would paint an all-grey map with nothing to click. The picker
+  // itself still opens as far as the newest published item year (month.max
+  // below) so the user can browse ahead of the stats on purpose.
   const statsYear = Number(span.newest.slice(0, 4));
   const newestYear = await newestPublishedYear(statsYear);
-  let defaultMonth = span.newest;
+  const defaultMonth = span.newest;
   if (newestYear > statsYear) {
-    const m = await newestMonthInYear(newestYear);
-    defaultMonth = m != null ? `${newestYear}-${String(m).padStart(2, "0")}` : `${newestYear}-12`;
+    lagNote = `Stats reach ${span.newest}; scenes are published through ${newestYear} `
+      + "— the choropleth updates when the stats rebuild lands.";
   }
   month.min = span.oldest;
   month.max = newestYear > statsYear ? `${newestYear}-12` : span.newest;
   month.value = defaultMonth;
   reboundDateRange(defaultMonth);
   await Promise.all([paintMonth(), timelineFor(null)]);
+  // paintMonth() already calls markActiveBar() (the same call the timeline
+  // bar's own onclick makes), but it can run before timelineFor() has
+  // appended the bar buttons; timelineFor() also calls it once its bars
+  // exist, so this just guarantees the default month's bar ends up
+  // highlighted regardless of which promise settles first.
+  markActiveBar();
 }
 
 // init() runs at the end of the module: it probes the item years with the

@@ -10,7 +10,7 @@
   ],
   "id": "sentinel-2-l2a",
   "title": "Sentinel-2 L2A scenes (item index)",
-  "description": "The AWS Earth Search item index for Sentinel-2 L2A, republished as one year-partitioned GeoParquet 2.0 table of 12,879,803 rows covering 2016 to 2019. One row per scene, carrying the whole STAC item: footprint, acquisition time, MGRS tile, cloud cover, the scene-classification percentages, and the complete upstream `assets` object as a JSON string. Every Cloud-Optimized GeoTIFF URL is therefore in the table -- no API call, no URL template to guess -- while the imagery itself stays in the `sentinel-cogs` bucket on AWS. Rows are ordered by month and then by a Hilbert index, so a reader prunes on both time and space. Years before 2019 are one items.parquet each. From 2019 each year is split by the UTM zone of s2:mgrs_tile (the leading one or two digits of the tile id): 2019\u20132020 into 4 files, z01-20.parquet (zones 1\u201320), z21-35.parquet (zones 21\u201335), z36-46.parquet (zones 36\u201346), z47-60.parquet (zones 47\u201360); from 2021 into 8 files, z01-15.parquet (zones 1\u201315), z16-20.parquet (zones 16\u201320), z21-31.parquet (zones 21\u201331), z32-35.parquet (zones 32\u201335), z36-40.parquet (zones 36\u201340), z41-46.parquet (zones 41\u201346), z47-52.parquet (zones 47\u201352), z53-60.parquet (zones 53\u201360). The current year adds live.parquet, the tail fetched daily since the last consolidation. There is no zone= directory: every part sits in year=YYYY/ and matches partition:glob, and a reader with a tile id opens only the part whose zone range holds it. Coverage before December 2018 is partial: nothing for 2015-2016 and part of 2017-2018, which is what Earth Search serves rather than a gap introduced here. Contains modified Copernicus Sentinel data. Read the [agent guide](AGENTS.md) before querying: `sat:orbit_state` and `s2:granule_id` are NULL on newer items, and `assets` is a JSON string, not a struct.",
+  "description": "The AWS Earth Search item index for Sentinel-2 L2A, republished as one year-partitioned GeoParquet 2.0 table of 51,279,608 rows covering 2016 to 2026. One row per scene, carrying the whole STAC item: footprint, acquisition time, MGRS tile, cloud cover, the scene-classification percentages, and the complete upstream `assets` object as a JSON string. Every Cloud-Optimized GeoTIFF URL is therefore in the table -- no API call, no URL template to guess -- while the imagery itself stays in the `sentinel-cogs` bucket on AWS. Rows are ordered by month and then by a Hilbert index, so a reader prunes on both time and space. Years before 2019 are one items.parquet each. From 2019 each year is split by the UTM zone of s2:mgrs_tile (the leading one or two digits of the tile id): 2019\u20132020 into 4 files, z01-20.parquet (zones 1\u201320), z21-35.parquet (zones 21\u201335), z36-46.parquet (zones 36\u201346), z47-60.parquet (zones 47\u201360); from 2021 into 8 files, z01-15.parquet (zones 1\u201315), z16-20.parquet (zones 16\u201320), z21-31.parquet (zones 21\u201331), z32-35.parquet (zones 32\u201335), z36-40.parquet (zones 36\u201340), z41-46.parquet (zones 41\u201346), z47-52.parquet (zones 47\u201352), z53-60.parquet (zones 53\u201360). The current year adds live.parquet, the tail fetched daily since the last consolidation. There is no zone= directory: every part sits in year=YYYY/ and matches partition:glob, and a reader with a tile id opens only the part whose zone range holds it. Coverage before December 2018 is partial: nothing for 2015-2016 and part of 2017-2018, which is what Earth Search serves rather than a gap introduced here. Contains modified Copernicus Sentinel data. Read the [agent guide](AGENTS.md) before querying: `sat:orbit_state` and `s2:granule_id` are NULL on newer items, and `assets` is a JSON string, not a struct.",
   "license": "CC-BY-SA-3.0-IGO",
   "keywords": [
     "sentinel-2",
@@ -23,7 +23,7 @@
     "cloud cover",
     "mgrs"
   ],
-  "updated": "2026-09-18T21:27:13Z",
+  "updated": "2026-09-19T15:43:53Z",
   "providers": [
     {
       "name": "European Space Agency (ESA)",
@@ -75,7 +75,7 @@
       "interval": [
         [
           "2016-11-01T08:52:23.012Z",
-          "2019-12-31T22:59:34.052Z"
+          "2026-09-17T09:26:57.938Z"
         ]
       ]
     }
@@ -89,10 +89,10 @@
       "description": "Year of acquisition (UTC). Years before 2019 are one items.parquet each. From 2019 each year is split by the UTM zone of s2:mgrs_tile (the leading one or two digits of the tile id): 2019\u20132020 into 4 files, z01-20.parquet (zones 1\u201320), z21-35.parquet (zones 21\u201335), z36-46.parquet (zones 36\u201346), z47-60.parquet (zones 47\u201360); from 2021 into 8 files, z01-15.parquet (zones 1\u201315), z16-20.parquet (zones 16\u201320), z21-31.parquet (zones 21\u201331), z32-35.parquet (zones 32\u201335), z36-40.parquet (zones 36\u201340), z41-46.parquet (zones 41\u201346), z47-52.parquet (zones 47\u201352), z53-60.parquet (zones 53\u201360). The current year adds live.parquet, the tail fetched daily since the last consolidation. There is no zone= directory: every part sits in year=YYYY/ and matches partition:glob, and a reader with a tile id opens only the part whose zone range holds it."
     }
   ],
-  "partition:file_count": 7,
+  "partition:file_count": 59,
   "partition:glob": "s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet",
   "table:primary_geometry": "geometry",
-  "table:row_count": 12879803,
+  "table:row_count": 51279608,
   "table:columns": [
     {
       "name": "thumbnail_url",
@@ -1261,6 +1261,42 @@
       "href": "./year=2019/2019.json",
       "type": "application/geo+json",
       "title": "Sentinel-2 L2A scenes, 2019"
+    },
+    {
+      "rel": "item",
+      "href": "./year=2020/2020.json",
+      "type": "application/geo+json",
+      "title": "Sentinel-2 L2A scenes, 2020"
+    },
+    {
+      "rel": "item",
+      "href": "./year=2021/2021.json",
+      "type": "application/geo+json",
+      "title": "Sentinel-2 L2A scenes, 2021"
+    },
+    {
+      "rel": "item",
+      "href": "./year=2022/2022.json",
+      "type": "application/geo+json",
+      "title": "Sentinel-2 L2A scenes, 2022"
+    },
+    {
+      "rel": "item",
+      "href": "./year=2023/2023.json",
+      "type": "application/geo+json",
+      "title": "Sentinel-2 L2A scenes, 2023"
+    },
+    {
+      "rel": "item",
+      "href": "./year=2024/2024.json",
+      "type": "application/geo+json",
+      "title": "Sentinel-2 L2A scenes, 2024"
+    },
+    {
+      "rel": "item",
+      "href": "./year=2026/2026.json",
+      "type": "application/geo+json",
+      "title": "Sentinel-2 L2A scenes, 2026"
     }
   ]
 }
