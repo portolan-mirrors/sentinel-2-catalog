@@ -32,9 +32,10 @@ footprints, not the true MGRS grid cell.
 Pick the file by the shape of the question:
 
 - **One tile over time** -> `mgrs-monthly.parquet` with `WHERE mgrs_tile =`.
-  The file is sorted by `(mgrs_tile, year, month)` in 10k-row groups, so
+  The file is sorted by `(mgrs_tile, year, month)` in 50k-row groups, so
   DuckDB's row-group statistics turn that filter into a range read of one
-  or two groups (~70 KB), not a 21 MB download.
+  group's projected columns plus a ~55 KB footer (~150 KB in all for a
+  5-column query), not a 21 MB download.
 - **Every tile in one month** -> `months/YYYY-MM.parquet`. One row group,
   sorted by `mgrs_tile`, ~100-150 KB; read it whole. A 404 means the table
   has no tile-months for that month, which is not an error.

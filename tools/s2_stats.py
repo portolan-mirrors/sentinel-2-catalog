@@ -15,8 +15,8 @@ splices it into the existing table instead of scanning ten years of parquet.
 
 Three outputs land under --out (Task 24):
   mgrs-monthly.parquet   the full table, sorted by (mgrs_tile, year, month)
-                         in 10k-row groups so one tile's history is a range
-                         read of one or two row groups
+                         in 50k-row groups so one tile's history is a range
+                         read of one row group and a small footer
   months/YYYY-MM.parquet one slice per month with the five paint columns,
                          sorted by tile, one row group: what the explorer
                          fetches to paint the choropleth (~100-150 KB)
@@ -71,19 +71,29 @@ MONTH_COLUMNS = ("mgrs_tile", "scene_count") + PERCENT_COLUMNS
 COVER_COLUMNS = ("mean_cover", "max_cover")
 NODATA_COLUMN = "s2:nodata_pixel_percentage"
 
-# zstd 18 costs seconds on this table (see the Task 24 report) and saves ~3 MB
-# against the DuckDB default level; the app reads the full table with range
-# requests, so the row group is small enough that one tile's ~120 rows sit in
-# one or two groups.
-FULL_TABLE_OPTS = "FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 18, ROW_GROUP_SIZE 10000"
+# Measured on the live 3.1M-row table: zstd 12 gives 24.2 MB, zstd 18 gives
+# 21.2 MB (DuckDB's own default is level 3), and the level-18 write is
+# seconds. The app range-reads the full table for one tile's history, so the
+# row group is the trade between footer size and column-chunk size: 50k rows
+# (DuckDB writes 51,200) is 6 requests / ~150 KB per tile against
+# 6 / ~310 KB at 10k, where a 266 KB footer dominated.
+FULL_TABLE_OPTS = "FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 18, ROW_GROUP_SIZE 50000"
 # A month slice is one row per tile (< 40k rows): one row group, so the app
 # reads it in one request with no footer round trip worth optimising.
 SLICE_OPTS = "FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 18, ROW_GROUP_SIZE 1000000"
 
 
 def _pct(expr: str) -> str:
-    """A 0-100 percent as an integer: round(x)::UTINYINT, NULL stays NULL."""
-    return f"round({expr})::UTINYINT"
+    """A 0-100 percent as an integer; NULL stays NULL.
+
+    Valid eo:cloud_cover and s2:nodata_pixel_percentage are 0-100, so the
+    clamp changes nothing for real data; it keeps one bad value (-0.5 would
+    fail the UTINYINT cast, 100.5 would store 101) from aborting the build.
+    DuckDB's least()/greatest() skip NULLs (greatest(0, NULL) is 0), so the
+    NULL case is handled first, or an all-NULL cover would read as 0 %.
+    """
+    return (f"CASE WHEN {expr} IS NULL THEN NULL "
+            f"ELSE least(100, greatest(0, round({expr}))) END::UTINYINT")
 
 
 STATS_SQL = """

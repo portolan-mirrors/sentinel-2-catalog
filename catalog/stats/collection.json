@@ -131,7 +131,7 @@
       "roles": [
         "data"
       ],
-      "description": "The full table, every tile and month, sorted by (mgrs_tile, year, month) in 10k-row groups so a filter on one mgrs_tile is a range read of one or two row groups. One months/YYYY-MM.parquet slice per month sits beside it (see README)."
+      "description": "The full table, every tile and month, sorted by (mgrs_tile, year, month) in 50k-row groups so a filter on one mgrs_tile is a range read of one row group plus a small footer. One months/YYYY-MM.parquet slice per month sits beside it (see README)."
     },
     "timeline": {
       "href": "./timeline.parquet",

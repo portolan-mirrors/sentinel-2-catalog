@@ -288,8 +288,8 @@ def test_three_outputs_schema_and_order():
         assert [c for c, _ in tl] == list(TIMELINE_TYPES)
         assert dict(tl) == TIMELINE_TYPES
 
-        # The full table is sorted by tile then time, in 10k-row groups
-        # (DuckDB rounds ROW_GROUP_SIZE 10000 up to 10240, five vectors).
+        # The full table is sorted by tile then time, in 50k-row groups
+        # (DuckDB rounds ROW_GROUP_SIZE 50000 up to 51,200, 25 vectors).
         keys = con.execute(f"""
             SELECT mgrs_tile, year, month
             FROM read_parquet('{out}/mgrs-monthly.parquet')""").fetchall()
@@ -297,7 +297,7 @@ def test_three_outputs_schema_and_order():
         rg = con.execute(f"""
             SELECT max(row_group_num_rows)
             FROM parquet_metadata('{out}/mgrs-monthly.parquet')""").fetchone()[0]
-        assert rg <= 10240
+        assert rg <= 51200
 
 
 def test_percent_columns_are_rounded_integers():
@@ -320,6 +320,29 @@ def test_percent_columns_are_rounded_integers():
         for v in rows.values():
             for x in v[:4]:
                 assert x is None or isinstance(x, int), v
+
+
+def test_percent_out_of_range_is_clamped_and_null_kept():
+    """A value outside 0-100 (bad upstream data) is clamped rather than
+    aborting the build on the UTINYINT cast (-0.5 -> 0) or storing 101
+    (100.5 -> 100). The clamp must not zero a NULL: DuckDB's least/greatest
+    skip NULLs, so an all-NULL cover would otherwise read as 0 %."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            ('X1', TIMESTAMPTZ '2024-05-01 10:00:00+00', '31UFU', -0.5,  NULL, ST_Point(4, 52)),
+            ('X2', TIMESTAMPTZ '2024-05-02 10:00:00+00', '31UFU', 100.5, NULL, ST_Point(4, 52))
+          ) t(id, datetime, "s2:mgrs_tile", "eo:cloud_cover",
+              "s2:nodata_pixel_percentage", geometry)
+          ) TO '{src}' (FORMAT PARQUET)
+        """)
+        _run([src], out)
+        row = con.execute(f"""
+            SELECT min_cloud_cover, median_cloud_cover, mean_cover, max_cover
+            FROM read_parquet('{out}/mgrs-monthly.parquet')""").fetchone()
+        assert row == (0, 50, None, None), row
 
 
 def test_month_slice_equals_full_table_filtered():

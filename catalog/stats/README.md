@@ -10,8 +10,8 @@ item index by `tools/s2_stats.py`, meant to be joined by `mgrs_tile`:
   `100 - s2:nodata_pixel_percentage`; NULL when no scene carried it). Every
   percent is an integer 0-100 (`round()`), which is what keeps the full
   table at ~21 MB for ten years of every tile. Sorted by
-  `(mgrs_tile, year, month)` in 10k-row groups, so a filter on one tile is
-  a range read of one or two row groups, not the whole file. This is the
+  `(mgrs_tile, year, month)` in 50k-row groups, so a filter on one tile is
+  a range read of one row group plus a small footer, not the whole file. This is the
   cheap first stop for "which month has a cloud-free scene here".
 - **`months/YYYY-MM.parquet`** -- one file per month present in the table
   (not listed as assets; the pattern is the contract), holding that

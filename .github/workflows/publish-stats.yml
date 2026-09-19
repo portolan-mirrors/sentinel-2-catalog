@@ -1,7 +1,8 @@
 name: publish-stats
 
-# Build the mgrs-monthly stats table and the mgrs.pmtiles footprint tileset
-# from the PUBLISHED year parts (HTTP reads, no artifacts) and upload them.
+# Build the mgrs-monthly stats table (with its months/YYYY-MM.parquet slices
+# and timeline.parquet) and the mgrs.pmtiles footprint tileset from the
+# PUBLISHED year parts (HTTP reads, no artifacts) and upload them all.
 #
 # Why this exists as its own workflow: after the first data publish,
 # catalog/stats/ metadata (committed, static) references mgrs-monthly.parquet
