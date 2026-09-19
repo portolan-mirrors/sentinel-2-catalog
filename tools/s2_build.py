@@ -37,6 +37,15 @@ after its gpio check, which is how the workflow uploads each part the moment
 it exists rather than after the whole year. A CMD that fails stops the
 build: an upload that did not happen is not a part that is published.
 
+`--only-parts LABEL[,LABEL...]` (with `--split zones` only) builds just the
+named parts of the tier: the year is staged as usual, the named ranges are
+copied out and written, and the rows of every other range are dropped with
+a log line that names the count. This is how consolidate-month.yml folds
+live.parquet into a year in one job per part -- eight octants re-sorted and
+re-compressed in one job is 8-12 hours, past every runner ceiling -- and
+each job only ever has its own part's rows to sort. A label that is not in
+the year's tier stops the build naming the valid ones.
+
 Rows are deduped by id keeping the highest s2:generation_time, then sorted
 (_month, _hilbert): month-first keeps month pruning inside a year file,
 Hilbert-within-month keeps row-group bboxes tight for spatial pruning. The
@@ -233,6 +242,21 @@ def archive_part_names() -> tuple[str, ...]:
     return ("items",
             *(label for label, _, _ in ZONE_PARTS),
             *(label for label, _, _ in ZONE_PARTS_8))
+
+
+def only_zone_parts(year: int, parts: tuple[tuple[str, int, int], ...],
+                    only: tuple[str, ...]) -> tuple[tuple[str, int, int], ...]:
+    """The subset of `parts` (a year's tier) named by `only`, in tier
+    order. A label that is not in the tier stops the build and names the
+    labels that are: a typo would otherwise build nothing and exit as if
+    the year were empty."""
+    valid = [label for label, _, _ in parts]
+    unknown = [label for label in only if label not in valid]
+    if unknown:
+        raise SystemExit(
+            f"--only-parts: {', '.join(unknown)} not among year={year}'s "
+            f"zone parts; valid labels: {', '.join(valid)}")
+    return tuple(part for part in parts if part[0] in only)
 # The UTM zone of a scene, from the leading one or two digits of its MGRS
 # tile id ('1VCJ', '31UFU'). NULL when the id does not start with a digit.
 ZONE_SQL = """TRY_CAST(regexp_extract("s2:mgrs_tile", '^(\\d{1,2})', 1) AS INTEGER)"""
@@ -415,18 +439,25 @@ def run_part_hook(cmd: list[str], part: Path, year: int) -> None:
 def _stage_zone_parts(con, staged: Path, year: int,
                       parts: tuple[tuple[str, int, int], ...],
                       skip: dict[str, str],
-                      remote_rows=published_rows) -> list[tuple[str, Path | None, int]]:
+                      remote_rows=published_rows,
+                      partial: bool = False,
+                      ) -> tuple[list[tuple[str, Path | None, int]], int]:
     """Copy each range of `parts` out of the staged year into its own staged
-    file. Returns (label, path, rows) for the ranges that have rows -- path
-    None for a label in `skip` (label -> published URL), which is never
-    copied but is counted, and its count compared with the published
-    part's footer: a published part built from an older slice set does not
-    match what this build would write, and keeping it silently would leave
-    the year stale, so that stops the build naming both counts. Removes
-    the whole-year staged file once the copies exist so the disk never
-    holds the year twice on top of a sort spill. A row with no parseable
-    zone would land in no part; rather than publish a year that is quietly
-    short, the build stops on the first one."""
+    file. Returns ((label, path, rows) for the ranges that have rows, rows
+    dropped) -- path None for a label in `skip` (label -> published URL),
+    which is never copied but is counted, and its count compared with the
+    published part's footer: a published part built from an older slice
+    set does not match what this build would write, and keeping it
+    silently would leave the year stale, so that stops the build naming
+    both counts. Removes the whole-year staged file once the copies exist
+    so the disk never holds the year twice on top of a sort spill. A row
+    with no parseable zone would land in no part; rather than publish a
+    year that is quietly short, the build stops on the first one.
+
+    `partial` says `parts` is a --only-parts subset of the year's tier: the
+    rows of every other range are dropped on purpose, and their count is
+    logged and returned so the caller's row accounting still closes. Without
+    it the tier covers zones 1-60 and nothing is dropped."""
     lost = con.execute(
         f"SELECT count(*) FROM read_parquet('{staged}') "
         f"WHERE {ZONE_SQL} IS NULL OR {ZONE_SQL} NOT BETWEEN 1 AND 60"
@@ -436,6 +467,16 @@ def _stage_zone_parts(con, staged: Path, year: int,
             f"year={year}: {lost:,} row(s) with no UTM zone in "
             f"s2:mgrs_tile fall outside every zone part; refusing to "
             f"drop them")
+    dropped = 0
+    if partial:
+        kept = " OR ".join(f"{ZONE_SQL} BETWEEN {lo} AND {hi}"
+                           for _, lo, hi in parts)
+        dropped = con.execute(
+            f"SELECT count(*) FROM read_parquet('{staged}') "
+            f"WHERE NOT ({kept})").fetchone()[0]
+        say(f"year={year}: --only-parts "
+            f"{','.join(label for label, _, _ in parts)}: {dropped:,} row(s) "
+            f"of other zone ranges dropped")
     out = []
     for label, lo, hi in parts:
         name = f"{label}.parquet"
@@ -474,21 +515,24 @@ def _stage_zone_parts(con, staged: Path, year: int,
             f"{time.monotonic() - t0:,.1f}s")
         out.append((label, part_staged, n))
     staged.unlink()
-    return out
+    return out, dropped
 
 
 def build_year(con, files: list[str], year: int, outdir: Path,
                name: str = "items.parquet", memory: str = "8GB",
                split: str | None = None, skip_existing_url: str | None = None,
                on_part_done: list[str] | None = None,
-               probe=published_part, remote_rows=published_rows) -> tuple[int, int]:
+               probe=published_part, remote_rows=published_rows,
+               only_parts: tuple[str, ...] | None = None) -> tuple[int, int]:
     """Build one year. Returns (rows written, parts skipped as already
     published). With --split zones the parts are zone_parts_for(year); a
     year below ZONE_SPLIT_FROM has none and the split is refused rather
-    than silently written whole. `probe` (published_part) and `remote_rows`
-    (published_rows) are injectable for tests. A year whose every part is
-    published is skipped before staging, on the HEADs alone: the point of
-    the flag is that re-dispatching a finished year costs nothing."""
+    than silently written whole. `only_parts` narrows those to the named
+    labels (only_zone_parts) and the other ranges' rows are dropped.
+    `probe` (published_part) and `remote_rows` (published_rows) are
+    injectable for tests. A year whose every part is published is skipped
+    before staging, on the HEADs alone: the point of the flag is that
+    re-dispatching a finished year costs nothing."""
     lst = ",".join(f"'{f}'" for f in files)
     dest = outdir / f"year={year}"
     dest.mkdir(parents=True, exist_ok=True)
@@ -501,6 +545,10 @@ def build_year(con, files: list[str], year: int, outdir: Path,
             raise SystemExit(
                 f"--split zones: {year} is before {ZONE_SPLIT_FROM} and has "
                 f"no zone parts; it is published as one items.parquet")
+        if only_parts:
+            parts = only_zone_parts(year, parts, only_parts)
+    elif only_parts:
+        raise SystemExit("--only-parts applies to --split zones only")
     # Ask the bucket before staging anything: a year whose every part is
     # already up costs one HEAD per part and no minutes, and a rerun after a
     # timeout builds only what the last run did not finish uploading.
@@ -552,8 +600,10 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         # one's sort starts, so the peak is one range's spill plus the other
         # ranges waiting on disk, never a whole year's sort.
         written = skipped = 0
-        for part_label, part_staged, part_rows in _stage_zone_parts(
-                con, staged, year, parts, skip, remote_rows):
+        staged_parts, dropped = _stage_zone_parts(
+            con, staged, year, parts, skip, remote_rows,
+            partial=bool(only_parts))
+        for part_label, part_staged, part_rows in staged_parts:
             if part_staged is None:
                 skipped += part_rows
                 continue
@@ -565,10 +615,10 @@ def build_year(con, files: list[str], year: int, outdir: Path,
             if on_part_done:
                 run_part_hook(on_part_done, part_final, year)
             written += part_rows
-        if written + skipped != n:
+        if written + skipped + dropped != n:
             raise SystemExit(
                 f"year={year}: staged {n:,} rows but the zone parts hold "
-                f"{written + skipped:,}")
+                f"{written + skipped:,} and {dropped:,} were dropped")
     return written, len(skip)
 
 
@@ -588,6 +638,11 @@ def main() -> int:
                          f"of one --name file: {len(ZONE_PARTS)} parts from "
                          f"{ZONE_SPLIT_FROM}, {len(ZONE_PARTS_8)} from "
                          f"{ZONE_SPLIT_8_FROM} (zone_parts_for)")
+    ap.add_argument("--only-parts", metavar="LABEL[,LABEL...]",
+                    help="with --split zones: write only these parts of the "
+                         "year's tier and drop the rows of every other zone "
+                         "range (consolidate-month.yml builds one part per "
+                         "job this way)")
     ap.add_argument("--skip-existing-url", metavar="BASE",
                     help="HEAD BASE/year=YYYY/<part>.parquet before each "
                          "part; 200 skips it, 404 builds it, anything else "
@@ -600,6 +655,14 @@ def main() -> int:
     _row_group_size = a.row_group_size
     if a.split and a.name != "items.parquet":
         ap.error("--split zones names its own parts; --name does not apply")
+    only_parts = None
+    if a.only_parts is not None:
+        if a.split != "zones":
+            ap.error("--only-parts applies to --split zones only")
+        only_parts = tuple(dict.fromkeys(
+            label.strip() for label in a.only_parts.split(",") if label.strip()))
+        if not only_parts:
+            ap.error("--only-parts needs at least one part label")
     hook = shlex.split(a.on_part_done) if a.on_part_done else None
     if a.on_part_done and not hook:
         ap.error("--on-part-done needs a command")
@@ -623,7 +686,8 @@ def main() -> int:
     total = skipped = 0
     for y in years:
         rows, skips = build_year(con, files, y, outdir, a.name, a.memory,
-                                 a.split, a.skip_existing_url, hook)
+                                 a.split, a.skip_existing_url, hook,
+                                 only_parts=only_parts)
         total += rows
         skipped += skips
     print(f"TOTAL {total:,} rows across {len(years)} year(s)"

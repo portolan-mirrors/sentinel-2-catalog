@@ -537,6 +537,97 @@ def test_split_zones_refuses_a_year_with_no_parts():
             not list((Path(td) / "publish" / "year=2017").glob("*.parquet"))
 
 
+def _mk_octant_year(con, td: Path, per_zone=2):
+    """One chunk dir holding `per_zone` scenes in every zone 1..60 of the
+    first octant year. Returns (chunks, year, distinct ids)."""
+    year = ZONE_SPLIT_8_FROM
+    chunks = td / "chunks" / "api"
+    chunks.mkdir(parents=True)
+    _mk_zone_chunk(con, chunks / "a.parquet", list(range(1, 61)),
+                   per_zone=per_zone, year=year)
+    return chunks, year, 60 * per_zone
+
+
+def test_only_parts_writes_just_the_named_part():
+    """--only-parts z21-31 on a full octant year writes exactly that file:
+    its rows are exactly zones 21-31, sorted and passing `gpio check all`;
+    the other seven ranges' rows are dropped and the log names how many.
+    This is the per-part job of consolidate-month.yml."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks, year, distinct = _mk_octant_year(con, Path(td))
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks,
+                            ["--split", "zones", "--only-parts", "z21-31"],
+                            year=year)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        year_dir = out / f"year={year}"
+        assert [p.name for p in year_dir.iterdir()] == ["z21-31.parquet"]
+        part = year_dir / "z21-31.parquet"
+        rows = con.execute(
+            f'SELECT "s2:mgrs_tile", _month, _hilbert '
+            f"FROM read_parquet('{part}')").fetchall()
+        assert {_zone(r[0]) for r in rows} == set(range(21, 32))
+        assert len(rows) == 11 * 2
+        keys = [(r[1], r[2]) for r in rows]
+        assert keys == sorted(keys)
+        chk = subprocess.run(["gpio", "check", "all", str(part)],
+                             capture_output=True, text=True)
+        assert chk.returncode == 0, chk.stdout + chk.stderr
+        dropped = distinct - len(rows)
+        assert (f"--only-parts z21-31: {dropped:,} row(s) of other zone "
+                f"ranges dropped") in proc.stdout
+        assert f"TOTAL {len(rows):,} rows" in proc.stdout
+
+
+def test_only_parts_accepts_several_labels():
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks, year, distinct = _mk_octant_year(con, Path(td))
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks,
+                            ["--split", "zones", "--only-parts",
+                             "z53-60,z01-15"], year=year)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert sorted(p.name for p in (out / f"year={year}").iterdir()) == \
+            ["z01-15.parquet", "z53-60.parquet"]
+        assert f"{distinct - (15 + 8) * 2:,} row(s) of other zone ranges" \
+            in proc.stdout
+
+
+def test_only_parts_refuses_a_label_outside_the_tier():
+    """A quartile label on an octant year is not a part of that year. The
+    refusal names every label that is, so the caller can fix the call."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks, year, _ = _mk_octant_year(con, Path(td), per_zone=1)
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks,
+                            ["--split", "zones", "--only-parts", "z01-20"],
+                            year=year)
+        assert proc.returncode != 0
+        assert "z01-20" in proc.stderr
+        for label in OCTANT_LABELS:
+            assert label in proc.stderr, label
+        assert not list((out / f"year={year}").glob("*.parquet"))
+
+
+def test_only_parts_needs_split_zones():
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks, year, _ = _mk_octant_year(con, Path(td), per_zone=1)
+        out = Path(td) / "publish"
+        proc = _build_split(out, chunks, ["--only-parts", "z01-15"],
+                            year=year)
+        assert proc.returncode != 0
+        assert "--only-parts" in proc.stderr and "--split zones" in proc.stderr
+        assert not (out / f"year={year}").exists()
+
+
 class _Bucket:
     """A stand-in for the bucket's public base, serving `root` (a directory
     holding year=YYYY/<part>.parquet, or None for an empty bucket) so
