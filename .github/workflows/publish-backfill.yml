@@ -318,19 +318,19 @@ jobs:
 
       # make_items.py/make_collection.py only consider a year "staged" (and
       # so worth --remote-baseline probing) when its year=YYYY directory
-      # exists under --data-dir; they need no bytes in it. A year with
-      # nothing published (2015/2016 mostly) is discovered as having no
-      # parts and skipped -- see discover()'s ABSENT case.
-      - name: Stage empty year markers for every planned year
-        env:
-          YEARS: ${{ needs.plan.outputs.years }}
+      # exists under --data-dir; they need no bytes in it. Stage EVERY
+      # year from the first Sentinel-2 year to now, not just this run's
+      # planned years: a chain of one-year publishes otherwise leaves the
+      # committed baseline (and the live collection) describing only the
+      # last run's years -- it happened twice. A year with nothing
+      # published is discovered as having no parts and skipped, see
+      # discover()'s ABSENT case, so over-staging costs a few HEADs.
+      - name: Stage empty year markers for every year of the mission
         run: |
           set -euo pipefail
-          python3 -c '
-          import json, os
-          for y in json.loads(os.environ["YEARS"]):
-              os.makedirs(f"staging/publish/sentinel-2-l2a/year={y}", exist_ok=True)
-          '
+          for y in $(seq 2015 "$(date -u +%Y)"); do
+            mkdir -p "staging/publish/sentinel-2-l2a/year=$y"
+          done
 
       - name: Regenerate items and the collection from the published parts
         run: |
