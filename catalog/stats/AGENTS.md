@@ -25,7 +25,7 @@ that tile's scene footprints, not the true MGRS grid cell.
 
 ```sql
 SELECT year, month, scene_count, min_cloud_cover, median_cloud_cover,
-       best_item_id, best_item_datetime
+       best_item_id, best_item_datetime, mean_cover, max_cover
 FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/stats/mgrs-monthly.parquet')
 WHERE mgrs_tile = '31UFU'
 ORDER BY year, month;
@@ -40,8 +40,19 @@ filtered by tile, not globbed by year.
 
 `mgrs_tile VARCHAR, year SMALLINT, month TINYINT, scene_count INTEGER,
 min_cloud_cover DOUBLE, median_cloud_cover DOUBLE, best_item_id VARCHAR,
-best_item_datetime TIMESTAMPTZ`. The collection's `table:columns` carries a
-description per column; that is the authority.
+best_item_datetime TIMESTAMPTZ, mean_cover DOUBLE, max_cover DOUBLE`. The
+collection's `table:columns` carries a description per column; that is the
+authority.
+
+`mean_cover`/`max_cover` are the mean and maximum over the tile-month's
+scenes of `100 - s2:nodata_pixel_percentage` — the percent of the MGRS tile
+a scene actually fills (an orbit-edge sliver is 5 %, a full tile 100 %).
+Both skip a NULL `s2:nodata_pixel_percentage` and are NULL when every scene
+of the tile-month lacks it. They are also NULL for every row written before
+the columns existed: the daily merge carries an older `mgrs-monthly.parquet`
+forward with `NULL` in these two columns rather than recomputing it, so
+until the next full rebuild only the recomputed year has values. A client
+must feature-detect the columns (`DESCRIBE`) — the file may predate them.
 
 `best_item_id`/`best_item_datetime` name the scene with the lowest
 `eo:cloud_cover` for that tile and month — look it up in `sentinel-2-l2a` by

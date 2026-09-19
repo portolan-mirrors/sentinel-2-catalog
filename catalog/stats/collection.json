@@ -9,7 +9,7 @@
   ],
   "id": "stats",
   "title": "MGRS coverage and cloud statistics",
-  "description": "One row per MGRS tile per month, aggregated from the `sentinel-2-l2a` item index: scene count, minimum and median cloud cover, and the least-cloudy scene of the month. This is the timeline/choropleth backend for the explorer app and the cheap first stop for \"which month has a cloud-free scene here\" -- no need to scan the full item archive to answer it. A companion PMTiles carries one polygon per MGRS tile (the envelope of that tile's scene footprints) so the app can join tile-month statistics onto a fixed geometry by `mgrs_tile` without the tileset ever changing on a daily stat refresh. Scenes whose bbox spans more than 20 degrees of longitude (antimeridian wraps) are excluded from the footprint polygons only; they are still counted in the monthly statistics. Generated from a pilot slice of the mirrored archive (two days, 2026-09-12 to 2026-09-13) while the full historical backfill runs; both products are refreshed as more of the archive lands. Contains modified Copernicus Sentinel data.",
+  "description": "One row per MGRS tile per month, aggregated from the `sentinel-2-l2a` item index: scene count, minimum and median cloud cover, the least-cloudy scene of the month, and the mean and maximum percent of the tile its scenes fill (from `s2:nodata_pixel_percentage`; NULL in rows written before those columns existed). This is the timeline/choropleth backend for the explorer app and the cheap first stop for \"which month has a cloud-free scene here\" -- no need to scan the full item archive to answer it. A companion PMTiles carries one polygon per MGRS tile (the envelope of that tile's scene footprints) so the app can join tile-month statistics onto a fixed geometry by `mgrs_tile` without the tileset ever changing on a daily stat refresh. Scenes whose bbox spans more than 20 degrees of longitude (antimeridian wraps) are excluded from the footprint polygons only; they are still counted in the monthly statistics. Generated from a pilot slice of the mirrored archive (two days, 2026-09-12 to 2026-09-13) while the full historical backfill runs; both products are refreshed as more of the archive lands. Contains modified Copernicus Sentinel data.",
   "license": "CC-BY-SA-3.0-IGO",
   "keywords": [
     "sentinel-2",
@@ -110,6 +110,16 @@
       "name": "best_item_datetime",
       "type": "timestamp[us, tz=UTC]",
       "description": "Acquisition datetime of best_item_id."
+    },
+    {
+      "name": "mean_cover",
+      "type": "double",
+      "description": "Mean over the tile-month's scenes of 100 - s2:nodata_pixel_percentage: the average percent of the MGRS tile a scene fills. Skips NULL nodata values; NULL when none of the scenes carry one, and NULL for rows written before this column existed."
+    },
+    {
+      "name": "max_cover",
+      "type": "double",
+      "description": "Maximum over the tile-month's scenes of 100 - s2:nodata_pixel_percentage: the largest percent of the MGRS tile any one scene fills (100 = at least one full-tile scene). NULL under the same conditions as mean_cover."
     }
   ],
   "table:row_count": 21040,

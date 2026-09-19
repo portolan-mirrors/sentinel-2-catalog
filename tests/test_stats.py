@@ -1,8 +1,10 @@
 """Aggregate a synthetic two-tile fixture and verify counts, medians,
-best-item selection (including cloud-cover ties), the merge path used by
-the daily refresh, the antimeridian exclusion from footprint polygons (and
-that the same scene is still counted in the stats table), and the real
-PMTiles archive gpio/tippecanoe produce.
+best-item selection (including cloud-cover ties), the percent-cover
+columns (mean_cover/max_cover from s2:nodata_pixel_percentage, NULL-safe
+and tolerant of sources and merge targets that lack them), the merge path
+used by the daily refresh, the antimeridian exclusion from footprint
+polygons (and that the same scene is still counted in the stats table), and
+the real PMTiles archive gpio/tippecanoe produce.
 """
 import json
 import subprocess
@@ -77,6 +79,96 @@ def test_cloud_cover_tie_is_one_scene():
         assert best_dt == lookup[best_id], (
             "best_item_id and best_item_datetime must describe the same "
             "tied scene")
+
+
+def test_percent_cover_mean_and_max():
+    """mean_cover is the average of 100 - s2:nodata_pixel_percentage over
+    the tile-month's scenes and max_cover its maximum: nodata 0 / 40 / 100
+    gives cover 100 / 60 / 0, so mean 53.33 and max 100. A NULL nodata is
+    skipped by both (the second tile: NULL and 25 -> mean 75, max 75), and a
+    tile whose scenes all lack it gets NULL, not 0 or 100."""
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'; INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            ('A1', TIMESTAMPTZ '2024-05-01 10:00:00+00', '31UFU', 80.0, 0.0,  ST_Point(4, 52)),
+            ('A2', TIMESTAMPTZ '2024-05-11 10:00:00+00', '31UFU', 10.0, 40.0, ST_Point(4, 52)),
+            ('A3', TIMESTAMPTZ '2024-05-21 10:00:00+00', '31UFU', 40.0, 100.0, ST_Point(4, 52)),
+            ('B1', TIMESTAMPTZ '2024-06-01 10:00:00+00', '32UMV', 5.0,  NULL, ST_Point(9, 51)),
+            ('B2', TIMESTAMPTZ '2024-06-02 10:00:00+00', '32UMV', 7.0,  25.0, ST_Point(9, 51)),
+            ('C1', TIMESTAMPTZ '2024-06-03 10:00:00+00', '33UVP', 9.0,  NULL, ST_Point(14, 50))
+          ) t(id, datetime, "s2:mgrs_tile", "eo:cloud_cover",
+              "s2:nodata_pixel_percentage", geometry)
+          ) TO '{src}' (FORMAT PARQUET)
+        """)
+        _run([src], out)
+        rows = {r[0]: r[1:] for r in con.execute(f"""
+            SELECT mgrs_tile, scene_count, mean_cover, max_cover
+            FROM read_parquet('{out}/mgrs-monthly.parquet')""").fetchall()}
+        n, mean, mx = rows["31UFU"]
+        assert n == 3
+        assert abs(mean - (100 + 60 + 0) / 3) < 1e-9, mean
+        assert mx == 100.0
+        n, mean, mx = rows["32UMV"]
+        assert n == 2, "the NULL-nodata scene is still counted"
+        assert mean == 75.0 and mx == 75.0, "NULL nodata is skipped, not zeroed"
+        assert rows["33UVP"] == (1, None, None), "all-NULL nodata -> NULL cover"
+        types = dict((r[0], r[1]) for r in con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{out}/mgrs-monthly.parquet')").fetchall())
+        assert types["mean_cover"] == "DOUBLE" and types["max_cover"] == "DOUBLE"
+
+
+def test_percent_cover_absent_from_source_is_null():
+    """A source with no s2:nodata_pixel_percentage column at all (the older
+    fixtures in this file) still aggregates, with both cover columns present
+    and NULL -- the schema is fixed, the values are not."""
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'; INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        _fixture(con, src)
+        _run([src], out)
+        rows = con.execute(f"""
+            SELECT mgrs_tile, mean_cover, max_cover
+            FROM read_parquet('{out}/mgrs-monthly.parquet') ORDER BY 1""").fetchall()
+        assert rows == [("31UFU", None, None), ("32UMV", None, None)]
+
+
+def test_merge_into_existing_without_cover_columns():
+    """The daily merge reads the published stats file, which will not have
+    the cover columns until the next full rebuild: untouched years come
+    through with NULL cover, the recomputed year with real values."""
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'; INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        existing = Path(td) / "old-stats.parquet"
+        con.execute(f"""
+          COPY (SELECT 'P1' AS best_item_id, '10ABC' AS mgrs_tile,
+                       2023::SMALLINT AS year, 3::TINYINT AS month,
+                       1::INTEGER AS scene_count, 20.0 AS min_cloud_cover,
+                       20.0 AS median_cloud_cover,
+                       TIMESTAMPTZ '2023-03-01 00:00:00+00' AS best_item_datetime
+          ) TO '{existing}' (FORMAT PARQUET)
+        """)
+        new_src = Path(td) / "new2024.parquet"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            ('Q2', TIMESTAMPTZ '2024-03-10 00:00:00+00', '20XYZ', 1.0, 30.0, ST_Point(2, 2))
+          ) t(id, datetime, "s2:mgrs_tile", "eo:cloud_cover",
+              "s2:nodata_pixel_percentage", geometry)
+          ) TO '{new_src}' (FORMAT PARQUET)
+        """)
+        merged_out = Path(td) / "merged_stats"
+        subprocess.run([sys.executable, "tools/s2_stats.py",
+                        "--sources", str(new_src), "--out", str(merged_out),
+                        "--merge-years", "2024", "--existing", str(existing)],
+                       check=True, cwd=ROOT)
+        rows = con.execute(f"""
+            SELECT mgrs_tile, year, scene_count, mean_cover, max_cover
+            FROM read_parquet('{merged_out}/mgrs-monthly.parquet') ORDER BY 1""").fetchall()
+        assert rows == [("10ABC", 2023, 1, None, None), ("20XYZ", 2024, 1, 70.0, 70.0)]
 
 
 def test_merge_replaces_only_named_years():

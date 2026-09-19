@@ -4,10 +4,13 @@ Two products, generated from the `sentinel-2-l2a` item index by
 `tools/s2_stats.py`, meant to be joined by `mgrs_tile`:
 
 - **`mgrs-monthly.parquet`** -- one row per MGRS tile per month: scene
-  count, minimum and median `eo:cloud_cover`, and the id/datetime of that
-  tile-month's least-cloudy scene. This is the cheap first stop for "which
-  month has a cloud-free scene here", and the timeline/choropleth data
-  source for the explorer app.
+  count, minimum and median `eo:cloud_cover`, the id/datetime of that
+  tile-month's least-cloudy scene, and the mean and maximum percent of the
+  tile its scenes fill (`mean_cover`/`max_cover`, from
+  `100 - s2:nodata_pixel_percentage`; NULL for rows written before the
+  columns existed). This is the cheap first stop for "which month has a
+  cloud-free scene here", and the timeline/choropleth data source for the
+  explorer app.
 - **`mgrs.pmtiles`** -- one polygon per MGRS tile, on the vector layer
   `mgrs` with an `mgrs_tile` attribute, generated with `gpio pmtiles create`
   (tippecanoe underneath). The polygon is the envelope of that tile's scene
@@ -28,7 +31,7 @@ data-quality filter.
 ## Query it
 
 ```sql
-SELECT year, month, scene_count, min_cloud_cover, best_item_id
+SELECT year, month, scene_count, min_cloud_cover, max_cover, best_item_id
 FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/stats/mgrs-monthly.parquet')
 WHERE mgrs_tile = '31UFU'
 ORDER BY year, month;

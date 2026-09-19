@@ -2,7 +2,9 @@
 """MGRS tile x month aggregates, and (optionally) the tile-footprint PMTiles.
 
 The stats table is the timeline/choropleth backend for the explorer app and
-the cheap first stop for "which month has a cloud-free scene here". The
+the cheap first stop for "which month has a cloud-free scene here" -- and,
+via mean_cover/max_cover (100 - s2:nodata_pixel_percentage), "how much of
+the tile did those scenes actually fill". The
 PMTiles carries geometry only (envelope of each tile's item bboxes); the app
 joins stats to tiles by mgrs_tile, so daily stat refreshes never touch the
 tileset. Scenes whose bbox spans >20 degrees of longitude (antimeridian
@@ -47,7 +49,7 @@ def _sources_sql(sources: list[str]) -> str:
 STATS_SQL = """
   SELECT mgrs_tile, year, month, scene_count, min_cloud_cover,
          median_cloud_cover, best.id AS best_item_id,
-         best.dt AS best_item_datetime
+         best.dt AS best_item_datetime, mean_cover, max_cover
   FROM (
     SELECT "s2:mgrs_tile" AS mgrs_tile,
            year(datetime)::SMALLINT AS year,
@@ -55,6 +57,10 @@ STATS_SQL = """
            count(*)::INTEGER AS scene_count,
            min("eo:cloud_cover") AS min_cloud_cover,
            median("eo:cloud_cover") AS median_cloud_cover,
+           -- Percent of the tile a scene fills: 100 - s2:nodata_pixel_percentage.
+           -- avg/max skip NULLs, so a scene without the property neither
+           -- drags the mean down nor caps the max; all-NULL gives NULL.
+           {cover_sql}
            -- A single arg_min over a packed struct, not two independent
            -- arg_min calls. Two independent arg_min(id, cc) / arg_min(dt, cc)
            -- calls can each break a cloud-cover tie differently and return
@@ -70,10 +76,44 @@ STATS_SQL = """
 """
 
 
+COVER_COLUMNS = ("mean_cover", "max_cover")
+NODATA_COLUMN = "s2:nodata_pixel_percentage"
+
+
+def _columns(con, relation_sql: str) -> set[str]:
+    return {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {relation_sql}").fetchall()}
+
+
+def cover_sql(con, files: str) -> str:
+    """The mean_cover / max_cover aggregate expressions for these sources.
+
+    Real item parts always carry s2:nodata_pixel_percentage, but a source
+    without it (a minimal fixture, an older export) must still aggregate:
+    both columns are then NULL rather than a failed read.
+    """
+    if NODATA_COLUMN in _columns(con, f"read_parquet([{files}], union_by_name=true)"):
+        return (f'avg(100 - "{NODATA_COLUMN}")::DOUBLE AS mean_cover, '
+                f'max(100 - "{NODATA_COLUMN}")::DOUBLE AS max_cover,')
+    return "NULL::DOUBLE AS mean_cover, NULL::DOUBLE AS max_cover,"
+
+
+def existing_cover_sql(con, existing: str) -> str:
+    """The cover columns of the table being merged into.
+
+    The published stats file predates the coverage columns until the next full
+    rebuild; the daily merge must read it without them and leave those rows
+    NULL, not fail.
+    """
+    have = _columns(con, f"read_parquet('{existing}')")
+    return ", ".join(f"{c}::DOUBLE AS {c}" if c in have else f"NULL::DOUBLE AS {c}"
+                     for c in COVER_COLUMNS)
+
+
 def build_stats(con, sources, out: Path, merge_years=None, existing=None):
     out.mkdir(parents=True, exist_ok=True)
     files = _sources_sql(sources)
     dest = out / "mgrs-monthly.parquet"
+    cover = cover_sql(con, files)
     if merge_years:
         yrs = ",".join(str(y) for y in merge_years)
         con.execute(f"""
@@ -85,18 +125,19 @@ def build_stats(con, sources, out: Path, merge_years=None, existing=None):
                    min_cloud_cover::DOUBLE AS min_cloud_cover,
                    median_cloud_cover::DOUBLE AS median_cloud_cover,
                    best_item_id::VARCHAR AS best_item_id,
-                   best_item_datetime::TIMESTAMPTZ AS best_item_datetime
+                   best_item_datetime::TIMESTAMPTZ AS best_item_datetime,
+                   {existing_cover_sql(con, existing)}
             FROM read_parquet('{existing}')
             WHERE year NOT IN ({yrs})
             UNION ALL BY NAME
-            {STATS_SQL.format(files=files,
+            {STATS_SQL.format(files=files, cover_sql=cover,
                               where=f'WHERE year(datetime) IN ({yrs})')}
             ORDER BY mgrs_tile, year, month
           ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd)
         """)
     else:
         con.execute(f"""
-          COPY ({STATS_SQL.format(files=files, where='')}
+          COPY ({STATS_SQL.format(files=files, cover_sql=cover, where='')}
                 ORDER BY mgrs_tile, year, month)
           TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd)
         """)
