@@ -4,14 +4,26 @@
 //   sentinel-2-l2a/year=*/…     – item queries (Task 12; one part per year
 //                                 by the tile's UTM zone from 2019, Task 18;
 //                                 eight parts from 2021, Task 19)
+//   …/TCI.tif                   – a scene's visual COG, drawn on the map
+//                                 straight from its overviews (Task 20)
 // There is no API, no server and no database behind this page: DuckDB-WASM
-// issues HTTP range reads straight at the object store.
+// issues HTTP range reads straight at the object store, and so do the COG
+// reads. The map is MapLibre for the camera; the tiles are drawn by deck.gl
+// interleaved into the same canvas (Task 20), because MapLibre's per-feature
+// state and filter changes re-parse the 33k-polygon tile on every update.
 import maplibregl from "https://esm.sh/maplibre-gl@4.7.1";
-import { Protocol } from "https://esm.sh/pmtiles@3.2.0";
+import { PMTiles, Protocol } from "https://esm.sh/pmtiles@3.2.0";
 // 1.32.0 (DuckDB v1.4.3) is a floor, not a preference: the item parts are
 // GeoParquet 2.0.0, and 1.29.0 (DuckDB v1.1.1) refuses them outright with
 // "Geoparquet version 2.0.0 is not supported".
 import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
+import { parse } from "https://esm.sh/@loaders.gl/core@4.5.1";
+import { MVTLoader } from "https://esm.sh/@loaders.gl/mvt@4.5.1";
+import { openCog, cogTileLayer } from "./cog.js";
+import { dayRange } from "./rangeslider.js";
+// deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
+// transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
+const { MapboxOverlay, GeoJsonLayer, MVTLayer } = window.deck;
 
 // ?base=http://localhost:8081 points the whole app at a local publish tree,
 // which is how it is developed before the bucket is populated.
@@ -19,7 +31,12 @@ export const BASE = new URLSearchParams(location.search).get("base")
   ?? "https://data.source.coop/portolan-mirrors/sentinel-2-catalog";
 
 const STATS = `${BASE}/stats/mgrs-monthly.parquet`;
-// Only these three may reach the SQL string; the <select> is not trusted input.
+// The stats file is fetched once, whole, and registered with DuckDB under
+// this name: it is sorted by tile, so any month's rows are spread across
+// every row group and a range-read per month would re-fetch most of it.
+const STATS_FILE = "mgrs-monthly.parquet";
+// Only these may reach the SQL string; the <select> is not trusted input.
+// `max_cover` is added once the stats file is known to carry it (Task 20).
 const METRICS = new Set(["min_cloud_cover", "scene_count", "median_cloud_cover"]);
 
 const $ = (id) => document.getElementById(id);
@@ -36,6 +53,11 @@ async function initDb() {
     [`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" })));
   const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING), worker);
   await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  // Measured, not assumed: duckdb-wasm 1.32.0 defaults forceFullHTTPReads to
+  // true, so a query against a 573 MB year part downloaded the whole file
+  // (162 s) instead of range-reading the ~5 MB it needed. With the flag off
+  // the same query is ~30 range GETs. Nothing else about the FS is changed.
+  await db.open({ filesystem: { forceFullHTTPReads: false } });
   return db;
 }
 
@@ -54,13 +76,14 @@ const mapReady = new Promise((resolve) => map.on("load", resolve));
 
 const db = await initDb();
 const conn = await db.connect();
-// `map` is extra, but a console handle to it saves reaching into the module.
+// A console handle saves reaching into the module; the deck.gl overlay and
+// the per-month lookup are added below once they exist.
 window.S2 = { BASE, db, conn, map };
 
-// The choropleth ramp, shared by the map paint expression, the legend and the
-// timeline bars so one colour always means one thing.
+// The choropleth ramp, shared by the map fill, the legend and the timeline
+// bars so one colour always means one thing.
 const RAMP = [[0, "#1a9850"], [25, "#fee08b"], [60, "#d73027"], [100, "#4d0013"]];
-const rampColor = (v) => {
+const rampRGB = (v) => {
   const x = Math.min(100, Math.max(0, Number(v)));
   for (let i = 1; i < RAMP.length; i++) {
     const [a, ca] = RAMP[i - 1], [b, cb] = RAMP[i];
@@ -68,55 +91,275 @@ const rampColor = (v) => {
     const t = (x - a) / (b - a);
     const mix = (j) => Math.round(parseInt(ca.slice(1 + j, 3 + j), 16) * (1 - t)
       + parseInt(cb.slice(1 + j, 3 + j), 16) * t);
-    return `rgb(${mix(0)},${mix(2)},${mix(4)})`;
+    return [mix(0), mix(2), mix(4)];
   }
-  return RAMP[RAMP.length - 1][1];
+  const c = RAMP[RAMP.length - 1][1];
+  return [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)];
 };
+const rampColor = (v) => `rgb(${rampRGB(v).join(",")})`;
+// 33k fills per repaint: a 101-entry lookup instead of 33k interpolations.
+const FILL_ALPHA = 140;                          // fill-opacity 0.55, as before
+const RAMP_LUT = Array.from({ length: 101 }, (_, i) => [...rampRGB(i), FILL_ALPHA]);
+const UNPAINTED = [34, 34, 51, FILL_ALPHA];       // #223: no stats for the month
+const DIMMED = [70, 78, 96, 70];                  // clearest scene over the slider
+const HOVER_LINE = [232, 240, 255, 255];          // #e8f0ff
 
 await mapReady;
 
-map.addSource("mgrs", {
-  type: "vector", url: `pmtiles://${BASE}/stats/mgrs.pmtiles`,
-  promoteId: "mgrs_tile",
-});
-map.addLayer({
-  id: "mgrs-fill", type: "fill", source: "mgrs", "source-layer": "mgrs",
-  paint: {
-    "fill-color": ["case", ["!=", ["feature-state", "v"], null],
-      ["interpolate", ["linear"], ["feature-state", "v"],
-        ...RAMP.flat()],
-      "#223"],
-    "fill-opacity": 0.55,
-  },
-});
+// ---------------------------------------------------------------------------
+// The MGRS choropleth. The fills are drawn by deck.gl: the footprints come
+// out of the same PMTiles archive as before, and the colour of each tile is
+// looked up in a Map rebuilt per month from the stats query. A month change,
+// a metric change or a slider drag bumps `paintKey`, and deck.gl recomputes
+// one colour attribute for the 33k polygons and uploads it — no per-feature
+// state, no filter change, no tile re-parse. The outlines stay a MapLibre
+// line layer: nothing ever changes on it, so its tile is parsed once, and a
+// deck.gl PathLayer of the same 33k outlines was measured at 0.5-0.9 s a
+// frame under software GL where MapLibre's lines take a few ms. The fills
+// are slotted beneath it with beforeId.
+// ---------------------------------------------------------------------------
+map.addSource("mgrs", { type: "vector", url: `pmtiles://${BASE}/stats/mgrs.pmtiles` });
 map.addLayer({ id: "mgrs-line", type: "line", source: "mgrs",
   "source-layer": "mgrs",
   paint: { "line-color": "#8899bb", "line-width": 0.4 } });
-map.addLayer({ id: "mgrs-hover", type: "line", source: "mgrs",
-  "source-layer": "mgrs", filter: ["==", ["get", "mgrs_tile"], ""],
-  paint: { "line-color": "#e8f0ff", "line-width": 1.6 } });
-map.on("mousemove", "mgrs-fill", (e) => {
-  map.getCanvas().style.cursor = "pointer";
-  map.setFilter("mgrs-hover", ["==", ["get", "mgrs_tile"], e.features[0].properties.mgrs_tile]);
+const archive = new PMTiles(`${BASE}/stats/mgrs.pmtiles`);
+let tileZoom = { minZoom: 0, maxZoom: 0 };
+try {
+  const h = await archive.getHeader();
+  tileZoom = { minZoom: h.minZoom, maxZoom: h.maxZoom };
+} catch (err) {
+  say(`Could not open ${BASE}/stats/mgrs.pmtiles — ${err.message}`, true);
+}
+// MVTLayer asks for "{z}/{x}/{y}" of its data template; the bytes come from
+// the PMTiles archive (one range read per tile, cached by the library) and
+// are parsed on this thread with loaders.gl's MVTLoader, using the options
+// the layer hands over (binary output, local tile coordinates). The layer's
+// own default loader is worker-only, which is why it is not used here. The
+// parsed polygons also feed the hit-test index below.
+async function fetchMvt(url, { loadOptions, signal }) {
+  const [z, x, y] = url.split("/").slice(-3).map(Number);
+  if (![z, x, y].every(Number.isInteger)) throw new Error(`bad tile key ${url}`);
+  const t = await archive.getZxy(z, x, y, signal);
+  if (!t?.data) return null;
+  const data = await parse(t.data, MVTLoader, { ...loadOptions, worker: false });
+  if (data?.polygons) hitIndex.add(data.polygons, z, x, y);
+  return data;
+}
+
+// Which tile is under the pointer, answered on the CPU. deck.gl's own picking
+// re-renders every pickable polygon into a picking buffer and reads it back
+// each frame the pointer moves; on a real GPU that is a few ms, under a
+// software GL it was measured at ~0.8 s per frame. A point-in-polygon test
+// against the same decoded geometry, through a 2-degree grid of polygon
+// bounding boxes, is microseconds anywhere — so the choropleth is not
+// pickable at all, and MapLibre's mousemove/click events drive hover and
+// selection.
+const hitIndex = {
+  cell: 2,                       // degrees
+  grid: new Map(),               // "cx,cy" -> [polygon ids]
+  polys: [],                     // {tile, rings: [[lon, lat, ...]], bbox}
+  add(polygons, z, tx, ty) {
+    const { positions, polygonIndices, primitivePolygonIndices, featureIds, properties } = polygons;
+    const P = positions.value, size = positions.size;
+    const n = 2 ** z;
+    // Local tile coordinates (0..1, y down) to lon/lat.
+    const lon = (u) => ((tx + u) / n) * 360 - 180;
+    const lat = (v) => (Math.atan(Math.sinh(Math.PI * (1 - (2 * (ty + v)) / n))) * 180) / Math.PI;
+    const ringStarts = primitivePolygonIndices.value;
+    let r = 0;
+    for (let p = 0; p < polygonIndices.value.length - 1; p++) {
+      const start = polygonIndices.value[p], end = polygonIndices.value[p + 1];
+      const tile = properties[featureIds.value[start]]?.mgrs_tile;
+      const rings = [];
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      while (r < ringStarts.length - 1 && ringStarts[r] < end) {
+        const a = ringStarts[r], b = Math.min(ringStarts[r + 1], end);
+        const ring = new Float64Array((b - a) * 2);
+        for (let i = a, k = 0; i < b; i++, k += 2) {
+          const X = lon(P[i * size]), Y = lat(P[i * size + 1]);
+          ring[k] = X; ring[k + 1] = Y;
+          if (X < x0) x0 = X; if (X > x1) x1 = X; if (Y < y0) y0 = Y; if (Y > y1) y1 = Y;
+        }
+        rings.push(ring);
+        r++;
+      }
+      if (!tile || !rings.length) continue;
+      const id = this.polys.push({ tile, rings, bbox: [x0, y0, x1, y1] }) - 1;
+      for (let cx = Math.floor(x0 / this.cell); cx <= Math.floor(x1 / this.cell); cx++) {
+        for (let cy = Math.floor(y0 / this.cell); cy <= Math.floor(y1 / this.cell); cy++) {
+          const key = `${cx},${cy}`;
+          const list = this.grid.get(key);
+          if (list) list.push(id); else this.grid.set(key, [id]);
+        }
+      }
+    }
+  },
+  // The topmost (last drawn) polygon containing the point, or null.
+  at(lng, lat) {
+    const list = this.grid.get(`${Math.floor(lng / this.cell)},${Math.floor(lat / this.cell)}`);
+    if (!list) return null;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const poly = this.polys[list[i]];
+      const [x0, y0, x1, y1] = poly.bbox;
+      if (lng < x0 || lng > x1 || lat < y0 || lat > y1) continue;
+      // Even-odd over every ring: holes cancel, multipolygon parts add.
+      let inside = false;
+      for (const ring of poly.rings) {
+        for (let a = 0, b = ring.length - 2; a < ring.length; b = a, a += 2) {
+          const ax = ring[a], ay = ring[a + 1], bx = ring[b], by = ring[b + 1];
+          if ((ay > lat) !== (by > lat) && lng < ((bx - ax) * (lat - ay)) / (by - ay) + ax) inside = !inside;
+        }
+      }
+      if (inside) return poly;
+    }
+    return null;
+  },
+  // The polygon as a GeoJSON feature, for the hover outline.
+  feature(poly) {
+    return { type: "Feature", properties: { mgrs_tile: poly.tile },
+      geometry: { type: "Polygon", coordinates: poly.rings.map((ring) => {
+        const out = [];
+        for (let i = 0; i < ring.length; i += 2) out.push([ring[i], ring[i + 1]]);
+        return out;
+      }) } };
+  },
+};
+
+// Per-tile stats for the shown month: mgrs_tile -> {v: 0..100 on the ramp,
+// cc: clearest scene's cloud %}. `v` is already rescaled per metric.
+let lookup = new Map();
+let paintKey = 0;
+let maxCloud = Number($("maxcloud").value);
+let hovered = null;          // the hovered feature (GeoJSON, WGS84) or null
+let cogLayer = null;         // the shown scene's TileLayer, or null
+let selectedTile = null;
+
+function fillColor(f) {
+  const s = lookup.get(f.properties.mgrs_tile);
+  if (!s) return UNPAINTED;
+  if (s.cc > maxCloud) return DIMMED;
+  return RAMP_LUT[Math.round(s.v)];
+}
+
+const overlay = new MapboxOverlay({
+  interleaved: true,
+  layers: [],
+  // deck.gl resets the canvas cursor after every pointer frame; the hover
+  // state below is the one source of truth for it.
+  getCursor: () => (hovered ? "pointer" : ""),
 });
-map.on("mouseleave", "mgrs-fill", () => {
-  map.getCanvas().style.cursor = "";
-  map.setFilter("mgrs-hover", ["==", ["get", "mgrs_tile"], ""]);
+map.addControl(overlay);
+Object.defineProperties(window.S2, {
+  overlay: { value: overlay },
+  hitIndex: { value: hitIndex },
+  lookup: { get: () => lookup },
+  selectedTile: { get: () => selectedTile },
 });
+
+function render() {
+  overlay.setProps({ layers: [
+    new MVTLayer({
+      id: "mgrs",
+      data: "mgrs/{z}/{x}/{y}",     // a key for fetchMvt, never fetched as a URL
+      fetch: fetchMvt,
+      minZoom: tileZoom.minZoom,
+      maxZoom: tileZoom.maxZoom,
+      binary: true,
+      pickable: false,           // hit-tested on the CPU, see hitIndex
+      filled: true,
+      stroked: false,            // the outline is MapLibre's mgrs-line
+      getFillColor: fillColor,
+      updateTriggers: { getFillColor: paintKey },
+      beforeId: "mgrs-line",
+    }),
+    cogLayer,
+    new GeoJsonLayer({
+      id: "mgrs-hover",
+      data: hovered ? [hovered] : [],
+      stroked: true,
+      filled: false,
+      getLineColor: HOVER_LINE,
+      lineWidthUnits: "pixels",
+      getLineWidth: 1.6,
+      lineWidthMinPixels: 1.6,
+    }),
+  ] });
+}
+
+function setHovered(poly) {
+  const tile = poly?.tile ?? null;
+  if (tile === (hovered?.properties?.mgrs_tile ?? null)) return;
+  hovered = poly ? hitIndex.feature(poly) : null;
+  map.getCanvas().style.cursor = hovered ? "pointer" : "";
+  render();
+}
+// One hit test per animation frame at most, however fast the pointer moves.
+let hoverFrame = 0, hoverAt = null;
+map.on("mousemove", (e) => {
+  hoverAt = e.lngLat;
+  if (hoverFrame) return;
+  hoverFrame = requestAnimationFrame(() => {
+    hoverFrame = 0;
+    setHovered(hoverAt ? hitIndex.at(hoverAt.lng, hoverAt.lat) : null);
+  });
+});
+map.on("mouseout", () => { hoverAt = null; setHovered(null); });
+
+function repaint() { paintKey++; render(); }
+render();
+
+// ---------------------------------------------------------------------------
+// Stats: the choropleth and the timeline.
+// ---------------------------------------------------------------------------
+
+// The stats file, fetched whole with a progress line and handed to DuckDB as
+// an in-memory file. See STATS_FILE for why not a range read per month.
+async function loadStats() {
+  const res = await fetch(STATS);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const total = Number(res.headers.get("content-length")) || 0;
+  const mb = (n) => (n / 1e6).toFixed(1);
+  const chunks = [];
+  let got = 0, shown = 0;
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    if (performance.now() - shown > 150) {
+      shown = performance.now();
+      say(`Reading the stats file… ${mb(got)}${total ? ` of ${mb(total)}` : ""} MB`);
+    }
+  }
+  const buf = new Uint8Array(got);
+  let o = 0;
+  for (const c of chunks) { buf.set(c, o); o += c.length; }
+  await db.registerFileBuffer(STATS_FILE, buf);
+  const cols = (await conn.query(`DESCRIBE SELECT * FROM read_parquet('${STATS_FILE}')`))
+    .toArray().map((r) => r.column_name);
+  return { bytes: got, columns: new Set(cols) };
+}
+
+// How a metric's raw value maps onto the 0..100 ramp (0 = green).
+function onRamp(metric, raw) {
+  const x = Number(raw);
+  // scene_count is rescaled onto the same ramp (12+ scenes = green).
+  if (metric === "scene_count") return Math.max(0, 100 - x * 8);
+  // coverage is inverted: a fully filled tile (100 %) is green.
+  if (metric === "max_cover") return Math.max(0, 100 - x);
+  return x;
+}
 
 export async function statsForMonth(y, m) {
   const metric = $("metric").value;
   if (!METRICS.has(metric)) throw new Error(`unknown metric ${metric}`);
   const res = await conn.query(`
-    SELECT mgrs_tile, ${metric} AS v
-    FROM read_parquet('${STATS}')
+    SELECT mgrs_tile, ${metric} AS v, min_cloud_cover AS cc
+    FROM read_parquet('${STATS_FILE}')
     WHERE year = ${Number(y)} AND month = ${Number(m)}`);
   return res.toArray();
 }
-
-// Which tiles currently carry a feature-state, so the next month can clear
-// exactly the ones it does not repaint.
-let painted = new Set();
 
 async function paintMonth() {
   const [y, m] = ($("month").value || "").split("-").map(Number);
@@ -130,21 +373,11 @@ async function paintMonth() {
     say(`Could not read ${STATS} — ${err.message}`, true);
     return;
   }
-  const isCount = $("metric").value === "scene_count";
-  const next = new Set();
-  // Clearing is an explicit `v: null` rather than removeFeatureState: the
-  // bulk remove is coalesced against the writes that follow it and left a
-  // handful of tiles holding last month's colour.
-  for (const r of rows) next.add(r.mgrs_tile);
-  for (const id of painted) {
-    if (!next.has(id)) map.setFeatureState({ source: "mgrs", sourceLayer: "mgrs", id }, { v: null });
-  }
-  for (const r of rows) {
-    // scene_count is rescaled onto the same 0-100 ramp (12+ scenes = green).
-    const v = isCount ? Math.max(0, 100 - Number(r.v) * 8) : Number(r.v);
-    map.setFeatureState({ source: "mgrs", sourceLayer: "mgrs", id: r.mgrs_tile }, { v });
-  }
-  painted = next;
+  const metric = $("metric").value;
+  const next = new Map();
+  for (const r of rows) next.set(r.mgrs_tile, { v: onRamp(metric, r.v), cc: Number(r.cc) });
+  lookup = next;
+  repaint();
   markActiveBar();
   if (!rows.length) {
     say(`No tile-months for ${ym} in the published stats. `
@@ -152,7 +385,7 @@ async function paintMonth() {
     return;
   }
   say(`${rows.length.toLocaleString()} MGRS tiles imaged in ${ym} — `
-    + `one range read, no API call.`);
+    + `filtered in the browser from the stats file, no API call.`);
 }
 
 export async function timelineFor(tile) {
@@ -163,7 +396,7 @@ export async function timelineFor(tile) {
     const res = await conn.query(`
       SELECT year, month, sum(scene_count)::INT AS n,
              min(min_cloud_cover) AS clearest
-      FROM read_parquet('${STATS}')
+      FROM read_parquet('${STATS_FILE}')
       ${where} GROUP BY 1, 2 ORDER BY 1, 2`);
     rows = res.toArray();
   } catch (err) {
@@ -217,10 +450,14 @@ function markActiveBar() {
   }
 }
 
+const LEGENDS = {
+  scene_count: ["12+ scenes", "1 scene"],
+  max_cover: ["100% filled", "0% filled"],
+};
 function updateLegend() {
-  const isCount = $("metric").value === "scene_count";
-  $("lo").textContent = isCount ? "12+ scenes" : "0% cloud";
-  $("hi").textContent = isCount ? "1 scene" : "100% cloud";
+  const [lo, hi] = LEGENDS[$("metric").value] ?? ["0% cloud", "100% cloud"];
+  $("lo").textContent = lo;
+  $("hi").textContent = hi;
 }
 
 // The current calendar month is empty until the backfill lands, so the app
@@ -229,29 +466,53 @@ async function newestMonth() {
   const res = await conn.query(
     `SELECT max(year::INT * 100 + month::INT) AS ym,
             min(year::INT * 100 + month::INT) AS lo
-     FROM read_parquet('${STATS}')`);
+     FROM read_parquet('${STATS_FILE}')`);
   const [row] = res.toArray();
   const fmt = (n) => `${Math.floor(n / 100)}-${String(n % 100).padStart(2, "0")}`;
   return row?.ym ? { newest: fmt(row.ym), oldest: fmt(row.lo) } : null;
 }
 
+// The cloud slider live-filters the map: tiles whose clearest scene is over
+// the value go grey. One colour recompute per animation frame at most, and
+// no query — the threshold is applied inside the fill accessor.
+let sliderFrame = 0;
+function onSlider() {
+  $("maxcloud-out").textContent = $("maxcloud").value;
+  if (sliderFrame) return;
+  sliderFrame = requestAnimationFrame(() => {
+    sliderFrame = 0;
+    const v = Number($("maxcloud").value);
+    if (v === maxCloud) return;
+    maxCloud = v;
+    repaint();
+  });
+}
+
+let dateRange = null;
+
 async function init() {
   updateLegend();
   $("metric").addEventListener("change", () => { updateLegend(); paintMonth(); });
   $("month").addEventListener("change", paintMonth);
-  $("maxcloud").addEventListener("input", (e) => {
-    $("maxcloud-out").textContent = e.target.value;
-  });
+  $("maxcloud").addEventListener("input", onSlider);
   say("Reading the stats file…");
-  let span;
+  let stats, span;
   try {
+    stats = await loadStats();
     span = await newestMonth();
   } catch (err) {
     say(`Could not open ${STATS}. The file is missing, unreadable, or the `
-      + `bucket refused the range read (${err.message}). Until the backfill `
+      + `bucket refused the read (${err.message}). Until the backfill `
       + `publishes, serve a local publish tree and load `
       + `?base=http://localhost:8081`, true);
     return;
+  }
+  // The coverage columns only exist once publish-stats has rebuilt the file
+  // with tools/s2_stats.py from Task 20; until then the option is not offered.
+  if (stats.columns.has("max_cover")) {
+    METRICS.add("max_cover");
+  } else {
+    $("metric").querySelector('option[value="max_cover"]')?.remove();
   }
   if (!span) {
     say("The stats file has no rows yet — the backfill has not published any "
@@ -263,10 +524,17 @@ async function init() {
   month.min = span.oldest;
   month.max = span.newest;
   month.value = span.newest;
-  // Give the Task 12 scene query a sane default window: the shown month.
+  // The scene query's window: bounded by the stats table's first and last
+  // month, defaulting to the shown month. The two-handle slider and the two
+  // calendar inputs are the same value, either way round.
   const [y, m] = span.newest.split("-").map(Number);
-  $("date0").value = `${span.newest}-01`;
-  $("date1").value = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+  const lastDay = (ym) => {
+    const [yy, mm] = ym.split("-").map(Number);
+    return new Date(Date.UTC(yy, mm, 0)).toISOString().slice(0, 10);
+  };
+  dateRange = dayRange({ container: $("dayrange"), from: $("date0"), to: $("date1"),
+    min: `${span.oldest}-01`, max: lastDay(span.newest) });
+  dateRange.set(`${span.newest}-01`, new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10));
   await Promise.all([paintMonth(), timelineFor(null)]);
 }
 
@@ -276,19 +544,22 @@ await init();
 // The scene query. Click a tile, pick a window, and DuckDB-WASM range-reads the
 // year parts of sentinel-2-l2a directly. Every href shown below is read out of
 // the row's `assets` column (a JSON string carrying the upstream STAC assets
-// object) — this app never builds an object-store URL from a template.
+// object) — this app never builds an object-store URL from a template. The
+// column is ~18 KB a row and half the bytes of a part, so the search leaves
+// it out and a card fetches its own row's `assets` when a link is wanted.
 // ---------------------------------------------------------------------------
 
 // An MGRS tile id: 1-2 digit UTM zone, latitude band C..X, then two letters.
 // The values come from the tileset, not from a text box, but they are the only
 // thing on this page that reaches a SQL string, so they are checked anyway.
 const TILE_RE = /^\d{1,2}[C-X][A-Z]{2}$/;
+// An item id as Earth Search mints them; the lazy `assets` lookup puts it in
+// a WHERE clause, so it is checked the same way.
+const ITEM_RE = /^[A-Za-z0-9_.-]+$/;
 const CURRENT_YEAR = new Date().getUTCFullYear();
 
-let selectedTile = null;
-
-map.on("click", "mgrs-fill", (e) => {
-  const tile = e.features[0]?.properties?.mgrs_tile;
+map.on("click", (e) => {
+  const tile = hitIndex.at(e.lngLat.lng, e.lngLat.lat)?.tile;
   if (!TILE_RE.test(tile ?? "")) return;
   selectedTile = tile;
   $("query").querySelector(".hint").textContent =
@@ -369,6 +640,8 @@ async function partUrls(y0, y1, tile) {
   return candidates.filter((_, i) => present[i]);
 }
 
+const partList = (urls) => `[${urls.map((u) => `'${u}'`).join(", ")}]`;
+
 function sceneSql(urls, tile, d0, d1, cc) {
   // `_month` is the cheap row-group filter, but it only narrows anything while
   // the window stays inside one calendar year — across a year boundary
@@ -379,13 +652,14 @@ function sceneSql(urls, tile, d0, d1, cc) {
   // `datetime` is TIMESTAMPTZ; comparing it against a bare literal would be
   // read in the session's zone, so both sides are pinned to UTC. The same
   // conversion formats the label, rather than guessing at the epoch units
-  // Arrow hands back.
+  // Arrow hands back. `assets` is deliberately not selected (see above);
+  // `bbox` is, for "Show on map".
   return `SELECT id,
        strftime(datetime AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ') AS ts,
        "eo:cloud_cover" AS cloud,
        thumbnail_url,
-       assets
-FROM read_parquet([${urls.map((u) => `'${u}'`).join(", ")}], union_by_name=true)
+       bbox
+FROM read_parquet(${partList(urls)}, union_by_name=true)
 WHERE "s2:mgrs_tile" = '${tile}'
   AND _month BETWEEN ${m0} AND ${m1}
   AND (datetime AT TIME ZONE 'UTC')
@@ -431,41 +705,170 @@ function assetHref(assets, key) {
   }
 }
 
+// The visual COG first, then the bands.
 const ASSET_LINKS = [["visual", "TCI"], ["red", "B04"], ["nir", "B08"],
   ["scl", "SCL"]];
 
+// The parts the last search read, so a card can go back to the same file for
+// its row's `assets` without probing again.
+let lastParts = [];
+const assetCache = new Map();
+
+// One row's `assets`, read lazily from the same part the search read: the
+// `_month` row-group filter plus `id`, LIMIT 1. Cached per item.
+async function assetsFor(r) {
+  const id = String(r.id);
+  if (assetCache.has(id)) return assetCache.get(id);
+  if (!ITEM_RE.test(id)) throw new Error(`unexpected item id ${id}`);
+  const ts = String(r.ts);
+  const year = ts.slice(0, 4), month = Number(ts.slice(5, 7));
+  const urls = lastParts.filter((u) => u.includes(`/year=${year}/`));
+  if (!urls.length) throw new Error(`no part for ${year}`);
+  const sql = `SELECT assets FROM read_parquet(${partList(urls)}, union_by_name=true)
+WHERE _month = ${month} AND id = '${id}' LIMIT 1`;
+  $("sql").textContent = sql;
+  const p = conn.query(sql).then((res) => {
+    const row = res.toArray()[0];
+    if (!row) throw new Error(`${id} is not in ${urls.map((u) => u.split("/").slice(-2).join("/")).join(", ")}`);
+    return JSON.parse(row.assets);
+  });
+  assetCache.set(id, p);
+  p.catch(() => assetCache.delete(id));
+  return p;
+}
+
+const bboxOf = (r) => {
+  try {
+    const b = Array.from(r.bbox ?? []).map(Number);
+    return b.length === 4 && b.every(Number.isFinite) ? b : null;
+  } catch {
+    return null;
+  }
+};
+
+// "Show on map": fly to the scene's footprint and draw its visual COG.
+async function showOnMap(r, button) {
+  const bbox = bboxOf(r);
+  if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 1200 });
+  button.disabled = true;
+  try {
+    say(`Reading ${r.id}'s assets from the item part…`);
+    const assets = await assetsFor(r);
+    const href = assetHref(assets, "visual");
+    if (!href) throw new Error("the item has no https visual asset");
+    say(`Opening ${href.split("/").slice(-2).join("/")} — reading its overviews by range…`);
+    const cog = await openCog(href);
+    cogLayer = cogTileLayer(cog, `cog-${r.id}`);
+    render();
+    $("cog-id").textContent = String(r.id);
+    $("cogbar").hidden = false;
+    say(`${r.id} on the map: TCI overviews range-read straight from the COG, `
+      + "reprojected in the browser. No tile server, no API.");
+  } catch (err) {
+    say(`Could not show ${r.id} — ${err.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("cog-clear").addEventListener("click", () => {
+  cogLayer = null;
+  render();
+  $("cogbar").hidden = true;
+});
+
+// The asset links for a card, rendered once its row's `assets` is read.
+async function showLinks(r, holder, button) {
+  button.disabled = true;
+  try {
+    const assets = await assetsFor(r);
+    holder.replaceChildren();
+    for (const [key, label] of ASSET_LINKS) {
+      const href = assetHref(assets, key);
+      if (!href) continue;
+      const a = el("a", null, label);
+      a.href = href;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.title = `${label} — ${href}`;
+      holder.append(a);
+    }
+    if (!holder.childElementCount) holder.append(el("span", "hint", "no https asset links"));
+    button.remove();
+  } catch (err) {
+    holder.replaceChildren(el("span", "hint", `links unavailable — ${err.message}`));
+    button.disabled = false;
+  }
+}
+
+// The preview JPEGs carry opaque white nodata around the swath. A blend mode
+// cannot key that out on a dark panel (multiply keeps the white as the panel
+// but darkens the imagery by the panel's own brightness, ~8x; screen keeps
+// the white), so the near-white pixels are made transparent on a canvas
+// instead — in the browser, no server-side work. Needs the host's CORS
+// header to read pixels back; when it is missing the plain image is shown.
+function keyOutWhite(img) {
+  const c = document.createElement("canvas");
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(img, 0, 0);
+  const px = ctx.getImageData(0, 0, c.width, c.height);
+  const d = px.data;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i] >= 250 && d[i + 1] >= 250 && d[i + 2] >= 250) d[i + 3] = 0;
+  }
+  ctx.putImageData(px, 0, 0);
+  img.src = c.toDataURL("image/png");
+}
+
+function thumbnail(r) {
+  const img = document.createElement("img");
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.alt = `Preview of ${r.id}`;
+  img.crossOrigin = "anonymous";
+  img.addEventListener("load", () => {
+    // Once: the keyed PNG's own load must not be keyed again, and the plain
+    // (no-CORS) fallback cannot be read back at all.
+    if (img.dataset.keyed || img.crossOrigin === null) return;
+    img.dataset.keyed = "1";
+    try { keyOutWhite(img); } catch { /* tainted canvas: keep the image as is */ }
+  });
+  img.addEventListener("error", () => {
+    if (img.crossOrigin !== null) {
+      // No CORS on this host: reload it as a plain image, white and all.
+      img.crossOrigin = null;
+      img.removeAttribute("crossorigin");
+      img.src = r.thumbnail_url;
+      return;
+    }
+    // A dead preview must not leave a broken-image box in the card.
+    img.remove();
+  });
+  img.src = r.thumbnail_url;
+  return img;
+}
+
 function sceneCard(r, i) {
   const card = el("div", "scene" + (i === 0 ? " best" : ""));
-  if (typeof r.thumbnail_url === "string" && r.thumbnail_url) {
-    const img = document.createElement("img");
-    img.loading = "lazy";
-    img.decoding = "async";
-    img.alt = `Preview of ${r.id}`;
-    // A dead preview must not leave a broken-image box in the card.
-    img.addEventListener("error", () => img.remove(), { once: true });
-    img.src = r.thumbnail_url;
-    card.append(img);
-  }
+  if (typeof r.thumbnail_url === "string" && r.thumbnail_url) card.append(thumbnail(r));
   const cap = document.createElement("div");
   cap.append(el("b", null, r.id), document.createElement("br"));
   cap.append(`${String(r.ts).slice(0, 10)} · ${Number(r.cloud).toFixed(1)}% cloud`);
   cap.append(document.createElement("br"));
-  // 30 rows, so parsing the whole assets object per row is free; a bad row is
-  // shown without its links instead of killing the render.
-  let assets = null;
-  try {
-    assets = JSON.parse(r.assets);
-  } catch { /* leave the links off this card */ }
-  for (const [key, label] of ASSET_LINKS) {
-    const href = assetHref(assets, key);
-    if (!href) continue;
-    const a = el("a", null, label);
-    a.href = href;
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-    a.title = `${label} — ${href}`;
-    cap.append(a);
-  }
+  const actions = el("span", "actions");
+  const show = el("button", "mini", "Show on map");
+  show.type = "button";
+  show.title = "Fly to the footprint and draw the visual COG on the map";
+  show.addEventListener("click", () => showOnMap(r, show));
+  const links = el("span", "links");
+  const more = el("button", "mini", "Links");
+  more.type = "button";
+  more.title = "Read this scene's asset hrefs from the item part";
+  more.addEventListener("click", () => showLinks(r, links, more));
+  actions.append(show, more);
+  cap.append(actions, links);
   card.append(cap);
   return card;
 }
@@ -507,6 +910,7 @@ async function runQuery() {
     say(`Range-reading ${urls.length} parquet part`
       + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
     const rows = (await conn.query(sql)).toArray();
+    lastParts = urls;
     box.replaceChildren();
     if (!rows.length) {
       box.append(el("p", "hint",

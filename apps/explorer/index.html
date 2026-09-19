@@ -23,6 +23,7 @@
         <option value="min_cloud_cover">clearest scene (min cloud %)</option>
         <option value="scene_count">scene count</option>
         <option value="median_cloud_cover">median cloud %</option>
+        <option value="max_cover">coverage (max % of tile filled)</option>
       </select></label>
     <div id="legend">
       <div class="ramp"></div>
@@ -32,12 +33,18 @@
   <section id="query">
     <h2>Find scenes</h2>
     <p class="hint">Click the map to pick an MGRS tile.</p>
-    <label>From <input type="date" id="date0"></label>
-    <label>To <input type="date" id="date1"></label>
+    <div class="dates">
+      <label>From <input type="date" id="date0"></label>
+      <label>To <input type="date" id="date1"></label>
+    </div>
+    <div id="dayrange" class="dayrange" title="Drag either handle; the calendars follow"></div>
     <label>Max cloud % <input type="range" id="maxcloud" min="0" max="100" value="10">
       <output id="maxcloud-out">10</output></label>
+    <p class="hint">Tiles whose clearest scene is cloudier than this go grey on the map.</p>
     <button id="run" disabled>Search scenes</button>
   </section>
+  <div id="cogbar" hidden>Showing <b id="cog-id"></b> on the map
+    <button id="cog-clear" class="mini" type="button">Clear</button></div>
   <section id="timeline"><h2>Monthly scenes</h2><div id="bars"></div>
     <p class="hint" id="timeline-scope">All tiles. Click a bar to jump to that month.</p></section>
   <section id="results"></section>
@@ -47,6 +54,11 @@
     <a href="https://source.coop/portolan-mirrors/sentinel-2-catalog">Source Cooperative</a>.
     No server, no API, no database.</footer>
 </aside>
+<!-- deck.gl's own bundle, not a CDN ESM transpile: the esm.sh build of
+     9.4.0 renders but its picking pass returns nothing (see task-20-report),
+     the official dist picks fine. Pinned; a classic script runs before the
+     module below. -->
+<script src="https://cdn.jsdelivr.net/npm/deck.gl@9.4.0/dist.min.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>
