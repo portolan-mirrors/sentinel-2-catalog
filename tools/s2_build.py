@@ -116,7 +116,22 @@ from s2_schema import COLUMNS
 # Content-Type that a HEAD has no use for.
 UA = {"User-Agent": _FETCH_UA["User-Agent"]}
 
-ROW_GROUP = 100_000
+# Row-group size is the unit of read amplification for a remote lookup: a
+# tile-and-month query fetches every row group that might hold a match,
+# whole. Measured on the published 2020/z36-46 part (477 MB, 4.6M rows):
+# one 100k-row group is 26.5 MB with assets or 13.8 MB without; at 5k rows
+# it is ~0.7 MB. This catalog's access pattern is "find the scenes over my
+# field in this window", not a bulk scan, so small groups win -- the
+# distribution best-practices doc's 50k-150k guidance assumes the opposite
+# workload. Parts published before this changed (2015-2023) carry 100k-row
+# groups and are rebuilt when a bigger machine allows; both sizes read
+# identically to every client, only the bytes-per-hit differ. gpio rounds
+# the request to a power of two: 5,000 writes 6,144-row groups.
+ROW_GROUP = 5_000
+# What the published part is written with; main() overrides it from
+# --row-group-size. Staging COPYs keep ROW_GROUP: they are deleted after
+# the sort, so their group size only affects the build, never a reader.
+_row_group_size = ROW_GROUP
 # The one knob. zstd decompression cost is flat across levels, so a reader
 # pays nothing for a high one -- but the writer pays, and on this row shape
 # (geometry + array + JSON-heavy columns) the ultra tiers fall off a cliff.
@@ -279,7 +294,7 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
              "_month,_hilbert", "--geoparquet-version", "2.0",
              "--compression", "zstd",
              "--compression-level", str(ZSTD_LEVEL),
-             "--row-group-size", str(ROW_GROUP),
+             "--row-group-size", str(_row_group_size),
              "--write-memory", memory],
             capture_output=True, text=True)
         if r.returncode != 0:
@@ -548,6 +563,9 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", default="items.parquet")
     ap.add_argument("--memory", default="8GB")
+    ap.add_argument("--row-group-size", type=int, default=ROW_GROUP,
+                    help=f"rows per Parquet row group (default {ROW_GROUP}; the "
+                         "read-amplification knob for remote lookups)")
     ap.add_argument("--split", choices=["zones"],
                     help="write the year as zone parts by UTM zone instead "
                          f"of one --name file: {len(ZONE_PARTS)} parts from "
@@ -561,6 +579,8 @@ def main() -> int:
                     help="after a part passes gpio check, run shlex.split(CMD) "
                          "+ [part path]; a non-zero exit stops the build")
     a = ap.parse_args()
+    global _row_group_size
+    _row_group_size = a.row_group_size
     if a.split and a.name != "items.parquet":
         ap.error("--split zones names its own parts; --name does not apply")
     hook = shlex.split(a.on_part_done) if a.on_part_done else None
