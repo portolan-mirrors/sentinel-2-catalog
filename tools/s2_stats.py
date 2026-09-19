@@ -12,6 +12,20 @@ wraps) are excluded from footprint aggregation only.
 
 --merge-years: the daily refresh recomputes only the current year and
 splices it into the existing table instead of scanning ten years of parquet.
+
+Three outputs land under --out (Task 24):
+  mgrs-monthly.parquet   the full table, sorted by (mgrs_tile, year, month)
+                         in 10k-row groups so one tile's history is a range
+                         read of one or two row groups
+  months/YYYY-MM.parquet one slice per month with the five paint columns,
+                         sorted by tile, one row group: what the explorer
+                         fetches to paint the choropleth (~100-150 KB)
+  timeline.parquet       one row per month with tile/scene counts and the
+                         clearest tile: the global timeline and the month
+                         span, a few KB
+Percent columns are rounded to integers (UTINYINT 0-100) and the best item's
+timestamp is kept as a DATE: the app never needed more, and it takes the full
+table from ~97 MB to ~21 MB.
 """
 from __future__ import annotations
 
@@ -46,15 +60,47 @@ def _sources_sql(sources: list[str]) -> str:
     return ",".join(f"'{f}'" for f in files)
 
 
+# The published column order. Every writer below selects exactly this list
+# so the full table, the daily merge and the month slices never disagree.
+STATS_COLUMNS = ("mgrs_tile", "year", "month", "scene_count",
+                 "min_cloud_cover", "median_cloud_cover",
+                 "mean_cover", "max_cover", "best_item_id", "best_item_date")
+PERCENT_COLUMNS = ("min_cloud_cover", "median_cloud_cover",
+                   "mean_cover", "max_cover")
+MONTH_COLUMNS = ("mgrs_tile", "scene_count") + PERCENT_COLUMNS
+COVER_COLUMNS = ("mean_cover", "max_cover")
+NODATA_COLUMN = "s2:nodata_pixel_percentage"
+
+# zstd 18 costs seconds on this table (see the Task 24 report) and saves ~3 MB
+# against the DuckDB default level; the app reads the full table with range
+# requests, so the row group is small enough that one tile's ~120 rows sit in
+# one or two groups.
+FULL_TABLE_OPTS = "FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 18, ROW_GROUP_SIZE 10000"
+# A month slice is one row per tile (< 40k rows): one row group, so the app
+# reads it in one request with no footer round trip worth optimising.
+SLICE_OPTS = "FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 18, ROW_GROUP_SIZE 1000000"
+
+
+def _pct(expr: str) -> str:
+    """A 0-100 percent as an integer: round(x)::UTINYINT, NULL stays NULL."""
+    return f"round({expr})::UTINYINT"
+
+
 STATS_SQL = """
-  SELECT mgrs_tile, year, month, scene_count, min_cloud_cover,
-         median_cloud_cover, best.id AS best_item_id,
-         best.dt AS best_item_datetime, mean_cover, max_cover
+  SELECT mgrs_tile, year, month, scene_count,
+         {min_pct} AS min_cloud_cover,
+         {median_pct} AS median_cloud_cover,
+         {mean_pct} AS mean_cover,
+         {max_pct} AS max_cover,
+         best.id AS best_item_id,
+         -- The best item's UTC calendar date. The session zone is UTC (see
+         -- connect()), so the cast buckets the same way year()/month() do.
+         (best.dt AT TIME ZONE 'UTC')::DATE AS best_item_date
   FROM (
     SELECT "s2:mgrs_tile" AS mgrs_tile,
            year(datetime)::SMALLINT AS year,
            month(datetime)::TINYINT AS month,
-           count(*)::INTEGER AS scene_count,
+           count(*)::USMALLINT AS scene_count,
            min("eo:cloud_cover") AS min_cloud_cover,
            median("eo:cloud_cover") AS median_cloud_cover,
            -- Percent of the tile a scene fills: 100 - s2:nodata_pixel_percentage.
@@ -66,18 +112,17 @@ STATS_SQL = """
            -- calls can each break a cloud-cover tie differently and return
            -- the id of one scene alongside the datetime of another. Packing
            -- them into one value makes the tiebreak a single decision, so
-           -- best_item_id and best_item_datetime always describe one scene.
+           -- best_item_id and best_item_date always describe one scene.
            arg_min(struct_pack(id := id, dt := datetime),
                    "eo:cloud_cover") AS best
     FROM read_parquet([{files}], union_by_name=true)
     {where}
     GROUP BY 1, 2, 3
   )
-"""
-
-
-COVER_COLUMNS = ("mean_cover", "max_cover")
-NODATA_COLUMN = "s2:nodata_pixel_percentage"
+""".replace("{min_pct}", _pct("min_cloud_cover")) \
+   .replace("{median_pct}", _pct("median_cloud_cover")) \
+   .replace("{mean_pct}", _pct("mean_cover")) \
+   .replace("{max_pct}", _pct("max_cover"))
 
 
 def _columns(con, relation_sql: str) -> set[str]:
@@ -97,52 +142,114 @@ def cover_sql(con, files: str) -> str:
     return "NULL::DOUBLE AS mean_cover, NULL::DOUBLE AS max_cover,"
 
 
-def existing_cover_sql(con, existing: str) -> str:
-    """The cover columns of the table being merged into.
+def existing_sql(con, existing: str) -> str:
+    """A SELECT that reads the table being merged into as the current schema.
 
-    The published stats file predates the coverage columns until the next full
-    rebuild; the daily merge must read it without them and leave those rows
-    NULL, not fail.
+    --existing can be the published file in the OLD schema (DOUBLE percents,
+    INTEGER scene_count, best_item_datetime TIMESTAMPTZ, possibly without the
+    cover columns) or a file this tool already wrote in the new one. The
+    columns are detected, and each is cast to what STATS_COLUMNS expects; a
+    cover column the old file lacks comes through as NULL, not a failed read.
     """
     have = _columns(con, f"read_parquet('{existing}')")
-    return ", ".join(f"{c}::DOUBLE AS {c}" if c in have else f"NULL::DOUBLE AS {c}"
-                     for c in COVER_COLUMNS)
+    cols = ["mgrs_tile::VARCHAR AS mgrs_tile",
+            "year::SMALLINT AS year",
+            "month::TINYINT AS month",
+            "scene_count::USMALLINT AS scene_count"]
+    for c in PERCENT_COLUMNS:
+        cols.append(f"{_pct(c) if c in have else 'NULL::UTINYINT'} AS {c}")
+    cols.append("best_item_id::VARCHAR AS best_item_id")
+    if "best_item_date" in have:
+        cols.append("best_item_date::DATE AS best_item_date")
+    else:
+        cols.append("(best_item_datetime AT TIME ZONE 'UTC')::DATE AS best_item_date")
+    return f"SELECT {', '.join(cols)} FROM read_parquet('{existing}')"
+
+
+def _month_name(year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
 
 
 def build_stats(con, sources, out: Path, merge_years=None, existing=None):
     out.mkdir(parents=True, exist_ok=True)
     files = _sources_sql(sources)
-    dest = out / "mgrs-monthly.parquet"
     cover = cover_sql(con, files)
+    cols = ", ".join(STATS_COLUMNS)
     if merge_years:
         yrs = ",".join(str(y) for y in merge_years)
-        con.execute(f"""
-          COPY (
-            SELECT mgrs_tile::VARCHAR AS mgrs_tile,
-                   year::SMALLINT AS year,
-                   month::TINYINT AS month,
-                   scene_count::INTEGER AS scene_count,
-                   min_cloud_cover::DOUBLE AS min_cloud_cover,
-                   median_cloud_cover::DOUBLE AS median_cloud_cover,
-                   best_item_id::VARCHAR AS best_item_id,
-                   best_item_datetime::TIMESTAMPTZ AS best_item_datetime,
-                   {existing_cover_sql(con, existing)}
-            FROM read_parquet('{existing}')
-            WHERE year NOT IN ({yrs})
-            UNION ALL BY NAME
-            {STATS_SQL.format(files=files, cover_sql=cover,
-                              where=f'WHERE year(datetime) IN ({yrs})')}
-            ORDER BY mgrs_tile, year, month
-          ) TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd)
-        """)
+        table_sql = f"""
+          SELECT {cols} FROM ({existing_sql(con, existing)}) WHERE year NOT IN ({yrs})
+          UNION ALL BY NAME
+          SELECT {cols} FROM ({STATS_SQL.format(
+              files=files, cover_sql=cover,
+              where=f'WHERE year(datetime) IN ({yrs})')})
+        """
     else:
+        table_sql = f"SELECT {cols} FROM ({STATS_SQL.format(files=files, cover_sql=cover, where='')})"
+    # One in-memory copy feeds all three outputs, so the month slices and the
+    # timeline are cut from exactly the table that was written, not from a
+    # second aggregation that could round or bucket differently.
+    con.execute(f"CREATE OR REPLACE TABLE stats AS SELECT {cols} FROM ({table_sql}) "
+                "ORDER BY mgrs_tile, year, month")
+
+    dest = out / "mgrs-monthly.parquet"
+    con.execute(f"""
+      COPY (SELECT {cols} FROM stats ORDER BY mgrs_tile, year, month)
+      TO '{dest}' ({FULL_TABLE_OPTS})
+    """)
+    n = con.execute("SELECT count(*) FROM stats").fetchone()[0]
+    print(f"  mgrs-monthly.parquet: {n:,} tile-months ({dest.stat().st_size / 1e6:,.1f} MB)")
+
+    build_month_slices(con, out / "months")
+    build_timeline(con, out / "timeline.parquet")
+
+
+def build_month_slices(con, months_dir: Path) -> list[str]:
+    """Write months/YYYY-MM.parquet for every month in the `stats` table.
+
+    Every month is rewritten on every run (a slice is ~100 KB; the loop is
+    seconds) and any months/*.parquet that no longer matches a month in the
+    table is deleted, so the directory never advertises a month the table
+    does not have. DuckDB's PARTITION_BY writes a hive layout
+    (year=2024/month=5/data_0.parquet), not this flat naming, so this is a
+    loop over the months.
+    """
+    months_dir.mkdir(parents=True, exist_ok=True)
+    months = con.execute(
+        "SELECT DISTINCT year, month FROM stats ORDER BY 1, 2").fetchall()
+    cols = ", ".join(MONTH_COLUMNS)
+    written = []
+    for year, month in months:
+        name = _month_name(year, month)
         con.execute(f"""
-          COPY ({STATS_SQL.format(files=files, cover_sql=cover, where='')}
-                ORDER BY mgrs_tile, year, month)
-          TO '{dest}' (FORMAT PARQUET, COMPRESSION zstd)
+          COPY (SELECT {cols} FROM stats
+                WHERE year = {year} AND month = {month}
+                ORDER BY mgrs_tile)
+          TO '{months_dir / name}.parquet' ({SLICE_OPTS})
         """)
+        written.append(name)
+    keep = {f"{name}.parquet" for name in written}
+    stale = [p for p in months_dir.glob("*.parquet") if p.name not in keep]
+    for p in stale:
+        p.unlink()
+    print(f"  months/: {len(written)} month slices written"
+          + (f", {len(stale)} stale removed" if stale else ""))
+    return written
+
+
+def build_timeline(con, dest: Path) -> None:
+    """One row per month over every tile: the explorer's global timeline and
+    the source of its month span (the newest month is max(year, month))."""
+    con.execute(f"""
+      COPY (SELECT year, month,
+                   count(*)::INTEGER AS tile_count,
+                   sum(scene_count)::INTEGER AS scene_count,
+                   min(min_cloud_cover)::UTINYINT AS min_cloud_cover
+            FROM stats GROUP BY 1, 2 ORDER BY 1, 2)
+      TO '{dest}' ({SLICE_OPTS})
+    """)
     n = con.execute(f"SELECT count(*) FROM read_parquet('{dest}')").fetchone()[0]
-    print(f"  mgrs-monthly.parquet: {n:,} tile-months")
+    print(f"  timeline.parquet: {n} months")
 
 
 def build_footprint_table(con, sources, dest: Path) -> None:

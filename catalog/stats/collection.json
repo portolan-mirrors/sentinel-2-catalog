@@ -9,7 +9,7 @@
   ],
   "id": "stats",
   "title": "MGRS coverage and cloud statistics",
-  "description": "One row per MGRS tile per month, aggregated from the `sentinel-2-l2a` item index: scene count, minimum and median cloud cover, the least-cloudy scene of the month, and the mean and maximum percent of the tile its scenes fill (from `s2:nodata_pixel_percentage`; NULL in rows written before those columns existed). This is the timeline/choropleth backend for the explorer app and the cheap first stop for \"which month has a cloud-free scene here\" -- no need to scan the full item archive to answer it. A companion PMTiles carries one polygon per MGRS tile (the envelope of that tile's scene footprints) so the app can join tile-month statistics onto a fixed geometry by `mgrs_tile` without the tileset ever changing on a daily stat refresh. Scenes whose bbox spans more than 20 degrees of longitude (antimeridian wraps) are excluded from the footprint polygons only; they are still counted in the monthly statistics. Generated from a pilot slice of the mirrored archive (two days, 2026-09-12 to 2026-09-13) while the full historical backfill runs; both products are refreshed as more of the archive lands. Contains modified Copernicus Sentinel data.",
+  "description": "One row per MGRS tile per month, aggregated from the `sentinel-2-l2a` item index: scene count, minimum and median cloud cover, the least-cloudy scene of the month (its id and UTC date), and the mean and maximum percent of the tile its scenes fill (from `s2:nodata_pixel_percentage`; NULL where no scene carried it). Every percent is stored rounded to an integer 0-100. Three parquet products are cut from the same table: the full `mgrs-monthly.parquet` (sorted by tile, small row groups, so one tile's history is a range read), one `months/YYYY-MM.parquet` slice per month with the paint columns only, and `timeline.parquet` with one row per month over all tiles. This is the timeline/choropleth backend for the explorer app and the cheap first stop for \"which month has a cloud-free scene here\" -- no need to scan the full item archive to answer it. A companion PMTiles carries one polygon per MGRS tile (the envelope of that tile's scene footprints) so the app can join tile-month statistics onto a fixed geometry by `mgrs_tile` without the tileset ever changing on a daily stat refresh. Scenes whose bbox spans more than 20 degrees of longitude (antimeridian wraps) are excluded from the footprint polygons only; they are still counted in the monthly statistics. Generated from a pilot slice of the mirrored archive (two days, 2026-09-12 to 2026-09-13) while the full historical backfill runs; both products are refreshed as more of the archive lands. Contains modified Copernicus Sentinel data.",
   "license": "CC-BY-SA-3.0-IGO",
   "keywords": [
     "sentinel-2",
@@ -21,7 +21,7 @@
     "choropleth",
     "coverage"
   ],
-  "updated": "2026-09-16T00:56:00Z",
+  "updated": "2026-09-19T18:30:00Z",
   "providers": [
     {
       "name": "European Space Agency (ESA)",
@@ -88,18 +88,28 @@
     },
     {
       "name": "scene_count",
-      "type": "int32",
+      "type": "uint16",
       "description": "Number of sentinel-2-l2a scenes for this tile and month."
     },
     {
       "name": "min_cloud_cover",
-      "type": "double",
-      "description": "Lowest eo:cloud_cover among this tile's scenes for the month."
+      "type": "uint8",
+      "description": "Lowest eo:cloud_cover among this tile's scenes for the month, rounded to an integer percent 0-100."
     },
     {
       "name": "median_cloud_cover",
-      "type": "double",
-      "description": "Median eo:cloud_cover among this tile's scenes for the month."
+      "type": "uint8",
+      "description": "Median eo:cloud_cover among this tile's scenes for the month, rounded to an integer percent 0-100."
+    },
+    {
+      "name": "mean_cover",
+      "type": "uint8",
+      "description": "Mean over the tile-month's scenes of 100 - s2:nodata_pixel_percentage, rounded to an integer percent: the average percent of the MGRS tile a scene fills. Skips NULL nodata values; NULL when none of the scenes carry one."
+    },
+    {
+      "name": "max_cover",
+      "type": "uint8",
+      "description": "Maximum over the tile-month's scenes of 100 - s2:nodata_pixel_percentage, rounded to an integer percent: the largest percent of the MGRS tile any one scene fills (100 = at least one full-tile scene). NULL under the same conditions as mean_cover."
     },
     {
       "name": "best_item_id",
@@ -107,19 +117,9 @@
       "description": "Item id of the least-cloudy scene for this tile and month."
     },
     {
-      "name": "best_item_datetime",
-      "type": "timestamp[us, tz=UTC]",
-      "description": "Acquisition datetime of best_item_id."
-    },
-    {
-      "name": "mean_cover",
-      "type": "double",
-      "description": "Mean over the tile-month's scenes of 100 - s2:nodata_pixel_percentage: the average percent of the MGRS tile a scene fills. Skips NULL nodata values; NULL when none of the scenes carry one, and NULL for rows written before this column existed."
-    },
-    {
-      "name": "max_cover",
-      "type": "double",
-      "description": "Maximum over the tile-month's scenes of 100 - s2:nodata_pixel_percentage: the largest percent of the MGRS tile any one scene fills (100 = at least one full-tile scene). NULL under the same conditions as mean_cover."
+      "name": "best_item_date",
+      "type": "date32[day]",
+      "description": "UTC calendar date of best_item_id's acquisition. Look the item up in sentinel-2-l2a by id for the full datetime."
     }
   ],
   "table:row_count": 21040,
@@ -128,6 +128,16 @@
       "href": "./mgrs-monthly.parquet",
       "type": "application/vnd.apache.parquet",
       "title": "MGRS tile x month statistics",
+      "roles": [
+        "data"
+      ],
+      "description": "The full table, every tile and month, sorted by (mgrs_tile, year, month) in 10k-row groups so a filter on one mgrs_tile is a range read of one or two row groups. One months/YYYY-MM.parquet slice per month sits beside it (see README)."
+    },
+    "timeline": {
+      "href": "./timeline.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "Month timeline over all tiles",
+      "description": "One row per (year, month) across every tile: tile_count, summed scene_count and the minimum min_cloud_cover, sorted by year and month; its last row names the newest month that has a months/YYYY-MM.parquet slice.",
       "roles": [
         "data"
       ]

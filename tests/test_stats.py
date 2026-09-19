@@ -2,12 +2,15 @@
 best-item selection (including cloud-cover ties), the percent-cover
 columns (mean_cover/max_cover from s2:nodata_pixel_percentage, NULL-safe
 and tolerant of sources and merge targets that lack them), the merge path
-used by the daily refresh, the antimeridian exclusion from footprint
-polygons (and that the same scene is still counted in the stats table), and
-the real PMTiles archive gpio/tippecanoe produce.
+used by the daily refresh (from an old-schema file and a new-schema one),
+the three outputs of Task 24 (compact full table, months/YYYY-MM.parquet
+slices, timeline.parquet) and their types, the antimeridian exclusion from
+footprint polygons (and that the same scene is still counted in the stats
+table), and the real PMTiles archive gpio/tippecanoe produce.
 """
 import json
 import subprocess
+from datetime import date
 import sys
 import tempfile
 from pathlib import Path
@@ -17,7 +20,27 @@ import duckdb
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
-from s2_stats import build_footprint_table, build_footprints, connect  # noqa: E402
+from s2_stats import (  # noqa: E402
+    MONTH_COLUMNS, STATS_COLUMNS, build_footprint_table, build_footprints,
+    build_month_slices, build_stats, connect,
+)
+
+STATS_TYPES = {
+    "mgrs_tile": "VARCHAR", "year": "SMALLINT", "month": "TINYINT",
+    "scene_count": "USMALLINT", "min_cloud_cover": "UTINYINT",
+    "median_cloud_cover": "UTINYINT", "mean_cover": "UTINYINT",
+    "max_cover": "UTINYINT", "best_item_id": "VARCHAR", "best_item_date": "DATE",
+}
+TIMELINE_TYPES = {
+    "year": "SMALLINT", "month": "TINYINT", "tile_count": "INTEGER",
+    "scene_count": "INTEGER", "min_cloud_cover": "UTINYINT",
+}
+
+
+def _schema(con, path):
+    """[(name, type), ...] in file order."""
+    return [(r[0], r[1]) for r in con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()]
 
 
 def _fixture(con, path):
@@ -55,7 +78,7 @@ def test_monthly_stats():
 
 
 def test_cloud_cover_tie_is_one_scene():
-    """A tied minimum must not let best_item_id and best_item_datetime name
+    """A tied minimum must not let best_item_id and best_item_date name
     two different scenes: two independent arg_min() calls could each break
     the tie differently."""
     con = duckdb.connect()
@@ -70,23 +93,24 @@ def test_cloud_cover_tie_is_one_scene():
           ) TO '{src}' (FORMAT PARQUET)
         """)
         _run([src], out)
-        best_id, best_dt = con.execute(f"""
-            SELECT best_item_id, best_item_datetime
+        best_id, best_date = con.execute(f"""
+            SELECT best_item_id, best_item_date
             FROM read_parquet('{out}/mgrs-monthly.parquet')""").fetchone()
         lookup = dict(con.execute(
-            f"SELECT id, datetime FROM read_parquet('{src}')").fetchall())
+            f"SELECT id, datetime::DATE FROM read_parquet('{src}')").fetchall())
         assert best_id in lookup
-        assert best_dt == lookup[best_id], (
-            "best_item_id and best_item_datetime must describe the same "
+        assert best_date == lookup[best_id], (
+            "best_item_id and best_item_date must describe the same "
             "tied scene")
 
 
 def test_percent_cover_mean_and_max():
     """mean_cover is the average of 100 - s2:nodata_pixel_percentage over
     the tile-month's scenes and max_cover its maximum: nodata 0 / 40 / 100
-    gives cover 100 / 60 / 0, so mean 53.33 and max 100. A NULL nodata is
-    skipped by both (the second tile: NULL and 25 -> mean 75, max 75), and a
-    tile whose scenes all lack it gets NULL, not 0 or 100."""
+    gives cover 100 / 60 / 0, so mean 53.33 (stored rounded: 53) and max
+    100. A NULL nodata is skipped by both (the second tile: NULL and 25 ->
+    mean 75, max 75), and a tile whose scenes all lack it gets NULL, not 0
+    or 100."""
     con = duckdb.connect()
     con.execute("SET TimeZone='UTC'; INSTALL spatial; LOAD spatial;")
     with tempfile.TemporaryDirectory() as td:
@@ -109,15 +133,14 @@ def test_percent_cover_mean_and_max():
             FROM read_parquet('{out}/mgrs-monthly.parquet')""").fetchall()}
         n, mean, mx = rows["31UFU"]
         assert n == 3
-        assert abs(mean - (100 + 60 + 0) / 3) < 1e-9, mean
-        assert mx == 100.0
+        assert mean == round((100 + 60 + 0) / 3), mean
+        assert mx == 100
         n, mean, mx = rows["32UMV"]
         assert n == 2, "the NULL-nodata scene is still counted"
-        assert mean == 75.0 and mx == 75.0, "NULL nodata is skipped, not zeroed"
+        assert mean == 75 and mx == 75, "NULL nodata is skipped, not zeroed"
         assert rows["33UVP"] == (1, None, None), "all-NULL nodata -> NULL cover"
-        types = dict((r[0], r[1]) for r in con.execute(
-            f"DESCRIBE SELECT * FROM read_parquet('{out}/mgrs-monthly.parquet')").fetchall())
-        assert types["mean_cover"] == "DOUBLE" and types["max_cover"] == "DOUBLE"
+        types = dict(_schema(con, f"{out}/mgrs-monthly.parquet"))
+        assert types["mean_cover"] == "UTINYINT" and types["max_cover"] == "UTINYINT"
 
 
 def test_percent_cover_absent_from_source_is_null():
@@ -137,9 +160,9 @@ def test_percent_cover_absent_from_source_is_null():
 
 
 def test_merge_into_existing_without_cover_columns():
-    """The daily merge reads the published stats file, which will not have
-    the cover columns until the next full rebuild: untouched years come
-    through with NULL cover, the recomputed year with real values."""
+    """The daily merge reads a stats file that predates the cover columns:
+    untouched years come through with NULL cover, the recomputed year with
+    real values."""
     con = duckdb.connect()
     con.execute("SET TimeZone='UTC'; INSTALL spatial; LOAD spatial;")
     with tempfile.TemporaryDirectory() as td:
@@ -168,7 +191,7 @@ def test_merge_into_existing_without_cover_columns():
         rows = con.execute(f"""
             SELECT mgrs_tile, year, scene_count, mean_cover, max_cover
             FROM read_parquet('{merged_out}/mgrs-monthly.parquet') ORDER BY 1""").fetchall()
-        assert rows == [("10ABC", 2023, 1, None, None), ("20XYZ", 2024, 1, 70.0, 70.0)]
+        assert rows == [("10ABC", 2023, 1, None, None), ("20XYZ", 2024, 1, 70, 70)]
 
 
 def test_merge_replaces_only_named_years():
@@ -211,8 +234,255 @@ def test_merge_replaces_only_named_years():
 
         assert after[0] == before[0], "the untouched year must survive verbatim"
         assert after[1][:4] == ("20XYZ", 2024, 3, 1), "the named year is recomputed"
-        assert after[1][6] == "Q2", "recomputed from the new source, not the old rows"
+        assert after[1][8] == "Q2", "recomputed from the new source, not the old rows"
         assert after[1] != before[1]
+
+
+def _wide_fixture(con, path):
+    """Three tiles over three months, with nodata so every percent column
+    has a value, and fractional values that exercise the rounding."""
+    con.execute(f"""
+      COPY (SELECT * FROM (VALUES
+        ('A1', TIMESTAMPTZ '2024-05-01 10:00:00+00', '31UFU', 0.276, 0.0,  ST_Point(4, 52)),
+        ('A2', TIMESTAMPTZ '2024-05-11 10:00:00+00', '31UFU', 34.59, 40.0, ST_Point(4, 52)),
+        ('A3', TIMESTAMPTZ '2024-05-21 10:00:00+00', '31UFU', 80.0,  100.0, ST_Point(4, 52)),
+        ('B1', TIMESTAMPTZ '2024-05-02 10:00:00+00', '32UMV', 12.5,  25.0, ST_Point(9, 51)),
+        ('B2', TIMESTAMPTZ '2024-06-01 10:00:00+00', '32UMV', 5.0,   NULL, ST_Point(9, 51)),
+        ('C1', TIMESTAMPTZ '2023-12-31 23:30:00+00', '33UVP', 99.6,  10.0, ST_Point(14, 50)),
+        ('C2', TIMESTAMPTZ '2024-06-03 10:00:00+00', '33UVP', 41.0,  30.0, ST_Point(14, 50))
+      ) t(id, datetime, "s2:mgrs_tile", "eo:cloud_cover",
+          "s2:nodata_pixel_percentage", geometry)
+      ) TO '{path}' (FORMAT PARQUET)
+    """)
+
+
+def test_three_outputs_schema_and_order():
+    """build_stats writes mgrs-monthly.parquet, months/YYYY-MM.parquet and
+    timeline.parquet with exactly the published column names, order and
+    compact types (integer percents, USMALLINT counts, DATE best item)."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        _wide_fixture(con, src)
+        _run([src], out)
+
+        full = _schema(con, out / "mgrs-monthly.parquet")
+        assert [c for c, _ in full] == list(STATS_COLUMNS)
+        assert dict(full) == STATS_TYPES
+
+        months = sorted(p.name for p in (out / "months").glob("*.parquet"))
+        assert months == ["2023-12.parquet", "2024-05.parquet", "2024-06.parquet"]
+        for name in months:
+            sl = _schema(con, out / "months" / name)
+            assert [c for c, _ in sl] == list(MONTH_COLUMNS), name
+            assert dict(sl) == {c: STATS_TYPES[c] for c in MONTH_COLUMNS}, name
+            groups = con.execute(f"""
+                SELECT count(DISTINCT row_group_id)
+                FROM parquet_metadata('{out / "months" / name}')""").fetchone()[0]
+            assert groups == 1, f"{name}: a month slice is one row group"
+            tiles = [r[0] for r in con.execute(
+                f"SELECT mgrs_tile FROM read_parquet('{out / 'months' / name}')").fetchall()]
+            assert tiles == sorted(tiles), f"{name}: sorted by mgrs_tile"
+
+        tl = _schema(con, out / "timeline.parquet")
+        assert [c for c, _ in tl] == list(TIMELINE_TYPES)
+        assert dict(tl) == TIMELINE_TYPES
+
+        # The full table is sorted by tile then time, in 10k-row groups
+        # (DuckDB rounds ROW_GROUP_SIZE 10000 up to 10240, five vectors).
+        keys = con.execute(f"""
+            SELECT mgrs_tile, year, month
+            FROM read_parquet('{out}/mgrs-monthly.parquet')""").fetchall()
+        assert keys == sorted(keys)
+        rg = con.execute(f"""
+            SELECT max(row_group_num_rows)
+            FROM parquet_metadata('{out}/mgrs-monthly.parquet')""").fetchone()[0]
+        assert rg <= 10240
+
+
+def test_percent_columns_are_rounded_integers():
+    """Every percent is round(x) as an integer 0-100: 0.276 -> 0, 34.59 ->
+    35, 99.6 -> 100, the median of (0.276, 34.59, 80) = 34.59 -> 35, and a
+    mean of (100, 60, 0) = 53.33 -> 53. NULL survives the rounding."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        _wide_fixture(con, src)
+        _run([src], out)
+        rows = {(r[0], r[1], r[2]): r[3:] for r in con.execute(f"""
+            SELECT mgrs_tile, year, month, min_cloud_cover, median_cloud_cover,
+                   mean_cover, max_cover, best_item_id, best_item_date
+            FROM read_parquet('{out}/mgrs-monthly.parquet')""").fetchall()}
+        assert rows[("31UFU", 2024, 5)] == (0, 35, 53, 100, "A1", date(2024, 5, 1))
+        assert rows[("32UMV", 2024, 5)] == (13, 13, 75, 75, "B1", date(2024, 5, 2))
+        assert rows[("32UMV", 2024, 6)] == (5, 5, None, None, "B2", date(2024, 6, 1))
+        assert rows[("33UVP", 2023, 12)] == (100, 100, 90, 90, "C1", date(2023, 12, 31))
+        for v in rows.values():
+            for x in v[:4]:
+                assert x is None or isinstance(x, int), v
+
+
+def test_month_slice_equals_full_table_filtered():
+    """months/YYYY-MM.parquet is the full table WHERE year, month = that
+    month, projected to MONTH_COLUMNS -- same rows, same values, same
+    order -- and there is one slice per month the table has, no more."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        _wide_fixture(con, src)
+        _run([src], out)
+        full = out / "mgrs-monthly.parquet"
+        months = con.execute(f"""
+            SELECT DISTINCT year, month FROM read_parquet('{full}')""").fetchall()
+        assert len(months) == 3
+        cols = ", ".join(MONTH_COLUMNS)
+        for y, m in months:
+            name = f"{y:04d}-{m:02d}.parquet"
+            expected = con.execute(f"""
+                SELECT {cols} FROM read_parquet('{full}')
+                WHERE year = {y} AND month = {m} ORDER BY mgrs_tile""").fetchall()
+            got = con.execute(
+                f"SELECT {cols} FROM read_parquet('{out / 'months' / name}')").fetchall()
+            assert got == expected, name
+        assert len(list((out / "months").glob("*.parquet"))) == len(months)
+
+
+def test_timeline_sums_equal_full_table():
+    """timeline.parquet is the per-month GROUP BY of the full table: tile
+    count, summed scene_count and the min over tiles of min_cloud_cover, in
+    (year, month) order."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        _wide_fixture(con, src)
+        _run([src], out)
+        expected = con.execute(f"""
+            SELECT year, month, count(*), sum(scene_count), min(min_cloud_cover)
+            FROM read_parquet('{out}/mgrs-monthly.parquet')
+            GROUP BY 1, 2 ORDER BY 1, 2""").fetchall()
+        got = con.execute(f"""
+            SELECT year, month, tile_count, scene_count, min_cloud_cover
+            FROM read_parquet('{out}/timeline.parquet')""").fetchall()
+        assert got == expected
+        assert got == [(2023, 12, 1, 1, 100), (2024, 5, 2, 4, 0), (2024, 6, 2, 2, 5)]
+
+
+def test_stale_month_slices_are_removed():
+    """A months/*.parquet left over from an earlier run whose month is no
+    longer in the table is deleted, and every current month is rewritten,
+    so the directory always matches the table exactly."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        _wide_fixture(con, src)
+        _run([src], out)
+        stale = out / "months" / "2019-01.parquet"
+        stale.write_bytes(b"not parquet")
+        # A second run over a source that lost 2023: its slice is stale too.
+        src2 = Path(td) / "items2.parquet"
+        con.execute(f"""
+          COPY (SELECT * FROM read_parquet('{src}') WHERE year(datetime) = 2024)
+          TO '{src2}' (FORMAT PARQUET)""")
+        _run([src2], out)
+        names = sorted(p.name for p in (out / "months").glob("*.parquet"))
+        assert names == ["2024-05.parquet", "2024-06.parquet"], names
+        assert not stale.exists()
+        assert not (out / "months" / "2023-12.parquet").exists()
+
+
+def test_build_month_slices_returns_written_names():
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        _wide_fixture(con, src)
+        build_stats(con, [str(src)], out)
+        assert build_month_slices(con, out / "months") == ["2023-12", "2024-05", "2024-06"]
+
+
+def test_merge_from_old_schema_existing():
+    """--existing is the CURRENT published file until the first new-schema
+    publish: DOUBLE percents, INTEGER scene_count, TIMESTAMPTZ
+    best_item_datetime, both cover columns present. The untouched year is
+    carried into the new schema (percents rounded, the datetime reduced to
+    its UTC date) and the recomputed year is aggregated fresh; the month
+    slices and timeline cover both."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        existing = Path(td) / "old-stats.parquet"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            ('10ABC', 2023::SMALLINT, 3::TINYINT, 4::INTEGER, 0.276::DOUBLE,
+             34.59::DOUBLE, 'P1', TIMESTAMPTZ '2023-03-01 23:30:00+00',
+             53.333::DOUBLE, 99.6::DOUBLE),
+            -- 2023-03-05 22:30 in UTC-05 is 2023-03-06 03:30 UTC: the UTC date
+            ('10ABD', 2023::SMALLINT, 3::TINYINT, 1::INTEGER, 7.0::DOUBLE,
+             7.0::DOUBLE, 'P2', TIMESTAMPTZ '2023-03-05 22:30:00-05',
+             NULL::DOUBLE, NULL::DOUBLE),
+            ('20XYZ', 2024::SMALLINT, 1::TINYINT, 9::INTEGER, 50.0::DOUBLE,
+             50.0::DOUBLE, 'OLD', TIMESTAMPTZ '2024-01-01 00:00:00+00',
+             1.0::DOUBLE, 1.0::DOUBLE)
+          ) t(mgrs_tile, year, month, scene_count, min_cloud_cover,
+              median_cloud_cover, best_item_id, best_item_datetime,
+              mean_cover, max_cover)
+          ) TO '{existing}' (FORMAT PARQUET)
+        """)
+        old_types = dict(_schema(con, existing))
+        assert old_types["min_cloud_cover"] == "DOUBLE"
+        assert old_types["best_item_datetime"].startswith("TIMESTAMP")
+        new_src = Path(td) / "new2024.parquet"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            ('Q2', TIMESTAMPTZ '2024-03-10 00:00:00+00', '20XYZ', 1.0, 30.0, ST_Point(2, 2))
+          ) t(id, datetime, "s2:mgrs_tile", "eo:cloud_cover",
+              "s2:nodata_pixel_percentage", geometry)
+          ) TO '{new_src}' (FORMAT PARQUET)
+        """)
+        out = Path(td) / "merged"
+        subprocess.run([sys.executable, "tools/s2_stats.py",
+                        "--sources", str(new_src), "--out", str(out),
+                        "--merge-years", "2024", "--existing", str(existing)],
+                       check=True, cwd=ROOT)
+        assert dict(_schema(con, out / "mgrs-monthly.parquet")) == STATS_TYPES
+        rows = con.execute(f"""
+            SELECT * FROM read_parquet('{out}/mgrs-monthly.parquet')
+            ORDER BY mgrs_tile, year, month""").fetchall()
+        assert rows == [
+            ("10ABC", 2023, 3, 4, 0, 35, 53, 100, "P1", date(2023, 3, 1)),
+            ("10ABD", 2023, 3, 1, 7, 7, None, None, "P2", date(2023, 3, 6)),
+            ("20XYZ", 2024, 3, 1, 1, 1, 70, 70, "Q2", date(2024, 3, 10)),
+        ], rows
+        assert sorted(p.name for p in (out / "months").glob("*.parquet")) == [
+            "2023-03.parquet", "2024-03.parquet"]
+        assert con.execute(f"""
+            SELECT year, month, tile_count, scene_count, min_cloud_cover
+            FROM read_parquet('{out}/timeline.parquet')""").fetchall() == [
+            (2023, 3, 2, 5, 0), (2024, 3, 1, 1, 1)]
+
+
+def test_merge_from_new_schema_existing_is_verbatim():
+    """--existing already in the new schema (the second daily run onward)
+    passes through unchanged: rounding an integer and casting a DATE are
+    identities, so the untouched year is byte-for-byte the same rows."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"
+        _wide_fixture(con, src)
+        first = Path(td) / "first"
+        _run([src], first)
+        existing = first / "mgrs-monthly.parquet"
+        before = con.execute(f"""
+            SELECT * FROM read_parquet('{existing}')
+            WHERE year = 2023 ORDER BY mgrs_tile""").fetchall()
+        out = Path(td) / "second"
+        subprocess.run([sys.executable, "tools/s2_stats.py",
+                        "--sources", str(src), "--out", str(out),
+                        "--merge-years", "2024", "--existing", str(existing)],
+                       check=True, cwd=ROOT)
+        after = con.execute(f"""
+            SELECT * FROM read_parquet('{out}/mgrs-monthly.parquet')
+            WHERE year = 2023 ORDER BY mgrs_tile""").fetchall()
+        assert after == before
+        assert dict(_schema(con, out / "mgrs-monthly.parquet")) == STATS_TYPES
 
 
 def test_antimeridian_excluded_from_footprints_but_counted_in_stats():
