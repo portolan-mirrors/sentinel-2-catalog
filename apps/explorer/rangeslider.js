@@ -12,8 +12,10 @@ const utc = (s) => Date.parse(`${s}T00:00:00Z`);
 // min/max: ISO dates bounding the slider (inclusive).
 // onChange(d0, d1): called with ISO dates after any change from either side.
 export function dayRange({ container, from, to, min, max, onChange }) {
-  const lo = utc(min), hi = utc(max);
-  const days = Math.max(1, Math.round((hi - lo) / DAY));
+  // lo/hi/days are reassigned by rebound() when the caller re-scopes the
+  // slider (Task 22: the window is bounded to whichever month is selected,
+  // not the whole stats span), so they cannot be const.
+  let lo = utc(min), hi = utc(max), days = Math.max(1, Math.round((hi - lo) / DAY));
   const a = document.createElement("input"), b = document.createElement("input");
   for (const r of [a, b]) {
     r.type = "range"; r.min = 0; r.max = days; r.step = 1;
@@ -63,5 +65,17 @@ export function dayRange({ container, from, to, min, max, onChange }) {
   to.addEventListener("change", fromDates);
   from.min = min; from.max = max; to.min = min; to.max = max;
   fromDates();
-  return { set(d0, d1) { from.value = d0; to.value = d1; fromDates(); }, days, min, max };
+
+  const setRange = (d0, d1) => { from.value = d0; to.value = d1; fromDates(); };
+  // Re-scope the whole slider to a new [min, max] (Task 22: called on every
+  // month change so the window can never reach outside the selected month)
+  // and reset From/To to that full range, same as a fresh dayRange() would.
+  const rebound = (newMin, newMax) => {
+    lo = utc(newMin); hi = utc(newMax);
+    days = Math.max(1, Math.round((hi - lo) / DAY));
+    a.max = days; b.max = days;
+    from.min = newMin; from.max = newMax; to.min = newMin; to.max = newMax;
+    setRange(newMin, newMax);
+  };
+  return { set: setRange, rebound, days, min, max };
 }

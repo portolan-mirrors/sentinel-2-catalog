@@ -249,15 +249,25 @@ const hitIndex = {
 let lookup = new Map();
 let paintKey = 0;
 let maxCloud = Number($("maxcloud").value);
+// Coverage is feature-detected against the loaded stats file (Task 22, same
+// gate as the max_cover metric option): while false the coverage slider
+// stays hidden and s.cover is always null, so the gate below never fires.
+let hasCover = false;
+let minCoverage = Number($("mincoverage").value);
+let minScenes = Number($("minscenes").value);
 let hovered = null;          // the hovered feature (GeoJSON, WGS84) or null
 let cogLayer = null;         // the shown scene's TileLayer, or null
 let selectedTile = null;
 
+// All three sliders AND together in one accessor; a NULL metric is "unknown"
+// rather than "over/under the slider" and is never dimmed for that reason
+// (the Task 20 rule, extended to coverage and scene count).
 function fillColor(f) {
   const s = lookup.get(f.properties.mgrs_tile);
   if (!s) return UNPAINTED;
-  // A NULL clearest-scene cloud cover is "unknown", not "over the slider".
   if (s.cc !== null && s.cc > maxCloud) return DIMMED;
+  if (s.cover !== null && s.cover < minCoverage) return DIMMED;
+  if (s.sc !== null && s.sc < minScenes) return DIMMED;
   return RAMP_LUT[Math.round(s.v)];
 }
 
@@ -375,11 +385,56 @@ function onRamp(metric, raw) {
 export async function statsForMonth(y, m) {
   const metric = $("metric").value;
   if (!METRICS.has(metric)) throw new Error(`unknown metric ${metric}`);
+  // max_cover is only selected once known to exist (see hasCover): a stats
+  // file predating the Task 20 rebuild has no such column at all.
+  const coverSelect = hasCover ? ", max_cover AS cover" : "";
   const res = await conn.query(`
-    SELECT mgrs_tile, ${metric} AS v, min_cloud_cover AS cc
+    SELECT mgrs_tile, ${metric} AS v, min_cloud_cover AS cc, scene_count AS sc${coverSelect}
     FROM read_parquet('${STATS_FILE}')
     WHERE year = ${Number(y)} AND month = ${Number(m)}`);
   return res.toArray();
+}
+
+// The three filter sliders, combined into one sentence for the status line
+// (Task 22): "N of M tiles pass (cloud ≤ x, coverage ≥ y, scenes ≥ z)". The
+// coverage clause is only shown while the slider itself is shown.
+function fmtFilters() {
+  const parts = [`cloud ≤ ${maxCloud}`];
+  if (hasCover) parts.push(`coverage ≥ ${minCoverage}`);
+  parts.push(`scenes ≥ ${minScenes}`);
+  return parts.join(", ");
+}
+function passCounts() {
+  let n = 0;
+  for (const s of lookup.values()) {
+    if (s.cc !== null && s.cc > maxCloud) continue;
+    if (s.cover !== null && s.cover < minCoverage) continue;
+    if (s.sc !== null && s.sc < minScenes) continue;
+    n++;
+  }
+  return { n, m: lookup.size };
+}
+function filterLine() {
+  const { n, m } = passCounts();
+  return `${n.toLocaleString()} of ${m.toLocaleString()} tiles pass (${fmtFilters()})`;
+}
+
+// The scene-count slider's bounds track the loaded month: 0..p99 of that
+// month's scene_count, integer step, recomputed every time the month
+// changes (a busy month and a quiet one should not share one scale).
+function updateScenesBound(rows) {
+  const values = rows.map((r) => Number(r.sc)).filter(Number.isFinite).sort((a, b) => a - b);
+  const p99 = values.length
+    ? values[Math.min(values.length - 1, Math.ceil(0.99 * values.length) - 1)]
+    : 0;
+  const bound = Math.max(1, Math.round(p99));
+  const slider = $("minscenes");
+  slider.max = bound;
+  if (Number(slider.value) > bound) {
+    slider.value = bound;
+    minScenes = bound;
+  }
+  $("minscenes-out").textContent = slider.value;
 }
 
 async function paintMonth() {
@@ -394,15 +449,21 @@ async function paintMonth() {
     say(`Could not read ${STATS} — ${err.message}`, true);
     return;
   }
+  updateScenesBound(rows);
   const metric = $("metric").value;
   const next = new Map();
   for (const r of rows) {
     // A NULL metric (every pre-rebuild row's cover, a NULL cloud cover) is
     // left unpainted: Number(null) is 0, which would read as "0% filled"
-    // or "0% cloud". A NULL clearest-scene cover is kept as null so the
-    // slider never dims what it cannot judge.
+    // or "0% cloud". A NULL clearest-scene cover, coverage or scene count
+    // is kept as null so no slider ever dims what it cannot judge.
     if (r.v == null) continue;
-    next.set(r.mgrs_tile, { v: onRamp(metric, r.v), cc: r.cc == null ? null : Number(r.cc) });
+    next.set(r.mgrs_tile, {
+      v: onRamp(metric, r.v),
+      cc: r.cc == null ? null : Number(r.cc),
+      cover: hasCover && r.cover != null ? Number(r.cover) : null,
+      sc: r.sc == null ? null : Number(r.sc),
+    });
   }
   lookup = next;
   repaint();
@@ -415,7 +476,8 @@ async function paintMonth() {
   const unpainted = rows.length - next.size;
   say(`${rows.length.toLocaleString()} MGRS tiles imaged in ${ym} — `
     + `filtered in the browser from the stats file, no API call.`
-    + (unpainted ? ` ${unpainted.toLocaleString()} have no ${metric} value and stay grey.` : ""));
+    + (unpainted ? ` ${unpainted.toLocaleString()} have no ${metric} value and stay grey.` : "")
+    + ` ${filterLine()}.`);
 }
 
 export async function timelineFor(tile) {
@@ -459,6 +521,7 @@ export async function timelineFor(tile) {
     d.setAttribute("aria-label", d.title);
     d.onclick = () => {
       $("month").value = ym;
+      reboundDateRange(ym);
       paintMonth();
     };
     bars.append(d);
@@ -502,29 +565,82 @@ async function newestMonth() {
   return row?.ym ? { newest: fmt(row.ym), oldest: fmt(row.lo) } : null;
 }
 
-// The cloud slider live-filters the map: tiles whose clearest scene is over
-// the value go grey. One colour recompute per animation frame at most, and
-// no query — the threshold is applied inside the fill accessor.
+// The three sliders live-filter the map: tiles that fail any gate go grey.
+// One colour recompute per animation frame at most, and no query — every
+// threshold is applied inside the fill accessor (fillColor).
 let sliderFrame = 0;
 function onSlider() {
   $("maxcloud-out").textContent = $("maxcloud").value;
+  if (hasCover) $("mincoverage-out").textContent = $("mincoverage").value;
+  $("minscenes-out").textContent = $("minscenes").value;
   if (sliderFrame) return;
   sliderFrame = requestAnimationFrame(() => {
     sliderFrame = 0;
-    const v = Number($("maxcloud").value);
-    if (v === maxCloud) return;
-    maxCloud = v;
+    const cc = Number($("maxcloud").value);
+    const cov = hasCover ? Number($("mincoverage").value) : 0;
+    const sc = Number($("minscenes").value);
+    if (cc === maxCloud && cov === minCoverage && sc === minScenes) return;
+    maxCloud = cc; minCoverage = cov; minScenes = sc;
     repaint();
+    say(`${filterLine()}.`);
   });
+}
+
+// Shows or hides the coverage slider (feature-detected exactly like the
+// Color-by option): while the stats file lacks max_cover the row stays
+// hidden and its one-line note explains why.
+function setCoverUi(has) {
+  $("mincoverage-row").hidden = !has;
+  $("mincoverage-note").hidden = has;
 }
 
 let dateRange = null;
 
+function lastDayOfMonth(ym) {
+  const [yy, mm] = ym.split("-").map(Number);
+  return new Date(Date.UTC(yy, mm, 0)).toISOString().slice(0, 10);
+}
+
+// The last month with any stats row in `year`, or null if the stats file
+// has no rows for that year at all (used when the newest published item
+// year is ahead of the stats file's own newest year).
+async function newestMonthInYear(year) {
+  const res = await conn.query(
+    `SELECT max(month::INT) AS m FROM read_parquet('${STATS_FILE}') WHERE year = ${Number(year)}`);
+  const m = res.toArray()[0]?.m;
+  return m == null ? null : Number(m);
+}
+
+// The scene query's window is scoped to whichever month is on screen (not
+// the whole stats span): re-scoped on every month change so it can never
+// reach outside the selected month, and reset to that month's full range.
+// The two-handle slider and the two calendar inputs stay the same value,
+// either way round.
+function reboundDateRange(ym) {
+  const from0 = `${ym}-01`, to0 = lastDayOfMonth(ym);
+  if (dateRange) {
+    dateRange.rebound(from0, to0);
+    return;
+  }
+  // dayRange()'s own construction calls fromDates() once, but that no-ops
+  // on a fresh page load: the <input type=date> fields start empty, and
+  // fromDates() refuses to compute from an empty value. set() writes the
+  // values directly, the same way rebound() does on every later call.
+  dateRange = dayRange({ container: $("dayrange"), from: $("date0"), to: $("date1"),
+    min: from0, max: to0 });
+  dateRange.set(from0, to0);
+}
+
 async function init() {
   updateLegend();
   $("metric").addEventListener("change", () => { updateLegend(); paintMonth(); });
-  $("month").addEventListener("change", paintMonth);
+  $("month").addEventListener("change", () => {
+    reboundDateRange($("month").value);
+    paintMonth();
+  });
   $("maxcloud").addEventListener("input", onSlider);
+  $("mincoverage").addEventListener("input", onSlider);
+  $("minscenes").addEventListener("input", onSlider);
   say("Reading the stats file…");
   let stats, span;
   try {
@@ -538,12 +654,15 @@ async function init() {
     return;
   }
   // The coverage columns only exist once publish-stats has rebuilt the file
-  // with tools/s2_stats.py from Task 20; until then the option is not offered.
-  if (stats.columns.has("max_cover")) {
+  // with tools/s2_stats.py from Task 20; until then the option is not offered
+  // and the coverage slider stays hidden (setCoverUi).
+  hasCover = stats.columns.has("max_cover");
+  if (hasCover) {
     METRICS.add("max_cover");
   } else {
     $("metric").querySelector('option[value="max_cover"]')?.remove();
   }
+  setCoverUi(hasCover);
   if (!span) {
     say("The stats file has no rows yet — the backfill has not published any "
       + "tile-months. The map and timeline will fill in once it does.");
@@ -551,28 +670,24 @@ async function init() {
     return;
   }
   const month = $("month");
-  month.min = span.oldest;
-  month.max = span.newest;
-  month.value = span.newest;
-  // The scene query's window: bounded by the stats table's first and last
-  // month, defaulting to the shown month. The two-handle slider and the two
-  // calendar inputs are the same value, either way round.
-  const [y, m] = span.newest.split("-").map(Number);
-  const lastDay = (ym) => {
-    const [yy, mm] = ym.split("-").map(Number);
-    return new Date(Date.UTC(yy, mm, 0)).toISOString().slice(0, 10);
-  };
   // The stats file can lag the item parts (it is rebuilt on its own
-  // schedule), so the window's upper bound is the newer of the stats' last
-  // month and the last published item year: one cached HEAD per year past
-  // the stats, the same probe the search uses.
-  const newestYear = await newestPublishedYear(Number(span.newest.slice(0, 4)));
-  const max = newestYear > Number(span.newest.slice(0, 4))
-    ? (newestYear === CURRENT_YEAR ? new Date().toISOString().slice(0, 10) : `${newestYear}-12-31`)
-    : lastDay(span.newest);
-  dateRange = dayRange({ container: $("dayrange"), from: $("date0"), to: $("date1"),
-    min: `${span.oldest}-01`, max });
-  dateRange.set(`${span.newest}-01`, new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10));
+  // schedule): the default month is the newest one with published item
+  // parts (one cached HEAD per year past the stats, the same probe the
+  // search uses), preferring the newest month the stats file actually has
+  // for that year, else that year's December. A month with no stats row
+  // just paints unpainted (the NULL-metric rule above), so this never
+  // crashes when the backfill has not caught up yet.
+  const statsYear = Number(span.newest.slice(0, 4));
+  const newestYear = await newestPublishedYear(statsYear);
+  let defaultMonth = span.newest;
+  if (newestYear > statsYear) {
+    const m = await newestMonthInYear(newestYear);
+    defaultMonth = m != null ? `${newestYear}-${String(m).padStart(2, "0")}` : `${newestYear}-12`;
+  }
+  month.min = span.oldest;
+  month.max = newestYear > statsYear ? `${newestYear}-12` : span.newest;
+  month.value = defaultMonth;
+  reboundDateRange(defaultMonth);
   await Promise.all([paintMonth(), timelineFor(null)]);
 }
 
@@ -699,13 +814,19 @@ async function partUrls(y0, y1, tile) {
 
 const partList = (urls) => `[${urls.map((u) => `'${u}'`).join(", ")}]`;
 
-function sceneSql(urls, tile, d0, d1, cc) {
+function sceneSql(urls, tile, d0, d1, cc, cov) {
   // `_month` is the cheap row-group filter, but it only narrows anything while
   // the window stays inside one calendar year — across a year boundary
   // (2023-11 → 2024-02) months 11..2 is empty, so it widens to the whole year.
   const sameYear = d0.slice(0, 4) === d1.slice(0, 4);
   const m0 = sameYear ? Number(d0.slice(5, 7)) : 1;
   const m1 = sameYear ? Number(d1.slice(5, 7)) : 12;
+  // The coverage gate is the item-level twin of the stats file's max_cover
+  // (100 - s2:nodata_pixel_percentage), projected straight from the column
+  // the item parts always carry — never from `assets`. Omitted at 0 (the
+  // slider's no-op value, and its state whenever the slider is hidden).
+  const coverClause = cov > 0
+    ? `\n  AND (100 - "s2:nodata_pixel_percentage") >= ${cov}` : "";
   // `datetime` is TIMESTAMPTZ; comparing it against a bare literal would be
   // read in the session's zone, so both sides are pinned to UTC. The same
   // conversion formats the label, rather than guessing at the epoch units
@@ -721,7 +842,7 @@ WHERE "s2:mgrs_tile" = '${tile}'
   AND _month BETWEEN ${m0} AND ${m1}
   AND (datetime AT TIME ZONE 'UTC')
       BETWEEN TIMESTAMP '${d0} 00:00:00' AND TIMESTAMP '${d1} 23:59:59'
-  AND "eo:cloud_cover" <= ${cc}
+  AND "eo:cloud_cover" <= ${cc}${coverClause}
 ORDER BY "eo:cloud_cover", id
 LIMIT 30`;
 }
@@ -966,7 +1087,7 @@ async function runQuery() {
       say(`Nothing published for ${d0.slice(0, 4)}–${d1.slice(0, 4)} yet.`);
       return;
     }
-    const sql = sceneSql(urls, selectedTile, d0, d1, cc);
+    const sql = sceneSql(urls, selectedTile, d0, d1, cc, minCoverage);
     $("sql").textContent = sql;
     $("api").textContent = apiMirror(selectedTile, d0, d1, cc);
     say(`Range-reading ${urls.length} parquet part`
