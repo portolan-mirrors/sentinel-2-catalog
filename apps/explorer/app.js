@@ -39,14 +39,23 @@ const { MapboxOverlay, GeoJsonLayer, MVTLayer } = window.deck;
 export const BASE = new URLSearchParams(location.search).get("base")
   ?? "https://data.source.coop/portolan-mirrors/sentinel-2-catalog";
 
+// The stats collection is three parquet products cut from one table
+// (tools/s2_stats.py): the app never reads the full table whole.
+//  - timeline.parquet: one row per month over all tiles, a few KB. Fetched
+//    whole on load; it gives the month span and the global timeline.
+//  - months/YYYY-MM.parquet: one month's rows with the paint columns, sorted
+//    by tile, ~100-150 KB. Fetched whole when that month is shown, then
+//    kept registered so a revisit is free.
+//  - mgrs-monthly.parquet: the full table, ~21 MB, sorted by tile in 10k-row
+//    groups. Only ever range-read over httpfs with WHERE mgrs_tile = ..., the
+//    way the scene search reads the year parts: one tile's history is one
+//    or two row groups, not the file.
 const STATS = `${BASE}/stats/mgrs-monthly.parquet`;
-// The stats file is fetched once, whole, and registered with DuckDB under
-// this name: it is sorted by tile, so any month's rows are spread across
-// every row group and a range-read per month would re-fetch most of it.
-const STATS_FILE = "mgrs-monthly.parquet";
+const TIMELINE = `${BASE}/stats/timeline.parquet`;
+const TIMELINE_FILE = "timeline.parquet";
+const monthUrl = (ym) => `${BASE}/stats/months/${ym}.parquet`;
 // Only these may reach the SQL string; the <select> is not trusted input.
-// `max_cover` is added once the stats file is known to carry it (Task 20).
-const METRICS = new Set(["min_cloud_cover", "scene_count", "median_cloud_cover"]);
+const METRICS = new Set(["min_cloud_cover", "scene_count", "median_cloud_cover", "max_cover"]);
 
 const $ = (id) => document.getElementById(id);
 const say = (msg, isError = false) => {
@@ -249,10 +258,6 @@ const hitIndex = {
 let lookup = new Map();
 let paintKey = 0;
 let maxCloud = Number($("maxcloud").value);
-// Coverage is feature-detected against the loaded stats file (Task 22, same
-// gate as the max_cover metric option): while false the coverage slider
-// stays hidden and s.cover is always null, so the gate below never fires.
-let hasCover = false;
 let minCoverage = Number($("mincoverage").value);
 let minScenes = Number($("minscenes").value);
 let hovered = null;          // the hovered feature (GeoJSON, WGS84) or null
@@ -343,33 +348,37 @@ render();
 // Stats: the choropleth and the timeline.
 // ---------------------------------------------------------------------------
 
-// The stats file, fetched whole with a progress line and handed to DuckDB as
-// an in-memory file. See STATS_FILE for why not a range read per month.
-async function loadStats() {
-  const res = await fetch(STATS);
+// A small remote parquet fetched whole and handed to DuckDB as an in-memory
+// file under `name`. Resolves false on a 404, which for a month slice means
+// "no tile-months for that month" (the builder writes a slice only for
+// months the table has), not a broken bucket.
+async function registerRemote(url, name) {
+  const res = await fetch(url);
+  if (res.status === 404) return false;
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const total = Number(res.headers.get("content-length")) || 0;
-  const mb = (n) => (n / 1e6).toFixed(1);
-  const chunks = [];
-  let got = 0, shown = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    got += value.length;
-    if (performance.now() - shown > 150) {
-      shown = performance.now();
-      say(`Reading the stats file… ${mb(got)}${total ? ` of ${mb(total)}` : ""} MB`);
-    }
+  await db.registerFileBuffer(name, new Uint8Array(await res.arrayBuffer()));
+  return true;
+}
+
+async function loadTimeline() {
+  if (!(await registerRemote(TIMELINE, TIMELINE_FILE))) throw new Error("HTTP 404");
+}
+
+// Month slices already registered with DuckDB: ym -> the registered file
+// name, or null for a month the bucket has no slice for. The value is the
+// in-flight promise, so two callers for the same month share one fetch and
+// a revisit costs nothing. A failed fetch is forgotten so the next attempt
+// retries rather than replaying the error.
+const monthFiles = new Map();
+function monthFile(ym) {
+  if (!monthFiles.has(ym)) {
+    const name = `month-${ym}.parquet`;
+    const p = registerRemote(monthUrl(ym), name)
+      .then((ok) => (ok ? name : null))
+      .catch((err) => { monthFiles.delete(ym); throw err; });
+    monthFiles.set(ym, p);
   }
-  const buf = new Uint8Array(got);
-  let o = 0;
-  for (const c of chunks) { buf.set(c, o); o += c.length; }
-  await db.registerFileBuffer(STATS_FILE, buf);
-  const cols = (await conn.query(`DESCRIBE SELECT * FROM read_parquet('${STATS_FILE}')`))
-    .toArray().map((r) => r.column_name);
-  return { bytes: got, columns: new Set(cols) };
+  return monthFiles.get(ym);
 }
 
 // How a metric's raw value maps onto the 0..100 ramp (0 = green).
@@ -382,27 +391,26 @@ function onRamp(metric, raw) {
   return x;
 }
 
+// The month's rows from its slice: [] for a month with no slice. The
+// percent columns are UTINYINT and scene_count USMALLINT; they arrive as JS
+// numbers and Number() in onRamp and paintMonth handles them like any other.
 export async function statsForMonth(y, m) {
   const metric = $("metric").value;
   if (!METRICS.has(metric)) throw new Error(`unknown metric ${metric}`);
-  // max_cover is only selected once known to exist (see hasCover): a stats
-  // file predating the Task 20 rebuild has no such column at all.
-  const coverSelect = hasCover ? ", max_cover AS cover" : "";
+  const ym = `${Number(y)}-${String(Number(m)).padStart(2, "0")}`;
+  const file = await monthFile(ym);
+  if (!file) return [];
   const res = await conn.query(`
-    SELECT mgrs_tile, ${metric} AS v, min_cloud_cover AS cc, scene_count AS sc${coverSelect}
-    FROM read_parquet('${STATS_FILE}')
-    WHERE year = ${Number(y)} AND month = ${Number(m)}`);
+    SELECT mgrs_tile, ${metric} AS v, min_cloud_cover AS cc, scene_count AS sc,
+           max_cover AS cover
+    FROM read_parquet('${file}')`);
   return res.toArray();
 }
 
 // The three filter sliders, combined into one sentence for the status line
-// (Task 22): "N of M tiles pass (cloud ≤ x, coverage ≥ y, scenes ≥ z)". The
-// coverage clause is only shown while the slider itself is shown.
+// (Task 22): "N of M tiles pass (cloud ≤ x, coverage ≥ y, scenes ≥ z)".
 function fmtFilters() {
-  const parts = [`cloud ≤ ${maxCloud}`];
-  if (hasCover) parts.push(`coverage ≥ ${minCoverage}`);
-  parts.push(`scenes ≥ ${minScenes}`);
-  return parts.join(", ");
+  return `cloud ≤ ${maxCloud}, coverage ≥ ${minCoverage}, scenes ≥ ${minScenes}`;
 }
 function passCounts() {
   let n = 0;
@@ -437,35 +445,42 @@ function updateScenesBound(rows) {
   $("minscenes-out").textContent = slider.value;
 }
 
+// A month slice is a network fetch now, so two quick month changes can
+// resolve out of order; only the latest call may touch the map or the
+// status line.
+let paintSeq = 0;
+
 async function paintMonth() {
   const [y, m] = ($("month").value || "").split("-").map(Number);
   if (!y || !m) return;
   const ym = `${y}-${String(m).padStart(2, "0")}`;
+  const seq = ++paintSeq;
   // Said once, on whichever paintMonth() call happens to be first (the
   // default-month load), then never again.
   const note = lagNote;
   lagNote = "";
-  say(`Reading ${ym} from mgrs-monthly.parquet…`);
+  say(`Reading ${ym}…`);
   let rows;
   try {
     rows = await statsForMonth(y, m);
   } catch (err) {
-    say(`Could not read ${STATS} — ${err.message}`, true);
+    if (seq === paintSeq) say(`Could not read ${monthUrl(ym)} — ${err.message}`, true);
     return;
   }
+  if (seq !== paintSeq) return;
   updateScenesBound(rows);
   const metric = $("metric").value;
   const next = new Map();
   for (const r of rows) {
-    // A NULL metric (every pre-rebuild row's cover, a NULL cloud cover) is
-    // left unpainted: Number(null) is 0, which would read as "0% filled"
+    // A NULL metric (a cover with no nodata property, a NULL cloud cover)
+    // is left unpainted: Number(null) is 0, which would read as "0% filled"
     // or "0% cloud". A NULL clearest-scene cover, coverage or scene count
     // is kept as null so no slider ever dims what it cannot judge.
     if (r.v == null) continue;
     next.set(r.mgrs_tile, {
       v: onRamp(metric, r.v),
       cc: r.cc == null ? null : Number(r.cc),
-      cover: hasCover && r.cover != null ? Number(r.cover) : null,
+      cover: r.cover == null ? null : Number(r.cover),
       sc: r.sc == null ? null : Number(r.sc),
     });
   }
@@ -480,26 +495,39 @@ async function paintMonth() {
   }
   const unpainted = rows.length - next.size;
   say(`${rows.length.toLocaleString()} MGRS tiles imaged in ${ym} — `
-    + `filtered in the browser from the stats file, no API call.`
+    + `one small month slice (months/${ym}.parquet), no API call.`
     + (unpainted ? ` ${unpainted.toLocaleString()} have no ${metric} value and stay grey.` : "")
     + ` ${filterLine()}.`
     + (note ? ` ${note}` : ""));
 }
 
+// All tiles: the timeline file, already in memory, one row per month. One
+// tile: the full table over httpfs, WHERE mgrs_tile = ... — DuckDB reads
+// the footer, keeps only the row groups whose mgrs_tile range covers the
+// tile (the table is sorted by tile), and range-reads those.
 export async function timelineFor(tile) {
   const bars = $("bars");
-  const where = tile ? `WHERE mgrs_tile = '${tile.replace(/'/g, "")}'` : "";
   let rows;
   try {
-    const res = await conn.query(`
-      SELECT year, month, sum(scene_count)::INT AS n,
-             min(min_cloud_cover) AS clearest
-      FROM read_parquet('${STATS_FILE}')
-      ${where} GROUP BY 1, 2 ORDER BY 1, 2`);
+    if (tile) say(`Reading tile ${tile}'s history…`);
+    const res = await conn.query(tile
+      ? `SELECT year, month, sum(scene_count)::INT AS n,
+                min(min_cloud_cover) AS clearest
+         FROM read_parquet('${STATS}')
+         WHERE mgrs_tile = '${tile.replace(/'/g, "")}'
+         GROUP BY 1, 2 ORDER BY 1, 2`
+      : `SELECT year, month, scene_count AS n, min_cloud_cover AS clearest
+         FROM read_parquet('${TIMELINE_FILE}') ORDER BY 1, 2`);
     rows = res.toArray();
   } catch (err) {
     bars.replaceChildren(el("p", "hint", `Timeline unavailable — ${err.message}`));
+    if (tile) say(`Could not read tile ${tile}'s history from ${STATS} — ${err.message}`, true);
     return;
+  }
+  if (tile) {
+    const scenes = rows.reduce((t, r) => t + Number(r.n), 0);
+    say(`Tile ${tile}: ${rows.length} months, ${scenes.toLocaleString()} scenes — `
+      + "range-read from mgrs-monthly.parquet, not the whole file.");
   }
   const scope = tile ? `Tile ${tile}` : "All tiles";
   bars.replaceChildren();
@@ -507,7 +535,7 @@ export async function timelineFor(tile) {
     $("timeline-scope").textContent = `${scope} — nothing to plot.`;
     bars.append(el("p", "hint", tile
       ? `No months recorded for tile ${tile}.`
-      : "The stats file is empty — nothing has been published yet."));
+      : "The stats timeline is empty — nothing has been published yet."));
     return;
   }
   const ymOf = (r) => `${r.year}-${String(r.month).padStart(2, "0")}`;
@@ -560,12 +588,13 @@ function updateLegend() {
 }
 
 // The current calendar month is empty until the backfill lands, so the app
-// opens on the newest month the stats file actually contains.
+// opens on the newest month the stats actually contain: the last row of the
+// timeline file, which is also the newest month with a months/ slice.
 async function newestMonth() {
   const res = await conn.query(
     `SELECT max(year::INT * 100 + month::INT) AS ym,
             min(year::INT * 100 + month::INT) AS lo
-     FROM read_parquet('${STATS_FILE}')`);
+     FROM read_parquet('${TIMELINE_FILE}')`);
   const [row] = res.toArray();
   const fmt = (n) => `${Math.floor(n / 100)}-${String(n % 100).padStart(2, "0")}`;
   return row?.ym ? { newest: fmt(row.ym), oldest: fmt(row.lo) } : null;
@@ -577,27 +606,19 @@ async function newestMonth() {
 let sliderFrame = 0;
 function onSlider() {
   $("maxcloud-out").textContent = $("maxcloud").value;
-  if (hasCover) $("mincoverage-out").textContent = $("mincoverage").value;
+  $("mincoverage-out").textContent = $("mincoverage").value;
   $("minscenes-out").textContent = $("minscenes").value;
   if (sliderFrame) return;
   sliderFrame = requestAnimationFrame(() => {
     sliderFrame = 0;
     const cc = Number($("maxcloud").value);
-    const cov = hasCover ? Number($("mincoverage").value) : 0;
+    const cov = Number($("mincoverage").value);
     const sc = Number($("minscenes").value);
     if (cc === maxCloud && cov === minCoverage && sc === minScenes) return;
     maxCloud = cc; minCoverage = cov; minScenes = sc;
     repaint();
     say(`${filterLine()}.`);
   });
-}
-
-// Shows or hides the coverage slider (feature-detected exactly like the
-// Color-by option): while the stats file lacks max_cover the row stays
-// hidden and its one-line note explains why.
-function setCoverUi(has) {
-  $("mincoverage-row").hidden = !has;
-  $("mincoverage-note").hidden = has;
 }
 
 let dateRange = null;
@@ -642,40 +663,30 @@ async function init() {
   $("maxcloud").addEventListener("input", onSlider);
   $("mincoverage").addEventListener("input", onSlider);
   $("minscenes").addEventListener("input", onSlider);
-  say("Reading the stats file…");
-  let stats, span;
+  say("Reading the stats timeline…");
+  let span;
   try {
-    stats = await loadStats();
+    await loadTimeline();
     span = await newestMonth();
   } catch (err) {
-    say(`Could not open ${STATS}. The file is missing, unreadable, or the `
-      + `bucket refused the read (${err.message}). Until the backfill `
-      + `publishes, serve a local publish tree and load `
+    say(`Could not open ${TIMELINE}. The file is missing, unreadable, or the `
+      + `bucket refused the read (${err.message}). Until publish-stats `
+      + `publishes it, serve a local publish tree and load `
       + `?base=http://localhost:8081`, true);
     return;
   }
-  // The coverage columns only exist once publish-stats has rebuilt the file
-  // with tools/s2_stats.py from Task 20; until then the option is not offered
-  // and the coverage slider stays hidden (setCoverUi).
-  hasCover = stats.columns.has("max_cover");
-  if (hasCover) {
-    METRICS.add("max_cover");
-  } else {
-    $("metric").querySelector('option[value="max_cover"]')?.remove();
-  }
-  setCoverUi(hasCover);
   if (!span) {
-    say("The stats file has no rows yet — the backfill has not published any "
-      + "tile-months. The map and timeline will fill in once it does.");
+    say("The stats timeline has no rows yet — the backfill has not published "
+      + "any tile-months. The map and timeline will fill in once it does.");
     await timelineFor(null);
     return;
   }
   const month = $("month");
-  // The stats file can lag the item parts (it is rebuilt on its own
+  // The stats can lag the item parts (they are rebuilt on their own
   // schedule, one cached HEAD per year past the stats to find how far
   // publishing has gone, the same probe the search uses): the default
-  // month is always span.newest, the newest month the stats file actually
-  // has rows for (computed in newestMonth() above with year/month cast to
+  // month is always span.newest, the newest month the timeline actually
+  // has a row for (computed in newestMonth() above with year/month cast to
   // INT before the year*100+month arithmetic — SMALLINT overflows past
   // year 327). Never default to a month the stats haven't reached yet,
   // which would paint an all-grey map with nothing to click. The picker

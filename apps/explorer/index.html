@@ -41,9 +41,9 @@
     <label>Max cloud % <input type="range" id="maxcloud" min="0" max="100" value="10">
       <output id="maxcloud-out">10</output></label>
     <p class="hint">Tiles whose clearest scene is cloudier than this go grey on the map.</p>
-    <label id="mincoverage-row" hidden>Min coverage % <input type="range" id="mincoverage" min="0" max="100" value="0">
+    <label id="mincoverage-row">Min coverage % <input type="range" id="mincoverage" min="0" max="100" value="0">
       <output id="mincoverage-out">0</output></label>
-    <p class="hint" id="mincoverage-note">Coverage arrives with the next stats rebuild.</p>
+    <p class="hint">Tiles whose fullest scene this month fills less of the tile than this go grey on the map.</p>
     <label>Min scenes <input type="range" id="minscenes" min="0" max="1" value="0" step="1"
         title="Tiles with fewer scenes this month go grey on the map. The scene search below is not gated by this slider: a search window's scene count can differ from the whole month's.">
       <output id="minscenes-out">0</output></label>
