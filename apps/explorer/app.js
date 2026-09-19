@@ -849,7 +849,15 @@ LIMIT 30`;
 
 // The request a STAC API would have been asked for the same answer. Shown in
 // full because not making it is the point of this page.
-function apiMirror(tile, d0, d1, cc) {
+function apiMirror(tile, d0, d1, cc, cov) {
+  const query = {
+    "eo:cloud_cover": { lte: cc },
+    "s2:mgrs_tile": { eq: tile },
+  };
+  // Mirrors sceneSql's coverage gate: coverage = 100 - nodata, so
+  // coverage >= cov is nodata <= 100 - cov. Omitted at the slider's inert
+  // value, same as the real query.
+  if (cov > 0) query["s2:nodata_pixel_percentage"] = { lte: 100 - cov };
   return JSON.stringify({
     note: "The STAC API request this page did NOT need to make. "
       + "Earth Search would answer it; the panel above is the same answer, "
@@ -859,10 +867,7 @@ function apiMirror(tile, d0, d1, cc) {
     body: {
       collections: ["sentinel-2-l2a"],
       datetime: `${d0}T00:00:00Z/${d1}T23:59:59Z`,
-      query: {
-        "eo:cloud_cover": { lte: cc },
-        "s2:mgrs_tile": { eq: tile },
-      },
+      query,
       sortby: [{ field: "properties.eo:cloud_cover", direction: "asc" }],
       limit: 30,
     },
@@ -1089,7 +1094,7 @@ async function runQuery() {
     }
     const sql = sceneSql(urls, selectedTile, d0, d1, cc, minCoverage);
     $("sql").textContent = sql;
-    $("api").textContent = apiMirror(selectedTile, d0, d1, cc);
+    $("api").textContent = apiMirror(selectedTile, d0, d1, cc, minCoverage);
     say(`Range-reading ${urls.length} parquet part`
       + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
     const rows = (await conn.query(sql)).toArray();
