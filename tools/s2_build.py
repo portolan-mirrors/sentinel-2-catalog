@@ -257,6 +257,8 @@ def only_zone_parts(year: int, parts: tuple[tuple[str, int, int], ...],
             f"--only-parts: {', '.join(unknown)} not among year={year}'s "
             f"zone parts; valid labels: {', '.join(valid)}")
     return tuple(part for part in parts if part[0] in only)
+
+
 # The UTM zone of a scene, from the leading one or two digits of its MGRS
 # tile id ('1VCJ', '31UFU'). NULL when the id does not start with a digit.
 ZONE_SQL = """TRY_CAST(regexp_extract("s2:mgrs_tile", '^(\\d{1,2})', 1) AS INTEGER)"""
@@ -416,6 +418,27 @@ def published_rows(con, url: str) -> int:
             f"refusing to guess whether the published part is current")
 
 
+def consolidation_plan(base: str, year: int, probe=published_part) -> dict:
+    """What consolidate-month.yml's plan job needs to know about a year,
+    from one round of HEADs: whether live.parquet is published, and for
+    each archive part of the year's tier ("items" when it has none)
+    whether it is. Every HEAD goes through `probe` (published_part, with
+    its retries), so a transient failure is retried here, once, instead of
+    in each of eight part jobs -- one part job that took a passing 404 for
+    "never published" would rebuild its part from live alone and drop the
+    rest of the year's scenes on upload. A probe that cannot answer stops
+    the plan (published_part raises), and nothing is built.
+
+    Returns {"live": bool, "parts": [label, ...],
+             "include": [{"part": label, "exists": bool}, ...]}.
+    """
+    labels = [label for label, _, _ in zone_parts_for(year)] or ["items"]
+    live = probe(base, year, "live.parquet")
+    include = [{"part": label, "exists": probe(base, year, f"{label}.parquet")}
+               for label in labels]
+    return {"live": live, "parts": labels, "include": include}
+
+
 def run_part_hook(cmd: list[str], part: Path, year: int) -> None:
     """Run the --on-part-done command with the finished part's path appended
     (`shlex.split(CMD) + [path]`, stdio inherited so an upload's progress
@@ -534,10 +557,9 @@ def build_year(con, files: list[str], year: int, outdir: Path,
     before staging, on the HEADs alone: the point of the flag is that
     re-dispatching a finished year costs nothing."""
     lst = ",".join(f"'{f}'" for f in files)
-    dest = outdir / f"year={year}"
-    dest.mkdir(parents=True, exist_ok=True)
-    final = dest / name
     label = "zones" if split == "zones" else name
+    # Every refusal comes before the year directory exists, so a refused
+    # build leaves no empty year=YYYY/ behind.
     parts = ()
     if split == "zones":
         parts = zone_parts_for(year)
@@ -549,6 +571,9 @@ def build_year(con, files: list[str], year: int, outdir: Path,
             parts = only_zone_parts(year, parts, only_parts)
     elif only_parts:
         raise SystemExit("--only-parts applies to --split zones only")
+    dest = outdir / f"year={year}"
+    dest.mkdir(parents=True, exist_ok=True)
+    final = dest / name
     # Ask the bucket before staging anything: a year whose every part is
     # already up costs one HEAD per part and no minutes, and a rerun after a
     # timeout builds only what the last run did not finish uploading.

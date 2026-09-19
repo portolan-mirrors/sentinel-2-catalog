@@ -14,28 +14,34 @@ name: consolidate-month
 # eight of them in one job is 8-12 hours, past the 6-hour runner ceiling.
 # So the work is three jobs:
 #
-#   plan      The bootstrap guard, then the year and its part list as a
-#             matrix.
+#   plan      The bootstrap guard, then ONE round of HEADs through
+#             s2_build.consolidation_plan (published_part's retries; a
+#             code that is not 200 or 404 stops the plan): is live
+#             published, and which archive parts are. The answers become
+#             the matrix. No live means nothing to fold: the plan says so
+#             and the other jobs are skipped.
 #
-#   part      One job per archive part, all eight at once. Downloads that
-#             part (if published) and live, runs s2_build.py with
-#             --only-parts <part> so the rows of the other ranges are
-#             dropped and only this part is sorted and written, and hands
-#             the file to finalize as a run artifact. Nothing is uploaded
-#             here. A live that is not published (404) means there is
-#             nothing to fold, and the job ends with no artifact.
+#   part      One job per archive part, all at once. It trusts the plan:
+#             live is downloaded and any failure is fatal; a part the
+#             plan saw is downloaded and any failure, a 404 included, is
+#             fatal; a part the plan did not see is built from live's
+#             rows alone. A job never probes for itself, so a transient
+#             404 in one of eight jobs cannot pass as "never published".
+#             s2_build.py --only-parts <part> drops the rows of the other
+#             ranges and sorts and writes only this part, which goes to
+#             finalize as a run artifact. Nothing is uploaded here.
 #
-#   finalize  Collects every part artifact into one staging tree, writes
-#             the zero-row live.parquet, restamps the metadata, validates,
-#             and uploads: the parts first, then the emptied live, then
-#             the catalog. Runs only when every part job succeeded.
+#   finalize  Collects every part artifact into one staging tree and
+#             stops unless the count equals the plan's part count. Then
+#             it writes the zero-row live.parquet, restamps the metadata,
+#             validates, and uploads: the parts first, then the emptied
+#             live, then the catalog. Runs only when every part job
+#             succeeded.
 #
-# A part job that fails leaves live untouched and uploads nothing: finalize
-# does not run, so the bucket keeps last month's parts and the full live,
-# and the next run folds the same rows again. A part missing from the
-# merge would otherwise be rewritten from live's rows alone and overwrite
-# months of scenes on upload, which is also why any failure to fetch a
-# published part is fatal to its job.
+# A part job that fails stops finalize. Live stays as it is. Nothing
+# uploads. The next run folds the same rows again. This matters because a
+# part left out of the merge would be rewritten from live's rows alone,
+# and its upload would overwrite months of scenes.
 #
 # Bootstrap guard: same reasoning as refresh-daily.yml -- nothing is
 # published on a fresh repo until publish-backfill has run once, so the
@@ -65,11 +71,13 @@ env:
 jobs:
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     outputs:
       published: ${{ steps.guard.outputs.published }}
-      year: ${{ steps.parts.outputs.year }}
-      parts: ${{ steps.parts.outputs.parts }}
+      year: ${{ steps.plan.outputs.year }}
+      live: ${{ steps.plan.outputs.live }}
+      parts: ${{ steps.plan.outputs.parts }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - name: Check the catalog is published
         id: guard
@@ -90,36 +98,46 @@ jobs:
       - name: Install tooling
         if: steps.guard.outputs.published == 'true'
         # s2_build imports duckdb at module level; nothing else is needed
-        # to ask it for the part list.
+        # to ask it for the plan.
         run: pip install --quiet duckdb
-      - name: Name the year and its archive parts
-        id: parts
+      - name: Probe live and the year's archive parts
+        id: plan
         if: steps.guard.outputs.published == 'true'
         run: |
           set -euo pipefail
           Y="${{ inputs.year }}"; [ -z "$Y" ] && Y=$(date -u +%Y)
-          # This year's part names come from tools/s2_build.py
-          # (zone_parts_for picks the tier by year; empty means the year is
-          # one items.parquet), so the matrix cannot drift from the builder.
-          PARTS=$(python3 -c '
-          import json, sys; sys.path.insert(0, "tools")
-          from s2_build import zone_parts_for
-          labels = [label for label, _, _ in zone_parts_for(int(sys.argv[1]))]
-          print(json.dumps(labels or ["items"]))' "$Y")
-          echo "year=$Y archive parts: $PARTS"
-          echo "year=$Y" >> "$GITHUB_OUTPUT"
-          echo "parts=$PARTS" >> "$GITHUB_OUTPUT"
+          # The part names come from tools/s2_build.py (zone_parts_for picks
+          # the tier by year; empty means the year is one items.parquet), so
+          # the matrix cannot drift from the builder. Every HEAD is
+          # published_part's: retried, and fatal on an answer that is not
+          # 200 or 404.
+          Y="$Y" python3 - << 'EOF'
+          import json, os, sys
+          sys.path.insert(0, "tools")
+          from s2_build import consolidation_plan
+          year = int(os.environ["Y"])
+          plan = consolidation_plan(os.environ["BASE"], year)
+          have = [e["part"] for e in plan["include"] if e["exists"]]
+          print(f"year={year}: live {'published' if plan['live'] else 'not published'}; "
+                f"archive parts {plan['parts']}, published {have}")
+          if not plan["live"]:
+              print(f"::notice::year={year}: no live.parquet published; nothing to fold")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"year={year}\n")
+              out.write("live=" + ("true" if plan["live"] else "false") + "\n")
+              out.write("parts=" + json.dumps(plan["parts"]) + "\n")
+              out.write("matrix=" + json.dumps({"include": plan["include"]}) + "\n")
+          EOF
 
   part:
     needs: plan
-    if: needs.plan.outputs.published == 'true'
+    if: needs.plan.outputs.published == 'true' && needs.plan.outputs.live == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       max-parallel: 8
       fail-fast: false
-      matrix:
-        part: ${{ fromJSON(needs.plan.outputs.parts) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -129,18 +147,20 @@ jobs:
         # geoparquet-io pinned on purpose: see ci.yml and gpio-fix-report.md.
         run: pip install --quiet duckdb 'geoparquet-io==1.5.0'
       - name: Merge live into year=${{ needs.plan.outputs.year }}/${{ matrix.part }}.parquet
-        id: build
         run: |
           set -euo pipefail
           mkdir -p staging
           Y="${{ needs.plan.outputs.year }}"
           PART="${{ matrix.part }}"
+          EXISTS="${{ matrix.exists }}"
           # fetch <name>: download year=$Y/<name>.parquet to staging/<name>-prev.parquet.
-          # Returns 1 only on a 404 (never published); any other failure --
-          # a non-200 HEAD, or a GET that fails or is cut short -- kills the
-          # job, because a part silently left out of the merge is a part
-          # overwritten on upload with a fraction of its rows. fetch is
-          # called as an if/&& condition, where `set -e` does not apply
+          # Returns 1 on a 404; any other failure -- a non-200 HEAD, or a
+          # GET that fails or is cut short -- kills the job, because a part
+          # silently left out of the merge is a part overwritten on upload
+          # with a fraction of its rows. Whether a 404 is acceptable is the
+          # plan's decision, not this job's: every caller below treats the
+          # 1 as fatal too, because the plan already saw the file. fetch is
+          # called as an if/|| condition, where `set -e` does not apply
           # inside the body, so every fatal path exits explicitly.
           fetch() {
             local code
@@ -159,17 +179,21 @@ jobs:
               exit 1
             }
           }
-          # Live first: without it there is nothing to fold, and the part
-          # (hundreds of MB) is not worth downloading.
-          if ! fetch live; then
-            echo "::notice::year=$Y: no live.parquet, nothing to fold into $PART"
-            echo "built=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          fetch live || {
+            echo "::error::year=$Y/live.parquet: the plan saw it published and now it is not; not consolidating"
+            exit 1
+          }
           SRC="staging/live-prev.parquet"
-          # On the first consolidation of a year the part may not be
-          # published yet (404); then the part is live's rows alone.
-          if fetch "$PART"; then SRC="$SRC staging/$PART-prev.parquet"; fi
+          if [ "$EXISTS" = "true" ]; then
+            fetch "$PART" || {
+              echo "::error::year=$Y/$PART.parquet: the plan saw it published and now it is not; not consolidating without it"
+              exit 1
+            }
+            SRC="$SRC staging/$PART-prev.parquet"
+          else
+            # The first consolidation of a year: the part is live's rows alone.
+            echo "year=$Y/$PART.parquet: not published (plan); building it from live alone"
+          fi
           if [ "$PART" = "items" ]; then
             SHAPE="--name items.parquet"
           else
@@ -179,23 +203,27 @@ jobs:
           python3 tools/s2_build.py --sources $SRC --years "$Y" \
             --out ./staging/publish/sentinel-2-l2a --memory 12GB $SHAPE
           test -f "staging/publish/sentinel-2-l2a/year=$Y/$PART.parquet"
-          echo "built=true" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
-        if: steps.build.outputs.built == 'true'
         with:
           name: consolidated-${{ needs.plan.outputs.year }}-${{ matrix.part }}
           path: staging/publish/sentinel-2-l2a/year=${{ needs.plan.outputs.year }}/${{ matrix.part }}.parquet
           retention-days: 3
           if-no-files-found: error
+          # zstd-18 parquet does not compress again; gzip would cost
+          # minutes per part for nothing.
+          compression-level: 0
 
   finalize:
     needs: [plan, part]
     # always() so a skipped part matrix does not skip this job's own
     # evaluation; the result check is what keeps a failed part from
     # publishing anything.
-    if: always() && needs.plan.outputs.published == 'true' && needs.part.result == 'success'
+    if: always() && needs.plan.outputs.published == 'true' && needs.plan.outputs.live == 'true' && needs.part.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      Y: ${{ needs.plan.outputs.year }}
+      PARTS: ${{ needs.plan.outputs.parts }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -210,25 +238,34 @@ jobs:
           pattern: consolidated-${{ needs.plan.outputs.year }}-*
           merge-multiple: true
           path: staging/publish/sentinel-2-l2a/year=${{ needs.plan.outputs.year }}/
-      - name: Write the emptied live.parquet
-        id: staged
+      - name: Check every planned part arrived, then write the emptied live.parquet
         run: |
           set -euo pipefail
-          Y="${{ needs.plan.outputs.year }}"
           YEAR_DIR="staging/publish/sentinel-2-l2a/year=$Y"
           mkdir -p "$YEAR_DIR"
-          PARTS=$(find "$YEAR_DIR" -maxdepth 1 -name '*.parquet' ! -name 'live.parquet' | sort)
-          if [ -z "$PARTS" ]; then
-            echo "::notice::year=$Y: no part was consolidated (live.parquet not published); nothing to upload"
-            echo "have=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "consolidated parts:"; echo "$PARTS"
+          echo "consolidated parts:"
+          find "$YEAR_DIR" -maxdepth 1 -name '*.parquet' ! -name 'live.parquet' | sort
+          # Every part in the plan must be here. A short set uploaded with an
+          # emptied live would leave a hole in the year, so a mismatch stops
+          # the job before anything is written or uploaded.
+          python3 - << 'EOF'
+          import json, os
+          from pathlib import Path
+          y = os.environ["Y"]
+          planned = json.loads(os.environ["PARTS"])
+          year_dir = Path(f"staging/publish/sentinel-2-l2a/year={y}")
+          have = sorted(p.stem for p in year_dir.glob("*.parquet") if p.name != "live.parquet")
+          if have != sorted(planned):
+              raise SystemExit(
+                  f"year={y}: planned parts {sorted(planned)} but the part jobs "
+                  f"delivered {have}; not uploading a year that is short")
+          print(f"year={y}: all {len(planned)} planned part(s) delivered")
+          EOF
           # Empty live: publish a zero-row live.parquet rather than deleting
           # (publishing never deletes; a missing object would 404 in the glob
           # clients already resolved). Its schema is copied from whichever
           # archive part the merge just wrote.
-          Y="$Y" python3 - << 'EOF'
+          python3 - << 'EOF'
           import duckdb, glob, os
           y = os.environ["Y"]
           con = duckdb.connect(); con.execute("INSTALL spatial; LOAD spatial;")
@@ -240,50 +277,41 @@ jobs:
           dst = f"{year_dir}/live.parquet"
           con.execute(f"COPY (SELECT * FROM read_parquet('{parts[0]}') LIMIT 0) TO '{dst}' (FORMAT PARQUET, COMPRESSION zstd)")
           EOF
-          echo "have=true" >> "$GITHUB_OUTPUT"
       - name: Restamp collection metadata
-        if: steps.staged.outputs.have == 'true'
         run: |
           python3 tools/make_items.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
           python3 tools/make_collection.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
       - name: Validate before upload
-        if: steps.staged.outputs.have == 'true'
         run: python3 tests/run_all.py
         env:
           CI_LIGHT: "1"
       - name: Assume the Source Cooperative write role
-        if: steps.staged.outputs.have == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
           aws-region: us-west-2
       # Upload order matters. The archive parts must land before the emptied
-      # live.parquet: a client that reads the year's glob while the parts
+      # live.parquet. A client that reads the year's glob while the parts
       # are up and the old live is still there sees this month's scenes
-      # twice, which is harmless; a client that saw the empty live before
-      # the parts landed would see a hole where this month's scenes were,
-      # which is not. upload_data.py without --only walks the whole tree on
+      # twice. That is harmless. A client that saw the empty live before
+      # the parts landed would see a hole where this month's scenes were.
+      # That is not. upload_data.py without --only walks the whole tree on
       # a thread pool (publish.upload_all), and its sorted walk puts
       # live.parquet before z*.parquet in any case, so the natural order
       # guarantees nothing. Two passes: every archive part through --only,
       # then live on its own once all of them are up.
       - name: Upload the archive parts
-        if: steps.staged.outputs.have == 'true'
         run: |
           set -euo pipefail
-          Y="${{ needs.plan.outputs.year }}"
           for f in $(find "staging/publish/sentinel-2-l2a/year=$Y" -maxdepth 1 -name '*.parquet' ! -name 'live.parquet' | sort); do
             python3 tools/upload_data.py --confirm --data-dir ./staging/publish \
               --only "sentinel-2-l2a/year=$Y/$(basename "$f")"
           done
       - name: Upload the emptied live.parquet
-        if: steps.staged.outputs.have == 'true'
         run: |
           set -euo pipefail
-          Y="${{ needs.plan.outputs.year }}"
           python3 tools/upload_data.py --confirm --data-dir ./staging/publish \
             --only "sentinel-2-l2a/year=$Y/live.parquet"
       - name: Publish catalog metadata
-        if: steps.staged.outputs.have == 'true'
         run: python3 tools/publish.py --confirm

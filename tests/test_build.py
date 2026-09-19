@@ -612,7 +612,8 @@ def test_only_parts_refuses_a_label_outside_the_tier():
         assert "z01-20" in proc.stderr
         for label in OCTANT_LABELS:
             assert label in proc.stderr, label
-        assert not list((out / f"year={year}").glob("*.parquet"))
+        # Refused before the year directory exists: nothing left behind.
+        assert not (out / f"year={year}").exists()
 
 
 def test_only_parts_needs_split_zones():
@@ -626,6 +627,42 @@ def test_only_parts_needs_split_zones():
         assert proc.returncode != 0
         assert "--only-parts" in proc.stderr and "--split zones" in proc.stderr
         assert not (out / f"year={year}").exists()
+
+
+def test_consolidation_plan_probes_live_and_every_part_once():
+    """The plan job's one round of HEADs: live and each part of the year's
+    tier, through the injected probe, in a shape the workflow turns into
+    outputs and a matrix. A probe that raises (published_part on a code
+    that is not 200 or 404) propagates and plans nothing."""
+    from s2_build import consolidation_plan
+    up = {"live.parquet", "z01-15.parquet", "z53-60.parquet"}
+    asked = []
+
+    def probe(base, year, name):
+        asked.append((base, year, name))
+        return name in up
+
+    plan = consolidation_plan("https://x/sentinel-2-l2a", 2021, probe)
+    assert plan["live"] is True
+    assert plan["parts"] == OCTANT_LABELS
+    assert plan["include"] == [
+        {"part": label, "exists": label in ("z01-15", "z53-60")}
+        for label in OCTANT_LABELS]
+    assert [name for _, _, name in asked] == \
+        ["live.parquet", *(f"{label}.parquet" for label in OCTANT_LABELS)]
+    assert {base for base, _, _ in asked} == {"https://x/sentinel-2-l2a"}
+    assert {year for _, year, _ in asked} == {2021}
+
+    # A single-file year plans one "items" part, and no live means no work.
+    plan = consolidation_plan("https://x/sentinel-2-l2a", 2017,
+                              lambda base, year, name: name == "items.parquet")
+    assert plan == {"live": False, "parts": ["items"],
+                    "include": [{"part": "items", "exists": True}]}
+
+    def broken(base, year, name):
+        raise SystemExit(f"{name}: HEAD answered 403")
+    with pytest.raises(SystemExit, match="403"):
+        consolidation_plan("https://x/sentinel-2-l2a", 2021, broken)
 
 
 class _Bucket:
