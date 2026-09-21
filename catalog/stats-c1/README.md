@@ -1,6 +1,6 @@
 # MGRS coverage and cloud statistics (Collection 1)
 
-Four parquet products and one tileset, generated from the
+Three parquet products and one tileset, generated from the
 `sentinel-2-c1-l2a` item index (Sentinel-2 Collection 1) by
 `tools/s2_stats.py --collection sentinel-2-c1-l2a`, meant to be joined by
 `mgrs_tile`. They are the same products, with the same columns, as the

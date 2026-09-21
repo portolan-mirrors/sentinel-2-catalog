@@ -399,8 +399,8 @@ FIRST = cols.get(cols.DEFAULT)
 
 def staged_c1_year(directory: Path, year: int = 2026) -> Path:
     """One built Collection 1 year (the full 57-column schema, native
-    GEOMETRY, month-aligned row groups) plus a tail, through the real
-    build, so the generators read what s2_build --collection writes."""
+    GEOMETRY, uniform row groups, tile-major) plus a tail, through the
+    real build, so the generators read what s2_build --collection writes."""
     sys.path.insert(0, str(ROOT / "tests"))
     from test_build import _build_c1, _mk_c1_full_chunk
     chunks = directory / "chunks" / "api"

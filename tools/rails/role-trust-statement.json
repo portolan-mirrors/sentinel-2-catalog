@@ -1,0 +1,8 @@
+{
+  "Sid": "RailsSentinel2CatalogUser",
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "arn:aws:iam::939788573396:user/rails-sentinel-2-catalog"
+  },
+  "Action": "sts:AssumeRole"
+}

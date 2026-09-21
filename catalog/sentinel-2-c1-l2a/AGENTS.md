@@ -37,7 +37,10 @@ empties it. The two files of a year do not overlap, with one exception: a
 scene ESA reprocessed keeps its id with a newer `s2:generation_time`, and
 live holds the newer copy beside the archive's older one until the next
 fold. Dedupe on `id` keeping the highest `s2:generation_time` when you glob
-a year; it is safe and removes nothing else:
+a year; it is safe and removes nothing else. The `QUALIFY` below is that
+dedupe; without it the count is high by the number of scenes reprocessed
+since the last fold, which is a fine approximation for a coverage question
+and the wrong answer for an inventory one:
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
@@ -46,9 +49,13 @@ SET s3_url_style = 'path';
 SET TimeZone = 'UTC';
 
 SELECT year, count(*) AS scenes, min(datetime) AS first, max(datetime) AS last
-FROM read_parquet('s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=*/*.parquet',
-                  hive_partitioning = true)
-WHERE year IN (2017, 2018)
+FROM (
+  SELECT year, id, datetime
+  FROM read_parquet('s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=*/*.parquet',
+                    hive_partitioning = true)
+  WHERE year IN (2017, 2018)
+  QUALIFY row_number() OVER (PARTITION BY id ORDER BY "s2:generation_time" DESC NULLS LAST) = 1
+)
 GROUP BY year ORDER BY year;
 ```
 
@@ -302,7 +309,8 @@ when each year file is built and again at each fold. So `id` is unique
 within a file. Between folds, a reprocessed scene can sit in `live.parquet`
 with a newer `s2:generation_time` than the copy in `items.parquet`, so
 dedupe on `id` keeping the highest `s2:generation_time` when you glob a
-year. Across the whole table, treat `id` as unique and report it if you ever
+year (the `QUALIFY` in the glob snippet above). Across the whole table,
+treat `id` as unique and report it if you ever
 find otherwise.
 
 ## What this collection does not do

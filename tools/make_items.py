@@ -478,7 +478,7 @@ def main() -> int:
         if not parts:
             print(f"  {year}: no parts, skipped")
             continue
-        item = build_item(con, year, parts, committed, config)
+        item = build_item(con, year, parts, committed, config=config)
         target.mkdir(parents=True, exist_ok=True)
         (target / f"{year}.json").write_text(json.dumps(item, indent=2) + "\n")
         props = item["properties"]

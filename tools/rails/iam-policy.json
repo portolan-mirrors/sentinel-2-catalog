@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListTheCatalogPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::us-west-2.opendata.source.coop",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "portolan-mirrors/sentinel-2-catalog/*"
+        }
+      }
+    },
+    {
+      "Sid": "ReadAndWriteCatalogObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": "arn:aws:s3:::us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/*"
+    }
+  ]
+}
