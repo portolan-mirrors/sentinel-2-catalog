@@ -1006,7 +1006,7 @@ const chanKey = (ch) => ch.index ?? ch.band;
 function bandSpec(me) {
   const p = PRESETS[ui.preset];
   const spec = { kind: p.kind, preset: ui.preset, curve: ui.curve,
-    gamma: ui.gamma, nodata: ui.nodata, offset: me?.offset ?? 0,
+    gamma: ui.gamma, nodata: p.kind === "scl" ? 0 : ui.nodata, offset: me?.offset ?? 0,
     label: p.kind === "gray" ? `Single band ${ui.single}` : p.label };
   if (p.kind === "index") {
     spec.index = p.index;
@@ -1063,7 +1063,8 @@ function buildChannels(me, spec) {
     const stats = ch.index
       ? sceneIndexStats(me.scene, INDICES[ch.index].a, INDICES[ch.index].b, me.offset ?? 0)
       : me.scene.overviews.get(ch.band)?.value?.stats ?? null;
-    const lo = ch.index ? -1 : stats?.min ?? 0, hi = ch.index ? 1 : stats?.max ?? 1;
+    // No stats (band unreadable): the same 0..10000 the range was seeded with.
+    const lo = ch.index ? -1 : stats?.min ?? 0, hi = ch.index ? 1 : stats?.max ?? 10000;
     const block = el("div", "chan");
     const head = el("div", "chan-head");
     head.append(el("b", null, ch.index ? INDICES[ch.index].label : ch.band),
@@ -1129,8 +1130,9 @@ function drawHist(canvas, stats, lo, hi, min, max) {
 
 // The scene being shown: its row, the click's clock, the band-COG memory
 // (cog.js openScene), which band set is on the map, whether its tiles have
-// settled or one has failed, and a serial that a later spec bumps so a
-// superseded load's late overviews never draw. Replaced by every "Show on
+// settled or one has failed, whether a band set is still loading, and a
+// serial that a later load bumps so a superseded load's late overviews
+// never draw. Replaced by every "Show on
 // map" click and dropped by Clear.
 let shown = null;
 Object.defineProperties(window.S2, { shown: { get: () => shown }, ui: { value: ui } });
@@ -1163,22 +1165,28 @@ const stale = (me, serial) => me !== shown || serial !== me.serial;
 // Put the panel's spec on the map for the shown scene: the TCI path (Task
 // 27: thumbnail under the visual COG's tiles), a new band set (overviews
 // first — preview and histograms — then the tiles), or, when only the
-// stretch changed, a repaint of what is already there. Any failure takes
+// stretch changed, a repaint of what is already there. Only a load bumps
+// the serial: a gamma or curve change while a band set is still loading
+// must not make that load stale (its layer would never appear and the
+// spinner never clear); showBands re-derives the spec from `ui` once the
+// overviews are in, so the change is not lost either. Any failure takes
 // the scene off the map and hides the bar, so nothing is left without a
 // Clear.
 async function applySpec(me = shown) {
   if (!me) return;
-  const serial = ++me.serial;
+  let serial = me.serial;
   try {
     const spec = bandSpec(me);
     if (spec.kind === "tci") {
       if (me.bandsKey === "TCI") { syncPanel(spec, me); return; }
+      serial = ++me.serial;
       me.spec = spec;
       syncPanel(spec, me);
       await showTci(me, spec, serial);
     } else if (me.bandsKey !== spec.bands.join("+")) {
+      serial = ++me.serial;
       await showBands(me, spec, serial);
-    } else {
+    } else if (!me.loading) {
       restyle(me, spec);
     }
   } catch (err) {
@@ -1204,11 +1212,23 @@ async function showBands(me, spec, serial) {
   const { id } = me;
   me.bandsKey = spec.bands.join("+"); me.spec = spec;
   me.settled = false; me.failed = false;
+  me.loading = true;
   cogLayer = null; cogPreview = null; render();
   syncPanel(spec, me);
+  // The old channel blocks go now: a handle dragged during the load would
+  // write into ranges the new blocks are about to be built from.
+  $("channels").replaceChildren();
   cogbar(id, "loading", "Loading preview…");
   say(`Preview of ${id} (${spec.label}) — loading ${spec.bands.join(", ")} at full resolution…`);
-  const failed = await loadOverviews(me.scene, spec.bands);
+  try {
+    await showBandsLoaded(me, spec, serial, await loadOverviews(me.scene, spec.bands));
+  } finally {
+    // A newer load owns the flag; only this load's own end clears it.
+    if (me.serial === serial) me.loading = false;
+  }
+}
+async function showBandsLoaded(me, spec, serial, failed) {
+  const { id } = me;
   if (stale(me, serial)) return;
   me.missing = failed.map(([b]) => b);
   if (me.missing.length === spec.bands.length) {
@@ -1225,7 +1245,7 @@ async function showBands(me, spec, serial) {
   syncPanel(spec, me);
   buildChannels(me, spec);
   const preview = bandPreviewImage(me.scene, spec);
-  cogLayer = bandTileLayer(me.scene, spec, styleKeyOf(spec), `cog-${id}-${me.bandsKey}`, me.events);
+  cogLayer = bandTileLayer(me.scene, spec, styleKeyOf(spec), `cog-${id}-${me.bandsKey}`, me.eventsFor(me.bandsKey));
   cogPreview = preview ? previewLayer(preview, me.scene, `cog-preview-${id}`) : null;
   render();
   cogbar(id, "loading", preview ? "Preview shown — loading full resolution…" : "Loading full resolution…");
@@ -1243,7 +1263,7 @@ async function showBands(me, spec, serial) {
 function restyle(me, spec) {
   me.spec = spec;
   syncPanel(spec, me);
-  if (cogLayer) cogLayer = bandTileLayer(me.scene, spec, styleKeyOf(spec), cogLayer.id, me.events);
+  if (cogLayer) cogLayer = bandTileLayer(me.scene, spec, styleKeyOf(spec), cogLayer.id, me.eventsFor(me.bandsKey));
   if (cogPreview) {
     const img = bandPreviewImage(me.scene, spec);
     cogPreview = img ? previewLayer(img, me.scene, cogPreview.id) : null;
@@ -1265,7 +1285,7 @@ async function showTci(me, spec, serial) {
   me.bitmapP ??= thumbnailBitmap(r.thumbnail_url);
   const cog = await sceneCog(me.scene, "TCI");
   if (stale(me, serial)) return;
-  cogLayer = cogTileLayer(cog, `cog-${id}-TCI`, me.events);
+  cogLayer = cogTileLayer(cog, `cog-${id}-TCI`, me.eventsFor("TCI"));
   render();
   cogbar(id, "loading", "Loading full resolution…");
   const bitmap = await me.bitmapP;
@@ -1297,7 +1317,8 @@ async function showOnMap(r, button, preset = "tci", band = null) {
   const prev = shown?.id === id ? shown : null;
   const me = shown = { id, r, t0: performance.now(), serial: 0, bandsKey: null, spec: null,
     settled: false, failed: false, missing: [], ranges: prev?.ranges ?? new Map(),
-    offset: offsetOf(r), scene: prev?.scene ?? null, bitmapP: prev?.bitmapP ?? null, events: null };
+    offset: offsetOf(r), scene: prev?.scene ?? null, bitmapP: prev?.bitmapP ?? null,
+    loading: false, eventsFor: null };
   const bbox = bboxOf(r);
   if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 1200 });
   button.disabled = true;
@@ -1305,9 +1326,12 @@ async function showOnMap(r, button, preset = "tci", band = null) {
   // the bar names this scene from here on and the map must not contradict it.
   if (cogLayer || cogPreview) { cogLayer = null; cogPreview = null; render(); }
   cogbar(id, "loading", "Loading preview…");
-  me.events = {
+  // The tile events of one layer, bound to its band set: a layer taken off
+  // the map for another band set may still fire while its tiles drain,
+  // and must not settle or fail the one that replaced it.
+  me.eventsFor = (key) => ({
     onTileError: (err) => {
-      if (me !== shown || me.failed) return;
+      if (me !== shown || key !== me.bandsKey || me.failed) return;
       me.failed = true;
       console.warn(`[cog] tile failed for ${id}:`, err);
       cogbar(id, "partial", "Preview under the tiles — a full-resolution tile failed to load");
@@ -1315,11 +1339,11 @@ async function showOnMap(r, button, preset = "tci", band = null) {
         + "The preview stays under the tiles that did.", true);
     },
     onViewportLoad: () => {
-      if (me !== shown) return;
-      debug(`[cog] ${id} ${me.bandsKey} viewport loaded at ${(performance.now() - me.t0).toFixed(0)} ms`);
+      if (me !== shown || key !== me.bandsKey) return;
+      debug(`[cog] ${id} ${key} viewport loaded at ${(performance.now() - me.t0).toFixed(0)} ms`);
       tilesSettled();
     },
-  };
+  });
   try {
     me.scene ??= openScene(id, sceneDirOf(r));
     ui.preset = preset;

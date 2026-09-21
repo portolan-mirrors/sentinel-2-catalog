@@ -29,7 +29,7 @@
 // same way; those overviews also feed the histograms.
 import { fromUrl } from "https://esm.sh/geotiff@3.0.5";
 import proj4 from "https://esm.sh/proj4@2.22.0";
-import { paintRGBA, sampleStats, indexStats, bandsOf } from "./bands.js";
+import { paintRGBA, paintTables, sampleStats, indexStats, bandsOf } from "./bands.js";
 // deck.gl from the pinned dist bundle loaded by index.html (see app.js).
 const { TileLayer, BitmapLayer } = window.deck;
 
@@ -318,8 +318,9 @@ export function sceneOverview(scene, band) {
       let lvl = cog.levels[0];
       for (const l of cog.levels) if (Math.max(l.w, l.h) >= PREVIEW_MIN) lvl = l;
       const raster = await lvl.image.readRasters({ interleave: true });
+      // Stats on first use: the sort is for a histogram, and SCL has none.
       return { cog, band, data: raster, w: raster.width, h: raster.height, scale: lvl.scale,
-        x0: 0, y0: 0, stats: sampleStats(raster, 0) };
+        x0: 0, y0: 0, get stats() { return this._stats ??= sampleStats(raster, 0); } };
     });
     scene.overviews.set(band, p);
   }
@@ -401,7 +402,7 @@ async function bandTilePlanes(scene, bands, { index, bbox, signal }) {
 // getTileData's). The RGBA is painted lazily per tile and kept on the tile
 // data until the style changes.
 export function bandTileLayer(scene, spec, styleKey, id, events = {}) {
-  const bands = bandsOf(spec);
+  const bands = bandsOf(spec), tables = paintTables(spec);
   return new TileLayer({
     id,
     tileSize: TILE,
@@ -415,7 +416,7 @@ export function bandTileLayer(scene, spec, styleKey, id, events = {}) {
     renderSubLayers: (props) => {
       const d = props.data;
       if (!d) return null;
-      if (d.styleKey !== styleKey) { d.rgba = paintRGBA(d.planes, spec, TILE, TILE); d.styleKey = styleKey; }
+      if (d.styleKey !== styleKey) { d.rgba = paintRGBA(d.planes, spec, TILE, TILE, tables); d.styleKey = styleKey; }
       const { west, south, east, north } = props.tile.bbox;
       return new BitmapLayer(props, { data: null, image: d.rgba, bounds: [west, south, east, north] });
     },

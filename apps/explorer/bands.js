@@ -161,14 +161,20 @@ function histogram(values, lo, hi) {
   return bins;
 }
 
+// The lookup tables a spec paints through — built once per layer, not
+// once per tile.
+export function paintTables(spec) {
+  return { lut: makeLut(spec.curve, spec.gamma),
+    ramp: spec.kind === "index" ? rampTable(INDICES[spec.index].ramp) : null };
+}
+
 // Paint W x H RGBA from the planes a spec needs. `planes` maps band name ->
 // Float32Array (W*H, NaN off the scene) or null for a band that could not be
 // read (its channel paints black; the others still show). Channels are
 // {band|index, min, max}; `nodata` is the sample value keyed out (0, the
 // files' own) or null for none. Off-scene (NaN) is always transparent.
-export function paintRGBA(planes, spec, W, H) {
+export function paintRGBA(planes, spec, W, H, { lut, ramp } = paintTables(spec)) {
   const out = new Uint8ClampedArray(W * H * 4);
-  const lut = makeLut(spec.curve, spec.gamma);
   const nd = spec.nodata === null || spec.nodata === undefined ? NaN : Number(spec.nodata);
   const N = W * H;
   if (spec.kind === "scl") {
@@ -184,7 +190,7 @@ export function paintRGBA(planes, spec, W, H) {
   }
   if (spec.kind === "index") {
     const ix = INDICES[spec.index], a = planes[ix.a], b = planes[ix.b];
-    const ch = spec.channels[0], ramp = rampTable(ix.ramp), off = spec.offset || 0;
+    const ch = spec.channels[0], off = spec.offset || 0;
     const lo = ch.min, scale = 255 / ((ch.max - ch.min) || 1e-9);
     if (!a || !b) return new ImageData(out, W, H);
     for (let i = 0; i < N; i++) {
