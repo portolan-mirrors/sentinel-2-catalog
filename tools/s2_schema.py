@@ -14,7 +14,8 @@ from it.
 from __future__ import annotations
 
 
-# (name, duckdb type, description). Order is the seed file's order with the
+# (name, duckdb type, description). Order is the upstream item's property
+# order (fixed when the schema was set from Earth Search in 2026) with the
 # two sort helpers appended before geometry; geometry stays last so
 # `SELECT * EXCLUDE (geometry), geometry` round-trips cleanly.
 COLUMNS = [

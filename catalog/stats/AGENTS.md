@@ -8,7 +8,7 @@ fact came from, it does not belong in this file.
 
 ## What this is
 
-Four parquet products and one tileset, joined by `mgrs_tile`, all generated
+Three parquet products and one tileset, joined by `mgrs_tile`, all generated
 from the `sentinel-2-l2a` item index by `tools/s2_stats.py`:
 
 ```
@@ -110,8 +110,11 @@ The daily refresh recomputes only the current year (`--merge-years Y
 --existing <current mgrs-monthly.parquet>`) and splices it into the existing
 table rather than rescanning the whole archive. Every run then rewrites all
 of `months/*.parquet` and `timeline.parquet` from the merged table, and
-deletes any month slice the table no longer has, so the three parquet
-products always describe the same table. `mgrs.pmtiles` is not rebuilt on
+deletes from its local output any month slice the table no longer has, so
+the three parquet products always describe the same table. That deletion is
+local only: publishing never deletes from the bucket, so a slice the table
+dropped would stay published until removed by hand (months only grow, so
+this has not happened). `mgrs.pmtiles` is not rebuilt on
 that schedule: the tileset changes only when a fuller rebuild adds tiles
 that have never been seen, so the app's map layer and its statistics update
 on different cadences by design.

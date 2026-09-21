@@ -21,18 +21,20 @@ was counted on 2026-09-15 — plus small aggregate products (scene counts and
 cloud cover per MGRS tile per month) that make it practical to plan a query
 before running it.
 
-The mirror fills in year by year until it carries that whole record. The
+The mirror carries that whole record and follows it daily. The
 [`sentinel-2-l2a` collection](sentinel-2-l2a/collection.json) carries the row
 count and time range it holds right now, and each `year=YYYY/YYYY.json` item
 carries its year's. Those are the authority on what is here; this page
 describes what is mirrored and how to read it.
 
-Coverage is partial before December 2018: nothing for 2015-2016, part of
-2017-2018, complete after that. This mirror adds no items and drops none, so
-that gap is Earth Search's record, not an artifact of the mirroring.
+The record starts in November 2016, when Earth Search produced its first L2A
+Cloud-Optimized GeoTIFFs: 2015 and most of 2016 have no COG products, 2017-2018
+are partial, and the record is complete from about December 2018. This mirror
+adds no items and drops none, so that gap is Earth Search's record, not an
+artifact of the mirroring.
 
-[`sentinel-2-l2a`](sentinel-2-l2a/collection.json) holds the item index. The
-`stats` collection, with the MGRS aggregates, follows. Check
+[`sentinel-2-l2a`](sentinel-2-l2a/collection.json) holds the item index and
+[`stats`](stats/collection.json) holds the MGRS aggregates. Check
 [`catalog.json`](catalog.json) for the current list of collections.
 
 ## License
@@ -52,9 +54,11 @@ Cite this catalog itself as the item index derived from that archive.
 
 Every item comes from the
 [Earth Search STAC API](https://earth-search.aws.element84.com/v1), collection
-`sentinel-2-l2a`, fetched from the API and normalized to one schema. The whole
-archive is therefore one queryable table, and a row means the same thing in
-2019 as it does today.
+`sentinel-2-l2a`, fetched from the API and normalized to one schema. Months
+the API could not serve during its outage windows were read instead from the
+static item JSON in the `sentinel-cogs` bucket (the repair lane), which holds
+the same items. The whole archive is therefore one queryable table, and a row
+means the same thing in 2019 as it does today.
 
 This catalog does not filter, reclassify, or interpolate anything Earth Search
 publishes. Column meanings, the two added sort-key columns, and the query

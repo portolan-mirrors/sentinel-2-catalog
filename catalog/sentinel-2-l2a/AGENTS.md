@@ -181,11 +181,14 @@ when ESA processed the product, not when the satellite looked.
 readers can prune:
 
 - `_month` — `month(datetime)`, 1 to 12. The first sort key.
-- `_hilbert` — `ST_Hilbert(geometry, world bounds)`. The second sort key.
+- `_hilbert` — `ST_Hilbert(geometry, world bounds)`. The last sort key.
 
-Every part file is written sorted by `(_month, _hilbert)`: month first so that
-a month filter prunes row groups inside a year, Hilbert within month so that
-each row group's bounding box stays tight and a spatial filter prunes too.
+Every part file is written sorted by month first, so that a month filter
+prunes row groups inside a year, and by Hilbert position last, so that each
+row group's bounding box stays tight and a spatial filter prunes too. Parts
+published through 2025 are `(_month, _hilbert)`; parts from 2026 are
+`(_month, s2:mgrs_tile, _hilbert)`, which puts one tile's month in a single
+row group (see Row-group size above).
 Nothing upstream publishes these two columns. Do not pass them on as STAC
 properties, and do not treat `_hilbert` as meaningful on its own — it is a
 position on a space-filling curve, not a measurement.
@@ -209,11 +212,14 @@ the upstream item did not carry them.
 
 ## Coverage
 
-Nothing for 2015-2016. Part of 2017-2018. Complete from about December 2018.
+The record starts in November 2016, when Earth Search produced its first L2A
+Cloud-Optimized GeoTIFFs: nothing for 2015 and most of 2016, part of
+2017-2018, complete from about December 2018.
 
 That is what Earth Search and the `sentinel-cogs` bucket serve, not a gap
-introduced here. Do not report "no scenes in 2016" as an observation about
-Sentinel-2 — the mission was acquiring; this index does not carry those items.
+introduced here. Do not report "no scenes in early 2016" as an observation
+about Sentinel-2 — the mission was acquiring; this index does not carry those
+items.
 Check the per-year items (`year=YYYY/YYYY.json`) for each year's measured row
 count and time range before you conclude anything about a period.
 

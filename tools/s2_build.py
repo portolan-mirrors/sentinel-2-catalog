@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compact chunks (and/or the seed archive) into published year parts.
+"""Compact fetched chunks into published year parts.
 
     sentinel-2-l2a/year=<YYYY>/items.parquet   (--name overrides, e.g. live.parquet)
     sentinel-2-l2a/year=<YYYY>/z01-20.parquet  (--split zones, 2019-2020: four
@@ -846,7 +846,8 @@ def build_year(con, files: list[str], year: int, outdir: Path,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sources", nargs="+", required=True,
-                    help="chunk dirs and/or parquet files (seed included)")
+                    help="chunk dirs and/or parquet files (a published "
+                         "part or live.parquet counts)")
     ap.add_argument("--years", help="comma list; default = every year found")
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", default="items.parquet")

@@ -47,7 +47,8 @@ from make_items import (  # noqa: E402
 )
 from publish import load_config  # noqa: E402
 from s2_build import (  # noqa: E402
-    ZONE_PARTS, ZONE_PARTS_8, ZONE_SPLIT_8_FROM, ZONE_SPLIT_FROM,
+    TILE_SORT_FROM, ZONE_PARTS, ZONE_PARTS_8, ZONE_SPLIT_8_FROM,
+    ZONE_SPLIT_FROM, sort_key,
 )
 from s2_schema import COLUMNS  # noqa: E402
 
@@ -107,6 +108,26 @@ def zone_parts_text() -> str:
             f"consolidation. There is no zone= directory: every part sits "
             f"in year=YYYY/ and matches partition:glob, and a reader with a "
             f"tile id opens only the part whose zone range holds it.")
+
+
+# The sort keys as a reader knows them (s2_build.sort_key names the columns).
+_SORT_WORDS = {"_month": "month", "s2:mgrs_tile": "MGRS tile",
+               "_hilbert": "Hilbert index"}
+
+
+def sort_order_text() -> str:
+    """The row order of the parts, in prose, from s2_build.sort_key: parts
+    published before TILE_SORT_FROM are (_month, _hilbert), parts from
+    that year on put the tile between them. Derived per vintage so this
+    sentence cannot say one order when the builder writes two."""
+    def words(year: int) -> str:
+        keys = [_SORT_WORDS[k] for k in sort_key(year).split(",")]
+        return ", then ".join(keys)
+    return (f"Rows in parts published through {TILE_SORT_FROM - 1} are "
+            f"ordered by {words(TILE_SORT_FROM - 1)}, so a reader prunes on "
+            f"both time and space; parts from {TILE_SORT_FROM} are ordered "
+            f"by {words(TILE_SORT_FROM)}, which also puts one tile's month "
+            f"in a single row group.")
 
 
 def table_columns() -> list[dict]:
@@ -331,12 +352,13 @@ def main() -> int:
             f"`assets` object as a JSON string. Every Cloud-Optimized GeoTIFF "
             f"URL is therefore in the table -- no API call, no URL template to "
             f"guess -- while the imagery itself stays in the `sentinel-cogs` "
-            f"bucket on AWS. Rows are ordered by month and then by a Hilbert "
-            f"index, so a reader prunes on both time and space. "
-            f"{zone_parts_text()} Coverage before "
-            f"December 2018 is partial: nothing for 2015-2016 and part of "
-            f"2017-2018, which is what Earth Search serves rather than a gap "
-            f"introduced here. Contains modified Copernicus Sentinel data. "
+            f"bucket on AWS. {sort_order_text()} "
+            f"{zone_parts_text()} The record starts in November 2016, "
+            f"when Earth Search's first L2A Cloud-Optimized GeoTIFFs were "
+            f"produced; 2015 and most of 2016 have no COG products, and "
+            f"2017-2018 are partial, which is what Earth Search serves "
+            f"rather than a gap introduced here. "
+            f"Contains modified Copernicus Sentinel data. "
             f"Read the [agent guide](AGENTS.md) before querying: "
             f"`sat:orbit_state` and `s2:granule_id` are NULL on newer items, "
             f"and `assets` is a JSON string, not a struct."

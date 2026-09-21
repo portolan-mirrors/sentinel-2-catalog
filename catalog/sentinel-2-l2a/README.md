@@ -33,7 +33,8 @@ API. Swap `$.visual.href` for `$.red.href`, `$.scl.href` or any other key; the
 Three things make that query cheap. A tile id and a year name the part
 (`31UFU` is zone 31, so 2021 is `z21-31.parquet`; the Layout section has
 every range), so it opens one file. Rows inside each part are sorted by
-`(_month, _hilbert)`, so the month filter and a spatial filter both prune row
+month first (`(_month, _hilbert)` through 2025, `(_month, s2:mgrs_tile,
+_hilbert)` from 2026), so the month filter and a spatial filter both prune row
 groups. And the whole answer comes from HTTP range requests against the
 Parquet files: there is no API in front of this, so there is nothing to rate
 limit.
@@ -67,7 +68,8 @@ and temporal extent give the whole-archive answer without one.
 ```
 sentinel-2-l2a/
   collection.json
-  year=2017/items.parquet      one file per year through 2018
+  year=2016/items.parquet      one file per year through 2018
+  year=2017/items.parquet
   year=2018/items.parquet
   year=2019/z01-20.parquet     four files per year for 2019-2020, by UTM zone
   year=2019/z21-35.parquet
@@ -115,9 +117,10 @@ one part it names.
 
 ## Coverage
 
-Coverage before December 2018 is partial: nothing for 2015-2016, part of
-2017-2018. That is what Earth Search serves. This mirror adds no rows and
-drops none, so the gap is upstream, not here.
+The record starts in November 2016, when Earth Search produced its first L2A
+Cloud-Optimized GeoTIFFs: 2015 and most of 2016 have no COG products, and
+2017-2018 are partial. That is what Earth Search serves. This mirror adds no
+rows and drops none, so the gap is upstream, not here.
 
 `sat:orbit_state` and `s2:granule_id` are NULL on newer items, because Earth
 Search stopped populating them. Read the [agent guide](AGENTS.md) before you

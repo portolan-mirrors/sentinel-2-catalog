@@ -107,9 +107,10 @@ reads (tile, month and year predicates) by design; raise `http_timeout` and
 
 `live.parquet` and the current year's archive parts are disjoint. The daily
 rebuild re-reads a five-day window from Earth Search and drops every id the
-archive parts already hold. The two can overlap only for the few hours
-between a consolidation and the next refresh. Deduping on `id` is always
-safe, and removes nothing when nothing overlaps.
+archive parts already hold. The two can overlap only for the minutes inside
+a consolidation between the upload of the merged archive parts and the upload
+of the emptied `live.parquet`. Deduping on `id` is always safe, and removes
+nothing when nothing overlaps.
 
 ## Two collections
 
@@ -196,8 +197,9 @@ stop. Over tile `31UFU`, 2021 has 454 items for 217 distinct acquisitions and
 2022 has 226 for 217. The mirror is faithful to the source: it adds no rows
 and drops none, so the halving is Earth Search's record, not a gap here.
 
-Coverage before December 2018 is partial for the same reason: nothing for
-2015-2016 and part of 2017-2018 is what Earth Search serves. Two properties,
+Coverage before December 2018 is partial for the same reason: the record
+starts in November 2016 with Earth Search's first L2A COGs (2015 and most of
+2016 have no COG products), and 2017-2018 are partial. Two properties,
 `sat:orbit_state` and `s2:granule_id`, are NULL on newer items because Earth
 Search stopped publishing them. The
 [agent guide](catalog/sentinel-2-l2a/AGENTS.md) has the details.
@@ -206,10 +208,13 @@ Search stopped publishing them. The
 
 | Workflow | When | Does |
 |---|---|---|
-| `refresh-daily` | daily, 03:42 UTC | Fetches the last five days from Earth Search into the current year's `live.parquet`, splices the current year into the stats table, restamps counts and extents, uploads. Nothing is committed. |
-| `consolidate-month` | the 3rd of each month, 05:17 UTC | Folds `live.parquet` into the year's archive parts, one job per part, deduped by `id`; then empties `live`. |
+| `refresh-daily` | daily, 03:42 UTC | Fetches the last five days from Earth Search into `live.parquet` (one per year the window touches, two around New Year), splices those years into the stats table, restamps counts and extents, uploads. Nothing is committed. |
+| `consolidate-month` | the 3rd of each month, 05:17 UTC | Folds `live.parquet` into the year's archive parts for the current year and, while it still has a tail, the previous one, one job per part, deduped by `id`; then empties each folded `live`. |
 | `publish-stats` | manual | Full rebuild of `mgrs-monthly.parquet`, the month slices, `timeline.parquet` and `mgrs.pmtiles` from the published parts. |
 | `backfill` and `publish-backfill` | manual | Fetch the whole record one month-slice at a time, then the credentialed year-by-year build and upload. How the archive was seeded; also the repair path. |
+| `repair-slices` | manual | Re-fetch given months from the static item JSON in the `sentinel-cogs` bucket instead of the API, as `slice-YYYY-MM` artifacts `publish-backfill` consumes unchanged. |
+| `upload-file-data` | manual | Publishes one locally built data file (for example `mgrs.pmtiles`) from an https URL into a catalog directory. |
+| `check-access` | manual | Writes and deletes a marker object with the Source Cooperative role: a smoke test of the credentials. |
 | `publish-catalog` | manual | Publishes the committed `catalog/` metadata as-is. |
 | `pages` | on push to `apps/explorer/` | Deploys the explorer to GitHub Pages. |
 
