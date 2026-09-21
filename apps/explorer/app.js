@@ -4,8 +4,12 @@
 //   sentinel-2-l2a/year=*/…     – item queries (Task 12; one part per year
 //                                 by the tile's UTM zone from 2019, Task 18;
 //                                 eight parts from 2021, Task 19)
-//   …/TCI.tif                   – a scene's visual COG, drawn on the map
-//                                 straight from its overviews (Task 20)
+//   …/preview.jpg (thumbnail_url) – a scene's thumbnail: the card image, and
+//                                 the instant preview under "Show on map"
+//   …/TCI.tif (next to it)      – a scene's visual COG, drawn on the map
+//                                 straight from its overviews (Task 20),
+//                                 replacing the preview as its tiles load
+//                                 (Task 27)
 // There is no API, no server and no database behind this page: DuckDB-WASM
 // issues HTTP range reads straight at the object store, and so do the COG
 // reads. The map is MapLibre for the camera; the tiles are drawn by deck.gl
@@ -19,7 +23,7 @@ import { PMTiles, Protocol } from "https://esm.sh/pmtiles@3.2.0";
 import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
 import { parse } from "https://esm.sh/@loaders.gl/core@4.5.1";
 import { MVTLoader } from "https://esm.sh/@loaders.gl/mvt@4.5.1";
-import { openCog, cogTileLayer } from "./cog.js";
+import { openCog, cogTileLayer, previewImage, previewLayer } from "./cog.js";
 import { dayRange } from "./rangeslider.js";
 // deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
 // transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
@@ -262,6 +266,7 @@ let minCoverage = Number($("mincoverage").value);
 let minScenes = Number($("minscenes").value);
 let hovered = null;          // the hovered feature (GeoJSON, WGS84) or null
 let cogLayer = null;         // the shown scene's TileLayer, or null
+let cogPreview = null;       // its thumbnail warp, beneath the tiles until they load
 let selectedTile = null;
 
 // All three sliders AND together in one accessor; a NULL metric is "unknown"
@@ -307,6 +312,7 @@ function render() {
       updateTriggers: { getFillColor: paintKey },
       beforeId: "mgrs-line",
     }),
+    cogPreview,
     cogLayer,
     new GeoJsonLayer({
       id: "mgrs-hover",
@@ -963,33 +969,128 @@ const bboxOf = (r) => {
   }
 };
 
-// "Show on map": fly to the scene's footprint and draw its visual COG.
+// The visual COG sits next to the thumbnail in the scene directory (checked
+// on 2020 thumbnail.jpg and 2026 preview.jpg rows alike), and thumbnail_url
+// is already in the search projection — so "Show on map" derives the href
+// instead of reading the row's `assets`, which cost ~2 MB and ~6 s of range
+// reads per click (docs/query-performance.md) before anything appeared. The
+// same https-and-host rule as assetHref, but a wrong host refuses here: this
+// string is fetched, not just linked.
+const COG_HOST_RE = /(^|\.)(amazonaws\.com|source\.coop)$/;
+function visualHrefOf(r) {
+  const thumb = r.thumbnail_url;
+  if (typeof thumb !== "string" || !thumb) throw new Error("the item has no thumbnail_url to locate its COG by");
+  let u;
+  try { u = new URL(thumb); } catch { throw new Error(`thumbnail_url is not a URL: ${thumb}`); }
+  if (u.protocol !== "https:") throw new Error(`thumbnail_url is not https: ${thumb}`);
+  if (!COG_HOST_RE.test(u.hostname)) throw new Error(`thumbnail_url is on an unexpected host: ${u.hostname}`);
+  u.pathname = u.pathname.replace(/[^/]*$/, "TCI.tif");
+  u.search = ""; u.hash = "";
+  return u.href;
+}
+
+// The thumbnail as an ImageBitmap, or null when it cannot be had (the tiles
+// still come; only the instant preview is lost).
+async function thumbnailBitmap(url) {
+  try {
+    const res = await fetch(url, { mode: "cors" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await createImageBitmap(await res.blob());
+  } catch (err) {
+    console.warn(`no preview for the map: ${url} — ${err.message}`);
+    return null;
+  }
+}
+
+// The cogbar's states: "loading" spins until every tile in view has loaded,
+// "full" is the tiles alone, "partial" keeps the preview under tiles that
+// failed. The spinner is CSS on data-state (style.css).
+function cogbar(id, state, text) {
+  $("cog-id").textContent = id;
+  $("cog-state").dataset.state = state;
+  $("cog-state").textContent = text;
+  $("cogbar").hidden = false;
+}
+
+// The scene being shown: its id, the click's clock, and whether its tiles
+// have settled or one has failed. Replaced by every click (a second "Show on
+// map" before the first has drawn must win, and the first's late headers
+// must not draw over it) and dropped by Clear.
+let shown = null;
+
+// The preview comes off once the tile layer has every tile of the resting
+// viewport. onViewportLoad fires mid-flight too (each coarse view the camera
+// passes through loads), so while the map moves this waits for its moveend
+// and asks the layer itself. A later pan re-fires onViewportLoad; once
+// settled there is nothing left to do.
+function tilesSettled() {
+  if (!shown || shown.settled || shown.failed || !cogLayer) return;
+  if (map.isMoving() || !cogLayer.isLoaded) return;
+  shown.settled = true;
+  cogPreview = null;
+  render();
+  cogbar(shown.id, "full", "Full resolution");
+  say(`${shown.id} on the map at full resolution: TCI overviews range-read `
+    + "straight from the COG, reprojected in the browser. No tile server, no API.");
+}
+map.on("moveend", tilesSettled);
+
+// "Show on map": fly to the scene's footprint, draw its thumbnail over the
+// scene as soon as the COG's headers say where it goes, and let the tiles
+// replace it. Nothing waits on a tile: the preview needs the JPEG and one
+// small range read of headers, both started at once.
 async function showOnMap(r, button) {
+  const id = String(r.id);
+  const me = shown = { id, t0: performance.now(), settled: false, failed: false };
   const bbox = bboxOf(r);
   if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 1200 });
   button.disabled = true;
+  // A scene already on the map comes off now, not when this one is ready:
+  // the bar names this scene from here on and the map must not contradict it.
+  if (cogLayer || cogPreview) { cogLayer = null; cogPreview = null; render(); }
+  cogbar(id, "loading", "Loading preview…");
   try {
-    say(`Reading ${r.id}'s assets from the item part…`);
-    const assets = await assetsFor(r);
-    const href = assetHref(assets, "visual");
-    if (!href) throw new Error("the item has no https visual asset");
-    say(`Opening ${href.split("/").slice(-2).join("/")} — reading its overviews by range…`);
-    const cog = await openCog(href);
-    cogLayer = cogTileLayer(cog, `cog-${r.id}`);
+    const href = visualHrefOf(r);
+    say(`Preview of ${id} — loading full-resolution tiles…`);
+    const [bitmap, cog] = await Promise.all([thumbnailBitmap(r.thumbnail_url), openCog(href)]);
+    if (me !== shown) return;
+    const onTileError = (err) => {
+      if (me !== shown || me.failed) return;
+      me.failed = true;
+      console.warn(`[cog] tile failed for ${id}:`, err);
+      cogbar(id, "partial", "Preview under the tiles — a full-resolution tile failed to load");
+      say(`A full-resolution tile of ${id} failed to load — ${err?.message ?? err}. `
+        + "The preview stays under the tiles that did.", true);
+    };
+    const onViewportLoad = () => {
+      if (me !== shown) return;
+      console.info(`[cog] ${id} viewport loaded at ${(performance.now() - me.t0).toFixed(0)} ms`);
+      tilesSettled();
+    };
+    // The older thumbnail.jpg paints nodata white, the newer preview.jpg
+    // black (cog.js, jpegNodataMask); the file name says which.
+    const white = !/\/preview\.jpg$/i.test(new URL(r.thumbnail_url).pathname);
+    cogPreview = bitmap ? previewLayer(previewImage(cog, bitmap, { white }), cog, `cog-preview-${id}`) : null;
+    cogLayer = cogTileLayer(cog, `cog-${id}`, { onViewportLoad, onTileError });
     render();
-    $("cog-id").textContent = String(r.id);
-    $("cogbar").hidden = false;
-    say(`${r.id} on the map: TCI overviews range-read straight from the COG, `
-      + "reprojected in the browser. No tile server, no API.");
+    cogbar(id, "loading", cogPreview ? "Preview shown — loading full resolution…"
+      : "Loading full resolution…");
+    console.info(`[cog] ${id} preview ${cogPreview ? "shown" : "unavailable"} at ${(performance.now() - me.t0).toFixed(0)} ms`);
+    if (!cogPreview) say(`${id}: no preview (thumbnail unreadable) — loading full-resolution tiles…`);
   } catch (err) {
-    say(`Could not show ${r.id} — ${err.message}`, true);
+    if (me !== shown) return;
+    shown = null;
+    $("cogbar").hidden = true;
+    say(`Could not show ${id} — ${err.message}`, true);
   } finally {
     button.disabled = false;
   }
 }
 
 $("cog-clear").addEventListener("click", () => {
+  shown = null;
   cogLayer = null;
+  cogPreview = null;
   render();
   $("cogbar").hidden = true;
 });

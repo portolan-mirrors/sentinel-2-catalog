@@ -120,6 +120,19 @@ button.mini:not(:disabled):hover { background: #26457a; }
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
 }
 #cogbar b { word-break: break-all; }
+/* The tile-loading state: a spinner before the text while the preview
+   stands in, a green dot once every tile in view has loaded. */
+#cog-state { display: inline-flex; align-items: center; gap: 6px; opacity: .85; }
+#cog-state::before {
+  content: ""; width: 10px; height: 10px; border-radius: 50%; flex: none;
+  background: #1a9850;
+}
+#cog-state[data-state="loading"]::before {
+  background: none; border: 2px solid #2b4c86; border-top-color: #9ecae1;
+  animation: cog-spin .8s linear infinite;
+}
+#cog-state[data-state="partial"]::before { background: #f4a261; }
+@keyframes cog-spin { to { transform: rotate(360deg); } }
 .scene.best { position: relative; }
 .scene.best::before {
   content: "best"; position: absolute; left: 4px; top: 4px;
