@@ -16,8 +16,20 @@
 // the TCI over the same UTM square at ~32x, so once the COG's headers give
 // the geotransform it is one more overview level, warped whole into a single
 // image over the scene's bounds before any tile has been read.
+//
+// Any other band goes the same way (Task 28): every band is its own COG in
+// the scene directory (B02.tif, B08.tif, SCL.tif, ...), on its own 10, 20
+// or 60 m grid. A composite reads one window per distinct band, warps each
+// into a per-pixel sample plane of the tile, and paints the planes to RGBA
+// through the stretch (bands.js). The planes are kept per scene, tile and
+// band, so a stretch, curve, gamma or nodata change repaints without a
+// single new byte, and a band change fetches only the bands not yet seen.
+// The preview of a composite is each band's coarsest overview (the whole
+// level, one read per band), warped over the scene bounds and painted the
+// same way; those overviews also feed the histograms.
 import { fromUrl } from "https://esm.sh/geotiff@3.0.5";
 import proj4 from "https://esm.sh/proj4@2.22.0";
+import { paintRGBA, sampleStats, indexStats, bandsOf } from "./bands.js";
 // deck.gl from the pinned dist bundle loaded by index.html (see app.js).
 const { TileLayer, BitmapLayer } = window.deck;
 
@@ -91,18 +103,20 @@ function controlGrid(cog, { west, south, east, north }, W, H) {
   return { gx, gy, nx, ny, minx, miny, maxx, maxy };
 }
 
-// Paint a W x H ImageData through a control grid from one source raster —
-// an overview window or the thumbnail, interchangeably: `data` holds
-// interleaved w x h x bands samples whose pixel (0, 0) is (x0, y0) in a grid
-// of `scale` base pixels per sample, `nodata(k)` says whether the sample at
-// byte offset k stays see-through. Nearest neighbour; the placement is the
-// grid's.
-function warp(grid, { data, w, h, bands, scale, x0, y0, nodata }, W, H) {
+// Walk a W x H output raster through a control grid over one source raster
+// — an overview window, a whole overview, or the thumbnail, interchangeably:
+// w x h samples whose pixel (0, 0) is (x0, y0) in a grid of `scale` base
+// pixels per sample. Nearest neighbour; the placement is the grid's. For
+// each output pixel that lands on a source sample, put(o, s) is called with
+// the output pixel index and the source sample index. Every painter below
+// (RGBA for the TCI and the thumbnail, one plane per band for composites)
+// is this walk with a different put, so the placement cannot differ between
+// them.
+function warpEach(grid, { w, h, scale, x0, y0 }, W, H, put) {
   const { gx, gy, nx, ny } = grid, N = nx + 1;
   // The grid divides the output evenly, so a cell is CELL px only when the
   // side is a multiple of it (a tile always, the preview's short side not).
   const cw = W / nx, ch = H / ny;
-  const out = new Uint8ClampedArray(W * H * 4);
   for (let y = 0; y < H; y++) {
     const fy = (y + 0.5) / ch, j = Math.min(ny - 1, Math.floor(fy)), t = fy - j;
     for (let x = 0; x < W; x++) {
@@ -112,12 +126,54 @@ function warp(grid, { data, w, h, bands, scale, x0, y0, nodata }, W, H) {
       const py = (gy[a] * (1 - u) + gy[b] * u) * (1 - t) + (gy[c] * (1 - u) + gy[d] * u) * t;
       const sx = Math.floor(px / scale) - x0, sy = Math.floor(py / scale) - y0;
       if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
-      const k = (sy * w + sx) * bands, o = (y * W + x) * 4;
-      if (nodata(k)) continue;
-      out[o] = data[k]; out[o + 1] = data[k + 1]; out[o + 2] = data[k + 2]; out[o + 3] = 255;
+      put(y * W + x, sy * w + sx);
     }
   }
+}
+
+// Paint a W x H ImageData from one interleaved w x h x bands source (the TCI
+// or the thumbnail); `nodata(k)` says whether the sample at byte offset k
+// stays see-through.
+function warp(grid, src, W, H) {
+  const { data, bands, nodata } = src;
+  const out = new Uint8ClampedArray(W * H * 4);
+  warpEach(grid, src, W, H, (o, s) => {
+    const k = s * bands;
+    if (nodata(k)) return;
+    o *= 4;
+    out[o] = data[k]; out[o + 1] = data[k + 1]; out[o + 2] = data[k + 2]; out[o + 3] = 255;
+  });
   return new ImageData(out, W, H);
+}
+
+// One band's samples placed into a W x H plane of floats; NaN where the
+// output pixel falls outside the source (off the scene, or off a window
+// clipped to the level). The file's nodata value (0 for every Sentinel-2
+// band) is carried through as is: whether it is keyed out is the stretch's
+// call (bands.js), so the Nodata control can change without a re-warp.
+function warpPlane(grid, src, W, H) {
+  const { data } = src;
+  const plane = new Float32Array(W * H).fill(NaN);
+  warpEach(grid, src, W, H, (o, s) => { plane[o] = data[s]; });
+  return plane;
+}
+
+// The window of the overview whose pixels are closest to (but not coarser
+// than) the grid's own — base-image pixels per output pixel, floored to a
+// level — as a source raster for the painters above, or null when the grid
+// misses the image.
+async function readWindow(cog, grid, W, signal) {
+  const { minx, miny, maxx, maxy } = grid;
+  if (maxx <= 0 || maxy <= 0 || minx >= cog.w || miny >= cog.h) return null;
+  const want = Math.max(maxx - minx, maxy - miny) / W;
+  let lvl = cog.levels[0];
+  for (const l of cog.levels) if (l.scale <= want) lvl = l;
+  const s = lvl.scale;
+  const x0 = Math.max(0, Math.floor(minx / s)), y0 = Math.max(0, Math.floor(miny / s));
+  const x1 = Math.min(lvl.w, Math.ceil(maxx / s) + 1), y1 = Math.min(lvl.h, Math.ceil(maxy / s) + 1);
+  if (x1 <= x0 || y1 <= y0) return null;
+  const raster = await lvl.image.readRasters({ window: [x0, y0, x1, y1], interleave: true, signal });
+  return { data: raster, w: raster.width, h: raster.height, scale: s, x0, y0 };
 }
 
 // One Web Mercator tile of the COG as ImageData, or null if the tile does not
@@ -126,20 +182,9 @@ function warp(grid, { data, w, h, bands, scale, x0, y0, nodata }, W, H) {
 // correction is asked for on the deck.gl side.
 export async function readCogTile(cog, bbox, signal) {
   const grid = controlGrid(cog, bbox, TILE, TILE);
-  const { minx, miny, maxx, maxy } = grid;
-  if (maxx <= 0 || maxy <= 0 || minx >= cog.w || miny >= cog.h) return null;
-  // The overview whose pixels are closest to (but not coarser than) the
-  // tile's own: base-image pixels per output pixel, floored to a level.
-  const want = Math.max(maxx - minx, maxy - miny) / TILE;
-  let lvl = cog.levels[0];
-  for (const l of cog.levels) if (l.scale <= want) lvl = l;
-  const s = lvl.scale;
-  const x0 = Math.max(0, Math.floor(minx / s)), y0 = Math.max(0, Math.floor(miny / s));
-  const x1 = Math.min(lvl.w, Math.ceil(maxx / s) + 1), y1 = Math.min(lvl.h, Math.ceil(maxy / s) + 1);
-  if (x1 <= x0 || y1 <= y0) return null;
-  const raster = await lvl.image.readRasters({ window: [x0, y0, x1, y1], interleave: true, signal });
-  return warp(grid, { data: raster, w: raster.width, h: raster.height, bands: cog.bands,
-    scale: s, x0, y0, nodata: cogNodata(raster) }, TILE, TILE);
+  const src = await readWindow(cog, grid, TILE, signal);
+  if (!src) return null;
+  return warp(grid, { ...src, bands: cog.bands, nodata: cogNodata(src.data) }, TILE, TILE);
 }
 
 // Which thumbnail pixels are the swath's nodata, as one flag per pixel. The
@@ -184,12 +229,16 @@ function jpegNodataMask(data, w, h, white) {
 // level of the COG, its pixel size the base's scaled by the width ratio;
 // null if the thumbnail is not the COG's shape. `white` says the
 // thumbnail's nodata colour (see jpegNodataMask).
+// The preview's pixel size: PREVIEW on the long side by the scene's
+// on-screen shape (longitude shrinks by cos(lat)).
+function previewSize([west, south, east, north]) {
+  const aspect = ((east - west) * Math.cos(((south + north) / 2) * Math.PI / 180)) / (north - south);
+  return [Math.round(aspect >= 1 ? PREVIEW : PREVIEW * aspect),
+    Math.round(aspect >= 1 ? PREVIEW / aspect : PREVIEW)];
+}
 export function previewImage(cog, bitmap, { white = false } = {}) {
   const [west, south, east, north] = cog.bounds;
-  // Long side by the scene's on-screen shape: longitude shrinks by cos(lat).
-  const aspect = ((east - west) * Math.cos(((south + north) / 2) * Math.PI / 180)) / (north - south);
-  const W = Math.round(aspect >= 1 ? PREVIEW : PREVIEW * aspect);
-  const H = Math.round(aspect >= 1 ? PREVIEW / aspect : PREVIEW);
+  const [W, H] = previewSize(cog.bounds);
   // One scale serves both axes, so the thumbnail must have the COG's
   // shape (both are square; a thumbnail cut to another shape would be
   // stretched into the wrong place). More than a pixel off: no preview.
@@ -228,8 +277,155 @@ export function cogTileLayer(cog, id = "cog", events = {}) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Bands (Task 28). A scene is a directory of band COGs; this is the per-scene
+// memory of what has been opened, read and warped, so nothing is fetched
+// twice while the scene is on the map: `cogs` band -> openCog promise,
+// `overviews` band -> the coarsest overview read whole (preview and
+// histogram), `previewPlanes` band -> that overview warped over the scene,
+// `planes` "z/x/y/band" -> a tile's warped plane (bounded; the oldest go
+// first). A band that fails to open keeps its rejection, so twenty tiles do
+// not each retry a 404. All is dropped with the scene (app.js).
+// ---------------------------------------------------------------------------
+const PREVIEW_MIN = 256;   // the preview overview's long side, at least
+const PLANE_CACHE = 400;   // tiles x bands kept per scene (~100 MB of Float32)
+export const bandHref = (dir, band) => `${dir}/${band}.tif`;
+
+export function openScene(id, dir) {
+  return { id, dir, bounds: null, cogs: new Map(), overviews: new Map(),
+    previewPlanes: new Map(), planes: new Map() };
+}
+
+// One band's COG, opened once per scene. The first to open sets the scene's
+// bounds: every band covers the same 109.8 km square (10980 x 10 m, 5490 x
+// 20 m, 1830 x 60 m), so any band's bounds are the scene's.
+export function sceneCog(scene, band) {
+  let p = scene.cogs.get(band);
+  if (!p) {
+    p = openCog(bandHref(scene.dir, band)).then((cog) => { scene.bounds ??= cog.bounds; return cog; });
+    scene.cogs.set(band, p);
+  }
+  return p;
+}
+
+// One band's coarsest overview whose long side is at least PREVIEW_MIN px,
+// read whole — one range read per band (a 10 m band's 16x level is 686 px;
+// a 60 m band's 4x, 457) — with its histogram and percentiles. Cached.
+export function sceneOverview(scene, band) {
+  let p = scene.overviews.get(band);
+  if (!p) {
+    p = sceneCog(scene, band).then(async (cog) => {
+      let lvl = cog.levels[0];
+      for (const l of cog.levels) if (Math.max(l.w, l.h) >= PREVIEW_MIN) lvl = l;
+      const raster = await lvl.image.readRasters({ interleave: true });
+      return { cog, band, data: raster, w: raster.width, h: raster.height, scale: lvl.scale,
+        x0: 0, y0: 0, stats: sampleStats(raster, 0) };
+    });
+    scene.overviews.set(band, p);
+  }
+  return p;
+}
+
+// The stats of an index over two overviews already read (null when a band
+// is missing or the two levels differ in size, which the fixed pairs — both
+// 10 m — never do).
+export function sceneIndexStats(scene, a, b, offset) {
+  const oa = scene.overviews.get(a)?.value, ob = scene.overviews.get(b)?.value;
+  return indexStats(oa?.data, ob?.data, offset, 0);
+}
+
+// The band's overview warped over the scene's bounds at the preview size;
+// null when that band failed. Sync: the overview must have been awaited
+// (sceneOverview) and is looked up by its settled value.
+function previewPlane(scene, band, W, H) {
+  if (scene.previewPlanes.has(band)) return scene.previewPlanes.get(band);
+  const ov = scene.overviews.get(band)?.value ?? null;
+  const plane = ov ? warpPlane(controlGrid(ov.cog, boundsOf(scene.bounds), W, H), ov, W, H) : null;
+  scene.previewPlanes.set(band, plane);
+  return plane;
+}
+const boundsOf = ([west, south, east, north]) => ({ west, south, east, north });
+
+// Await each band's overview, remembering the settled value (or the error)
+// on the promise so the sync painters can look it up; returns the bands
+// that failed with their errors.
+export async function loadOverviews(scene, bands) {
+  const failed = [];
+  await Promise.all(bands.map(async (band) => {
+    const p = sceneOverview(scene, band);
+    try { p.value = await p; } catch (err) { p.error = err; failed.push([band, err]); }
+  }));
+  return failed;
+}
+
+// The preview of a composite: the bands' overviews warped and painted
+// through the spec. Needs loadOverviews first; null if no band came.
+export function bandPreviewImage(scene, spec) {
+  if (!scene.bounds) return null;
+  const [W, H] = previewSize(scene.bounds);
+  const planes = {};
+  let any = false;
+  for (const band of bandsOf(spec)) { planes[band] = previewPlane(scene, band, W, H); any ||= !!planes[band]; }
+  return any ? paintRGBA(planes, spec, W, H) : null;
+}
+
+// A tile's planes for the given bands, from the cache or one window read per
+// band (in parallel). A band that cannot be opened is null (its channel
+// paints black, the others show); a tile off the image is null throughout
+// and the tile is skipped.
+async function bandTilePlanes(scene, bands, { index, bbox, signal }) {
+  const key = `${index.z}/${index.x}/${index.y}`;
+  const planes = {};
+  await Promise.all(bands.map(async (band) => {
+    const ck = `${key}/${band}`;
+    if (scene.planes.has(ck)) { planes[band] = scene.planes.get(ck); return; }
+    let cog;
+    try { cog = await sceneCog(scene, band); } catch { planes[band] = null; return; }
+    const grid = controlGrid(cog, bbox, TILE, TILE);
+    const src = await readWindow(cog, grid, TILE, signal);
+    const plane = src ? warpPlane(grid, src, TILE, TILE) : null;
+    if (scene.planes.size >= PLANE_CACHE) scene.planes.delete(scene.planes.keys().next().value);
+    scene.planes.set(ck, plane);
+    planes[band] = plane;
+  }));
+  if (!Object.values(planes).some(Boolean)) return null;
+  return { planes, rgba: null, styleKey: null, byteLength: bands.length * TILE * TILE * 4 };
+}
+
+// The deck.gl layer for a composite of one scene. The layer id carries the
+// band set, so a band change is a fresh tileset (its tiles come out of the
+// plane cache where they were seen before) under a fresh preview; a style
+// change keeps the id and passes a new styleKey through updateTriggers,
+// which makes deck re-run renderSubLayers per tile without refetching
+// (TileLayer nulls each tile's sublayers on any prop change that is not
+// getTileData's). The RGBA is painted lazily per tile and kept on the tile
+// data until the style changes.
+export function bandTileLayer(scene, spec, styleKey, id, events = {}) {
+  const bands = bandsOf(spec);
+  return new TileLayer({
+    id,
+    tileSize: TILE,
+    minZoom: 4,
+    maxZoom: 15,
+    extent: scene.bounds,
+    maxRequests: 6,
+    refinementStrategy: "no-overlap",
+    getTileData: (tile) => bandTilePlanes(scene, bands, tile),
+    updateTriggers: { renderSubLayers: styleKey },
+    renderSubLayers: (props) => {
+      const d = props.data;
+      if (!d) return null;
+      if (d.styleKey !== styleKey) { d.rgba = paintRGBA(d.planes, spec, TILE, TILE); d.styleKey = styleKey; }
+      const { west, south, east, north } = props.tile.bbox;
+      return new BitmapLayer(props, { data: null, image: d.rgba, bounds: [west, south, east, north] });
+    },
+    ...events,
+  });
+}
+
 // The preview as a deck.gl layer: one bitmap over the scene's bounds, drawn
-// beneath the tile layer until every tile in view has loaded.
+// beneath the tile layer until every tile in view has loaded. `cog` is
+// anything with the bounds: an opened COG or a band scene.
 export function previewLayer(image, cog, id = "cog-preview") {
   return new BitmapLayer({
     id,
