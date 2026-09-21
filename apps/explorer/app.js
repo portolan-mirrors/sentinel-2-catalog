@@ -977,6 +977,14 @@ function cogbar(id, state, text) {
   $("cog-state").dataset.state = state;
   $("cog-state").textContent = text;
   $("cogbar").hidden = false;
+  $("imgpanel").hidden = false;
+}
+// The image panel at the map's lower right (Task 29) holds the cogbar and
+// the band mapper; it shows with the first cogbar and goes with the scene.
+function hideImagePanel() {
+  $("imgpanel").hidden = true;
+  $("cogbar").hidden = true;
+  $("bandbox").hidden = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,7 +1201,7 @@ async function applySpec(me = shown) {
     if (stale(me, serial)) return;
     shown = null;
     cogLayer = null; cogPreview = null; render();
-    $("cogbar").hidden = true; $("bandbox").hidden = true;
+    hideImagePanel();
     say(`Could not show ${me.id} — ${err.message}`, true);
   }
 }
@@ -1354,7 +1362,7 @@ async function showOnMap(r, button, preset = "tci", band = null) {
     if (me !== shown) return;
     shown = null;
     cogLayer = null; cogPreview = null; render();
-    $("cogbar").hidden = true; $("bandbox").hidden = true;
+    hideImagePanel();
     say(`Could not show ${id} — ${err.message}`, true);
   } finally {
     button.disabled = false;
@@ -1366,8 +1374,7 @@ $("cog-clear").addEventListener("click", () => {
   cogLayer = null;
   cogPreview = null;
   render();
-  $("cogbar").hidden = true;
-  $("bandbox").hidden = true;
+  hideImagePanel();
 });
 
 // The panel's controls. A band select under a preset switches it to Custom

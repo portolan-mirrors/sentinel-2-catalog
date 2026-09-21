@@ -117,8 +117,21 @@ button.mini {
   padding: 2px 8px; font-size: 11.5px; background: #1d365e; border-color: #2b4c86;
 }
 button.mini:not(:disabled):hover { background: #26457a; }
+/* The image controls (Task 29): a card floating at the map's lower right,
+   well under the zoom column at the top right; it scrolls on its own past
+   70 vh. No source carries attribution, so MapLibre's compact attribution
+   control in that corner is empty and hidden — if one ever appears, the
+   panel would cover it. The cogbar and the band mapper keep their own
+   sidebar-block look inside it. */
+#imgpanel {
+  position: absolute; right: 16px; bottom: 16px; z-index: 3;
+  width: min(360px, calc(100% - 360px - 32px));
+  max-height: 70vh; overflow-y: auto; padding: 10px 12px 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .45);
+}
 #cogbar:not([hidden]) {
-  margin: 10px 0 0; padding: 8px 10px; font-size: 12.5px; border-radius: 3px;
+  margin: 0; padding: 8px 10px; font-size: 12.5px; border-radius: 3px;
   background: var(--panel-2); border-left: 3px solid #1a9850;
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
 }
@@ -198,4 +211,12 @@ button.mini:not(:disabled):hover { background: #26457a; }
   #panel { position: static; width: auto; height: 46vh; border-right: 0;
            border-bottom: 1px solid var(--line); }
   #map { position: absolute; inset: 46vh 0 0 0; }
+  /* A bottom sheet over the lower map. The map is 54 vh tall here; the
+     height cap keeps 90 px of map free above the sheet so the zoom column
+     (10 px margin + two 29 px buttons) stays clickable on a short screen. */
+  #imgpanel {
+    left: 0; right: 0; bottom: 0; width: auto;
+    max-height: min(45vh, calc(54vh - 90px));
+    border-radius: 6px 6px 0 0; border-width: 1px 0 0;
+  }
 }
