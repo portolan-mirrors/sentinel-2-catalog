@@ -180,6 +180,43 @@ publish `<file>.idx.json` beside the file, and the client is ~60 lines of
 hyparquet glue. `exp/make_index.py` builds the index for any key-sorted
 parquet file; `exp/hyclient.mjs` is the client.
 
+## Round 3: the same client against the full canonical files
+
+Question: how much of the gain needs the slim side file at all, versus a
+column-selective hyparquet client pointed at the real stac-geoparquet parts?
+The client (`exp/hycols.mjs`) computes the needed column chunks from the
+footer (8 of the 48 columns) for the target row groups — located by sidecar
+row range, or by plain footer statistics — and fetches them in parallel,
+capped at 32 in flight. Same rig (0.4 s/request), per-search numbers on a
+warm session:
+
+| setup | per search | GET | KiB |
+|---|---|---|---|
+| DuckDB-WASM, today's layout (the current app) | 6.2–6.9 s | 74–122 | ~2,300 |
+| hyparquet cols-client, today's layout, stats pruning — **no data change** | 2.0–3.4 s | 104–208 | 2,600–5,200 |
+| hyparquet cols-client, tile-sorted canonical rebuild | 0.5–0.6 s | 8–16 | 260–530 |
+| hyparquet + sidecar, slim file (round 2) | 0.4 s | 1 | 31 |
+
+Parallelism makes the GET count nearly free — what still costs is the group
+count the layout admits (today's Hilbert sort scatters a tile over 13–26
+groups; the tile sort pins it to 1–2) and the bytes. On a tile-sorted file
+the footer statistics alone find the 1–2 groups, so the sidecar is not even
+required there; it saves the ~1 MB footer fetch and cuts per-search bytes
+10× (each fetched chunk spans a whole 6,144-row group to read ~200 rows).
+
+So the ladder is:
+
+1. **Client swap alone** (no publishing change): 6.5 s → 2–3.4 s.
+2. **Client + tile-sorted canonical rebuild**: 0.5–0.6 s on fully standard
+   geoparquet, no side files. The rebuild is the 32–71 runner-hour job of
+   issue #9, with `(tile, datetime)` as the sort.
+3. **Client + slim sidecar files**: 0.4 s and 31 KB/search, buildable from
+   the current parts in seconds, no rebuild needed.
+
+Steps 2 and 3 converge: once the canonical parts are tile-sorted, the slim
+file's remaining edge is bytes (31 vs ~300 KiB) and cold-start, which is a
+mobile-bandwidth argument more than a latency one.
+
 ## Artifacts
 
 Scratchpad `exp/` (session-local, not committed): `build_variants.py`,
