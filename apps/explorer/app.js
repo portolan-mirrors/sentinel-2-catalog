@@ -10,6 +10,10 @@
 //                                 straight from its overviews (Task 20),
 //                                 replacing the preview as its tiles load
 //                                 (Task 27)
+//   …/B01.tif … B12.tif, B8A, SCL, AOT, WVP (same directory) – any band or
+//                                 composite, NDVI/NDWI or the SCL classes,
+//                                 read band by band on demand and stretched
+//                                 in the browser (Task 28, bands.js)
 // There is no API, no server and no database behind this page: DuckDB-WASM
 // issues HTTP range reads straight at the object store, and so do the COG
 // reads. The map is MapLibre for the camera; the tiles are drawn by deck.gl
@@ -23,8 +27,10 @@ import { PMTiles, Protocol } from "https://esm.sh/pmtiles@3.2.0";
 import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
 import { parse } from "https://esm.sh/@loaders.gl/core@4.5.1";
 import { MVTLoader } from "https://esm.sh/@loaders.gl/mvt@4.5.1";
-import { openCog, cogTileLayer, previewImage, previewLayer } from "./cog.js";
-import { dayRange } from "./rangeslider.js";
+import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOverviews,
+  sceneIndexStats, bandPreviewImage, bandTileLayer, bandHref } from "./cog.js";
+import { BANDS, bandTitle, INDICES, SCL_CLASSES, PRESETS, bandsOf, HIST_BINS } from "./bands.js";
+import { dayRange, valueRange } from "./rangeslider.js";
 // deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
 // transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
 // A classic script that failed to load is a missing global, not an import
@@ -734,20 +740,17 @@ async function init() {
 
 // ---------------------------------------------------------------------------
 // The scene query. Click a tile, pick a window, and DuckDB-WASM range-reads the
-// year parts of sentinel-2-l2a directly. Every href shown below is read out of
-// the row's `assets` column (a JSON string carrying the upstream STAC assets
-// object) — this app never builds an object-store URL from a template. The
-// column is ~18 KB a row and half the bytes of a part, so the search leaves
-// it out and a card fetches its own row's `assets` when a link is wanted.
+// year parts of sentinel-2-l2a directly. The row's `assets` column (a JSON
+// string carrying the upstream STAC assets object) is ~18 KB a row and half
+// the bytes of a part, so the search leaves it out; every COG the page draws
+// or links sits in the scene directory that `thumbnail_url` names (see
+// sceneDirOf), so no row ever needs `assets`.
 // ---------------------------------------------------------------------------
 
 // An MGRS tile id: 1-2 digit UTM zone, latitude band C..X, then two letters.
 // The values come from the tileset, not from a text box, but they are the only
 // thing on this page that reaches a SQL string, so they are checked anyway.
 const TILE_RE = /^\d{1,2}[C-X][A-Z]{2}$/;
-// An item id as Earth Search mints them; the lazy `assets` lookup puts it in
-// a WHERE clause, so it is checked the same way.
-const ITEM_RE = /^[A-Za-z0-9_.-]+$/;
 const CURRENT_YEAR = new Date().getUTCFullYear();
 
 map.on("click", (e) => {
@@ -869,12 +872,14 @@ function sceneSql(urls, tile, d0, d1, cc, cov) {
   // read in the session's zone, so both sides are pinned to UTC. The same
   // conversion formats the label, rather than guessing at the epoch units
   // Arrow hands back. `assets` is deliberately not selected (see above);
-  // `bbox` is, for "Show on map".
+  // `bbox` is, for "Show on map", and the processing baseline (a short
+  // dictionary-coded string) for the band mapper's index offset (bands.js).
   return `SELECT id,
        strftime(datetime AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ') AS ts,
        "eo:cloud_cover" AS cloud,
        thumbnail_url,
-       bbox
+       bbox,
+       "s2:processing_baseline" AS baseline
 FROM read_parquet(${partList(urls)}, union_by_name=true)
 WHERE "s2:mgrs_tile" = '${tile}'
   AND _month BETWEEN ${m0} AND ${m1}
@@ -912,57 +917,6 @@ function apiMirror(tile, d0, d1, cc, cov) {
   }, null, 2);
 }
 
-// Asset hrefs are remote-derived strings going into an href, so only real
-// https URLs are linked; anything else (javascript:, data:, http: — which
-// this https page could not fetch anyway, missing) is dropped rather than
-// rendered. A protocol check only: a mirror on another host must still work.
-function assetHref(assets, key) {
-  const href = assets?.[key]?.href;
-  if (typeof href !== "string") return null;
-  try {
-    const u = new URL(href);
-    if (u.protocol !== "https:") return null;
-    if (!/(^|\.)(amazonaws\.com|source\.coop)$/.test(u.hostname)) {
-      console.warn(`asset ${key} on an unexpected host: ${u.hostname}`);
-    }
-    return href;
-  } catch {
-    return null;
-  }
-}
-
-// The visual COG first, then the bands.
-const ASSET_LINKS = [["visual", "TCI"], ["red", "B04"], ["nir", "B08"],
-  ["scl", "SCL"]];
-
-// The parts the last search read, so a card can go back to the same file for
-// its row's `assets` without probing again.
-let lastParts = [];
-const assetCache = new Map();
-
-// One row's `assets`, read lazily from the same part the search read: the
-// `_month` row-group filter plus `id`, LIMIT 1. Cached per item.
-async function assetsFor(r) {
-  const id = String(r.id);
-  if (assetCache.has(id)) return assetCache.get(id);
-  if (!ITEM_RE.test(id)) throw new Error(`unexpected item id ${id}`);
-  const ts = String(r.ts);
-  const year = ts.slice(0, 4), month = Number(ts.slice(5, 7));
-  const urls = lastParts.filter((u) => u.includes(`/year=${year}/`));
-  if (!urls.length) throw new Error(`no part for ${year}`);
-  const sql = `SELECT assets FROM read_parquet(${partList(urls)}, union_by_name=true)
-WHERE _month = ${month} AND id = '${id}' LIMIT 1`;
-  $("sql").textContent = sql;
-  const p = conn.query(sql).then((res) => {
-    const row = res.toArray()[0];
-    if (!row) throw new Error(`${id} is not in ${urls.map((u) => u.split("/").slice(-2).join("/")).join(", ")}`);
-    return JSON.parse(row.assets);
-  });
-  assetCache.set(id, p);
-  p.catch(() => assetCache.delete(id));
-  return p;
-}
-
 const bboxOf = (r) => {
   try {
     const b = Array.from(r.bbox ?? []).map(Number);
@@ -972,24 +926,34 @@ const bboxOf = (r) => {
   }
 };
 
-// The visual COG sits next to the thumbnail in the scene directory (checked
-// on 2020 thumbnail.jpg and 2026 preview.jpg rows alike), and thumbnail_url
-// is already in the search projection — so "Show on map" derives the href
-// instead of reading the row's `assets`, which cost ~2 MB and ~6 s of range
-// reads per click (docs/query-performance.md) before anything appeared. The
-// same https-and-host rule as assetHref, but a wrong host refuses here: this
-// string is fetched, not just linked.
+// Every COG of a scene sits in the directory the thumbnail is in (checked on
+// 2020 thumbnail.jpg and 2026 preview.jpg rows alike: TCI.tif, B02.tif …
+// SCL.tif), and thumbnail_url is already in the search projection — so the
+// map derives each href instead of reading the row's `assets`, which cost
+// ~2 MB and ~6 s of range reads per click (docs/query-performance.md)
+// before anything appeared. https, and a host the page expects, or it
+// refuses: these strings are fetched, not just linked.
 const COG_HOST_RE = /(^|\.)(amazonaws\.com|source\.coop)$/;
-function visualHrefOf(r) {
+function sceneDirOf(r) {
   const thumb = r.thumbnail_url;
-  if (typeof thumb !== "string" || !thumb) throw new Error("the item has no thumbnail_url to locate its COG by");
+  if (typeof thumb !== "string" || !thumb) throw new Error("the item has no thumbnail_url to locate its COGs by");
   let u;
   try { u = new URL(thumb); } catch { throw new Error(`thumbnail_url is not a URL: ${thumb}`); }
   if (u.protocol !== "https:") throw new Error(`thumbnail_url is not https: ${thumb}`);
   if (!COG_HOST_RE.test(u.hostname)) throw new Error(`thumbnail_url is on an unexpected host: ${u.hostname}`);
-  u.pathname = u.pathname.replace(/[^/]*$/, "TCI.tif");
+  u.pathname = u.pathname.replace(/\/[^/]*$/, "");
   u.search = ""; u.hash = "";
   return u.href;
+}
+// The same, or null, for a card's download links.
+const sceneDirOrNull = (r) => { try { return sceneDirOf(r); } catch { return null; } };
+
+// The BOA offset an index must subtract (bands.js): 1000 from processing
+// baseline 04.00 on, 0 before, null when the row does not say.
+function offsetOf(r) {
+  const b = r.baseline;
+  if (typeof b !== "string" || !/^\d\d\.\d\d$/.test(b)) return null;
+  return b >= "04.00" ? 1000 : 0;
 }
 
 // The thumbnail as an ImageBitmap, or null when it cannot be had (the tiles
@@ -1007,7 +971,7 @@ async function thumbnailBitmap(url) {
 
 // The cogbar's states: "loading" spins until every tile in view has loaded,
 // "full" is the tiles alone, "partial" keeps the preview under tiles that
-// failed. The spinner is CSS on data-state (style.css).
+// failed, or says which band is missing. The spinner is CSS on data-state.
 function cogbar(id, state, text) {
   $("cog-id").textContent = id;
   $("cog-state").dataset.state = state;
@@ -1015,11 +979,161 @@ function cogbar(id, state, text) {
   $("cogbar").hidden = false;
 }
 
-// The scene being shown: its id, the click's clock, and whether its tiles
-// have settled or one has failed. Replaced by every click (a second "Show on
-// map" before the first has drawn must win, and the first's late headers
-// must not draw over it) and dropped by Clear.
+// ---------------------------------------------------------------------------
+// The band mapper (Task 28). `ui` is what the panel says: the preset, the
+// R/G/B and single-band picks, curve, gamma, nodata. The shown scene adds
+// what only its data can say: the min/max per channel (defaulting to the
+// overview's 2nd..98th percentiles the first time a band is seen), the
+// index offset from its baseline, and which bands failed. bandSpec() joins
+// the two into the spec cog.js/bands.js paint from.
+// ---------------------------------------------------------------------------
+const ui = { preset: "tci", rgb: ["B04", "B03", "B02"], single: "B04", curve: "linear", gamma: 1, nodata: 0 };
+for (const [key, p] of Object.entries(PRESETS)) $("preset").append(new Option(p.label, key));
+for (const id of ["sel-r", "sel-g", "sel-b"]) {
+  for (const b of Object.keys(BANDS)) {
+    const o = new Option(`${b} ${BANDS[b].label}`, b);
+    o.title = bandTitle(b);
+    $(id).append(o);
+  }
+}
+for (const [v, name, color] of SCL_CLASSES) {
+  const sw = el("span", null, `${v} ${name}`);
+  sw.style.setProperty("--sw", color);
+  $("scl-legend").append(sw);
+}
+const chanKey = (ch) => ch.index ?? ch.band;
+
+function bandSpec(me) {
+  const p = PRESETS[ui.preset];
+  const spec = { kind: p.kind, preset: ui.preset, curve: ui.curve,
+    gamma: ui.gamma, nodata: ui.nodata, offset: me?.offset ?? 0,
+    label: p.kind === "gray" ? `Single band ${ui.single}` : p.label };
+  if (p.kind === "index") {
+    spec.index = p.index;
+    spec.bands = bandsOf(spec);
+    spec.channels = [{ index: p.index }];
+  } else {
+    spec.bands = p.kind === "gray" ? [ui.single] : ui.preset === "custom" ? [...ui.rgb] : [...p.bands];
+    spec.channels = p.kind === "rgb" || p.kind === "gray" ? spec.bands.map((band) => ({ band })) : [];
+  }
+  for (const ch of spec.channels) Object.assign(ch, me?.ranges.get(chanKey(ch)) ?? { min: 0, max: 1 });
+  return spec;
+}
+const styleKeyOf = (spec) => JSON.stringify([spec.channels, spec.curve, spec.gamma, spec.nodata, spec.offset]);
+
+// The panel follows the spec: which selects show, which blocks apply.
+function syncPanel(spec, me) {
+  const { kind } = spec;
+  $("preset").value = spec.preset;
+  // The selects show what is drawn, so a change under a preset starts
+  // Custom from that preset's other two bands.
+  if (kind === "rgb") ui.rgb = [...spec.bands];
+  $("sel-r").value = kind === "gray" ? ui.single : ui.rgb[0];
+  $("sel-g").value = ui.rgb[1]; $("sel-b").value = ui.rgb[2];
+  $("rgbsel").hidden = !(kind === "rgb" || kind === "gray");
+  $("rgbsel").classList.toggle("three", kind === "rgb");
+  $("sel-g").parentElement.hidden = $("sel-b").parentElement.hidden = kind !== "rgb";
+  $("sel-r").previousElementSibling.textContent = kind === "gray" ? "Band" : "R";
+  $("stretchopts").hidden = kind === "tci" || kind === "scl";
+  // An index is linear between its handles (bands.js): no curve, no gamma.
+  $("stretchopts").querySelector(".bandrow").hidden = kind === "index";
+  $("gamma").parentElement.hidden = kind === "index";
+  $("channels").hidden = kind === "tci" || kind === "scl";
+  $("scl-legend").hidden = kind !== "scl";
+  const notes = [];
+  if (kind === "tci") notes.push("TCI is ESA's own stretch of B04/B03/B02 — pick a composite or a band for stretch controls.");
+  if (kind === "index") {
+    const ix = INDICES[spec.index];
+    notes.push(`${ix.label} = (${ix.a} − ${ix.b}) / (${ix.a} + ${ix.b}) on DN; ramp fixed over −1..1, handles narrow it.`);
+    if (me?.offset === null) notes.push("No processing baseline in the row — the ≥ 04.00 BOA offset (−1000) is not applied.");
+    else if (me?.offset) notes.push(`Baseline ${me.r.baseline}: −1000 BOA offset applied before the ratio.`);
+  }
+  if (me?.missing.length) notes.push(`${me.missing.join(", ")} could not be opened — shown without.`);
+  $("bandnote").textContent = notes.join(" ");
+}
+
+// One block per channel: the overview's histogram (64 bins over the data's
+// own min..max, sqrt-scaled heights so the tail shows), the two handles, the
+// numeric min/max, and the 2–98 % / Min/Max buttons. Rebuilt per band set.
+function buildChannels(me, spec) {
+  const box = $("channels");
+  box.replaceChildren();
+  for (const ch of spec.channels) {
+    const key = chanKey(ch);
+    const stats = ch.index
+      ? sceneIndexStats(me.scene, INDICES[ch.index].a, INDICES[ch.index].b, me.offset ?? 0)
+      : me.scene.overviews.get(ch.band)?.value?.stats ?? null;
+    const lo = ch.index ? -1 : stats?.min ?? 0, hi = ch.index ? 1 : stats?.max ?? 1;
+    const block = el("div", "chan");
+    const head = el("div", "chan-head");
+    head.append(el("b", null, ch.index ? INDICES[ch.index].label : ch.band),
+      el("span", "hint", ch.index ? `${INDICES[ch.index].a} − ${INDICES[ch.index].b}` : bandTitle(ch.band).slice(4)));
+    const canvas = document.createElement("canvas");
+    canvas.className = "hist"; canvas.width = 320; canvas.height = 36;
+    canvas.title = "Histogram of the overview (nodata left out); the lit bins are inside the handles";
+    const range = el("div", "dayrange vrange");
+    const mm = el("div", "minmax");
+    const minIn = document.createElement("input"), maxIn = document.createElement("input");
+    for (const i of [minIn, maxIn]) { i.type = "number"; i.step = ch.index ? 0.01 : 1; }
+    mm.append(minIn, "–", maxIn);
+    const draw = () => {
+      const r = me.ranges.get(key);
+      drawHist(canvas, stats, lo, hi, r.min, r.max);
+      minIn.value = ch.index ? r.min.toFixed(2) : Math.round(r.min);
+      maxIn.value = ch.index ? r.max.toFixed(2) : Math.round(r.max);
+    };
+    const slider = valueRange({ container: range, lo, hi, onInput: (min, max) => {
+      me.ranges.set(key, { min, max }); draw(); scheduleRestyle();
+    } });
+    const setRange = (min, max) => {
+      if (!(max > min)) return;
+      me.ranges.set(key, { min, max }); slider.set(min, max); draw(); scheduleRestyle();
+    };
+    const fromInputs = () => setRange(Number(minIn.value), Number(maxIn.value));
+    minIn.addEventListener("change", fromInputs); maxIn.addEventListener("change", fromInputs);
+    if (stats) {
+      const b1 = el("button", "mini", "2–98 %"), b2 = el("button", "mini", "Min/Max");
+      b1.type = b2.type = "button";
+      b1.title = "Handles to the overview's 2nd and 98th percentiles";
+      b2.title = "Handles to the overview's minimum and maximum";
+      b1.addEventListener("click", () => setRange(stats.p2, stats.p98));
+      b2.addEventListener("click", () => setRange(stats.min, stats.max));
+      head.append(b1, b2);
+    }
+    block.append(head, canvas, range, mm);
+    box.append(block);
+    slider.set(me.ranges.get(key).min, me.ranges.get(key).max);
+    draw();
+  }
+}
+
+function drawHist(canvas, stats, lo, hi, min, max) {
+  const ctx = canvas.getContext("2d"), W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!stats) {
+    ctx.fillStyle = "#93a2c0"; ctx.font = "11px system-ui, sans-serif";
+    ctx.fillText("no histogram (overview unreadable)", 6, 22);
+    return;
+  }
+  const { hist } = stats;
+  let peak = 1;
+  for (let i = 0; i < HIST_BINS; i++) if (hist[i] > peak) peak = hist[i];
+  const bw = W / HIST_BINS;
+  for (let i = 0; i < HIST_BINS; i++) {
+    const v = lo + ((i + 0.5) / HIST_BINS) * (hi - lo);
+    const h = Math.sqrt(hist[i] / peak) * (H - 2);
+    ctx.fillStyle = v >= min && v <= max ? "#6ea8ff" : "#3a4666";
+    ctx.fillRect(i * bw, H - h, Math.max(1, bw - 0.6), h);
+  }
+}
+
+// The scene being shown: its row, the click's clock, the band-COG memory
+// (cog.js openScene), which band set is on the map, whether its tiles have
+// settled or one has failed, and a serial that a later spec bumps so a
+// superseded load's late overviews never draw. Replaced by every "Show on
+// map" click and dropped by Clear.
 let shown = null;
+Object.defineProperties(window.S2, { shown: { get: () => shown }, ui: { value: ui } });
 
 // The preview comes off once the tile layer has every tile of the resting
 // viewport. onViewportLoad fires mid-flight too (each coarse view the camera
@@ -1032,19 +1146,158 @@ function tilesSettled() {
   shown.settled = true;
   cogPreview = null;
   render();
-  cogbar(shown.id, "full", "Full resolution");
-  say(`${shown.id} on the map at full resolution: TCI overviews range-read `
-    + "straight from the COG, reprojected in the browser. No tile server, no API.");
+  const { id, spec, missing } = shown;
+  const read = spec.bands.filter((b) => !missing.includes(b));
+  const what = spec.kind === "tci" ? "TCI overviews" : `${read.join(", ")} overviews`;
+  const how = spec.kind === "tci" ? "reprojected" : "reprojected and stretched";
+  const without = missing.length ? ` without ${missing.join(", ")}` : "";
+  cogbar(id, missing.length ? "partial" : "full", `Full resolution${without}`);
+  say(`${id} on the map at full resolution (${spec.label}${without}): ${what} range-read `
+    + `straight from the COG${read.length > 1 ? "s" : ""}, ${how} in the browser. `
+    + "No tile server, no API.");
 }
 map.on("moveend", tilesSettled);
 
-// "Show on map": fly to the scene's footprint, draw its thumbnail over the
-// scene as soon as the COG's headers say where it goes, and let the tiles
-// replace it. Nothing waits on a tile: the preview needs the JPEG and one
-// small range read of headers, both started at once.
-async function showOnMap(r, button) {
+const stale = (me, serial) => me !== shown || serial !== me.serial;
+
+// Put the panel's spec on the map for the shown scene: the TCI path (Task
+// 27: thumbnail under the visual COG's tiles), a new band set (overviews
+// first — preview and histograms — then the tiles), or, when only the
+// stretch changed, a repaint of what is already there. Any failure takes
+// the scene off the map and hides the bar, so nothing is left without a
+// Clear.
+async function applySpec(me = shown) {
+  if (!me) return;
+  const serial = ++me.serial;
+  try {
+    const spec = bandSpec(me);
+    if (spec.kind === "tci") {
+      if (me.bandsKey === "TCI") { syncPanel(spec, me); return; }
+      me.spec = spec;
+      syncPanel(spec, me);
+      await showTci(me, spec, serial);
+    } else if (me.bandsKey !== spec.bands.join("+")) {
+      await showBands(me, spec, serial);
+    } else {
+      restyle(me, spec);
+    }
+  } catch (err) {
+    if (stale(me, serial)) return;
+    shown = null;
+    cogLayer = null; cogPreview = null; render();
+    $("cogbar").hidden = true; $("bandbox").hidden = true;
+    say(`Could not show ${me.id} — ${err.message}`, true);
+  }
+}
+let restyleFrame = 0;
+function scheduleRestyle() {
+  if (restyleFrame) return;
+  restyleFrame = requestAnimationFrame(() => { restyleFrame = 0; applySpec(); });
+}
+
+// A new band set on the map: reset the loading state, take the old layers
+// off, say what is loading, read every band's overview (parallel; a band
+// that cannot be opened is reported and left out), seed the handles at
+// 2–98 % for a band not seen before, then the preview and the tiles in one
+// render. Nothing here waits on a tile.
+async function showBands(me, spec, serial) {
+  const { id } = me;
+  me.bandsKey = spec.bands.join("+"); me.spec = spec;
+  me.settled = false; me.failed = false;
+  cogLayer = null; cogPreview = null; render();
+  syncPanel(spec, me);
+  cogbar(id, "loading", "Loading preview…");
+  say(`Preview of ${id} (${spec.label}) — loading ${spec.bands.join(", ")} at full resolution…`);
+  const failed = await loadOverviews(me.scene, spec.bands);
+  if (stale(me, serial)) return;
+  me.missing = failed.map(([b]) => b);
+  if (me.missing.length === spec.bands.length) {
+    throw new Error(`${me.missing.join(", ")} could not be opened — ${failed[0][1].message}`);
+  }
+  for (const ch of spec.channels) {
+    if (me.ranges.has(chanKey(ch))) continue;
+    const st = ch.index
+      ? sceneIndexStats(me.scene, INDICES[ch.index].a, INDICES[ch.index].b, me.offset ?? 0)
+      : me.scene.overviews.get(ch.band)?.value?.stats;
+    me.ranges.set(chanKey(ch), ch.index ? { min: -1, max: 1 } : st ? { min: st.p2, max: st.p98 } : { min: 0, max: 10000 });
+  }
+  spec = me.spec = bandSpec(me);
+  syncPanel(spec, me);
+  buildChannels(me, spec);
+  const preview = bandPreviewImage(me.scene, spec);
+  cogLayer = bandTileLayer(me.scene, spec, styleKeyOf(spec), `cog-${id}-${me.bandsKey}`, me.events);
+  cogPreview = preview ? previewLayer(preview, me.scene, `cog-preview-${id}`) : null;
+  render();
+  cogbar(id, "loading", preview ? "Preview shown — loading full resolution…" : "Loading full resolution…");
+  debug(`[cog] ${id} ${me.bandsKey} preview shown at ${(performance.now() - me.t0).toFixed(0)} ms`);
+  if (me.missing.length) {
+    say(`${me.missing.join(", ")} of ${id} could not be opened (${failed[0][1].message}) — `
+      + `showing ${spec.label} without ${me.missing.length > 1 ? "them" : "it"}.`, true);
+  }
+  tilesSettled();
+}
+
+// Only the stretch changed: the same tiles repainted from their cached
+// planes (a new layer instance with the same id and a new style key), and
+// the preview repainted if it is still under them.
+function restyle(me, spec) {
+  me.spec = spec;
+  syncPanel(spec, me);
+  if (cogLayer) cogLayer = bandTileLayer(me.scene, spec, styleKeyOf(spec), cogLayer.id, me.events);
+  if (cogPreview) {
+    const img = bandPreviewImage(me.scene, spec);
+    cogPreview = img ? previewLayer(img, me.scene, cogPreview.id) : null;
+  }
+  render();
+}
+
+// The visual COG (Task 27): its thumbnail over the scene as soon as the
+// headers say where it goes, and the tiles replace it. Both start at once;
+// whichever lands second draws the preview under tiles that may already be
+// arriving.
+async function showTci(me, spec, serial) {
+  const { id, r } = me;
+  me.bandsKey = "TCI"; me.missing = [];
+  me.settled = false; me.failed = false;
+  cogLayer = null; cogPreview = null; render();
+  cogbar(id, "loading", "Loading preview…");
+  say(`Preview of ${id} (True color) — loading full-resolution tiles…`);
+  me.bitmapP ??= thumbnailBitmap(r.thumbnail_url);
+  const cog = await sceneCog(me.scene, "TCI");
+  if (stale(me, serial)) return;
+  cogLayer = cogTileLayer(cog, `cog-${id}-TCI`, me.events);
+  render();
+  cogbar(id, "loading", "Loading full resolution…");
+  const bitmap = await me.bitmapP;
+  if (stale(me, serial)) return;
+  // Only thumbnail.jpg paints nodata white; preview.jpg and the .jp2 of
+  // some 2018 rows (which Chrome and Firefox cannot decode, Safari can)
+  // paint it black (cog.js, jpegNodataMask). The file name says which.
+  const white = /\/thumbnail\.jpg$/i.test(new URL(r.thumbnail_url).pathname);
+  const preview = bitmap && previewImage(cog, bitmap, { white });
+  // Under the tiles unless they have all settled already; a failed tile
+  // keeps it, as the bar says.
+  if (preview && !me.settled) {
+    cogPreview = previewLayer(preview, cog, `cog-preview-${id}`);
+    render();
+    if (!me.failed) cogbar(id, "loading", "Preview shown — loading full resolution…");
+    debug(`[cog] ${id} preview shown at ${(performance.now() - me.t0).toFixed(0)} ms`);
+    // The tiles may have all landed while the JPEG was still coming.
+    tilesSettled();
+  } else if (!preview && !me.settled) {
+    say(`${id}: no preview (thumbnail unreadable) — loading full-resolution tiles…`);
+  }
+}
+
+// "Show on map" and the card's band chips: fly to the scene's footprint,
+// remember the scene, set the panel to the asked preset and apply it.
+async function showOnMap(r, button, preset = "tci", band = null) {
   const id = String(r.id);
-  const me = shown = { id, t0: performance.now(), settled: false, failed: false };
+  // A chip on the scene already shown keeps what it has read and set.
+  const prev = shown?.id === id ? shown : null;
+  const me = shown = { id, r, t0: performance.now(), serial: 0, bandsKey: null, spec: null,
+    settled: false, failed: false, missing: [], ranges: prev?.ranges ?? new Map(),
+    offset: offsetOf(r), scene: prev?.scene ?? null, bitmapP: prev?.bitmapP ?? null, events: null };
   const bbox = bboxOf(r);
   if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 1200 });
   button.disabled = true;
@@ -1052,53 +1305,32 @@ async function showOnMap(r, button) {
   // the bar names this scene from here on and the map must not contradict it.
   if (cogLayer || cogPreview) { cogLayer = null; cogPreview = null; render(); }
   cogbar(id, "loading", "Loading preview…");
-  try {
-    const href = visualHrefOf(r);
-    say(`Preview of ${id} — loading full-resolution tiles…`);
-    // Both start now; the tiles are not made to wait for the JPEG, nor the
-    // preview for a tile. Whichever of the two lands second draws the
-    // preview (it needs the headers for its placement, and it goes under
-    // tiles that may already be arriving).
-    const bitmapP = thumbnailBitmap(r.thumbnail_url);
-    const cog = await openCog(href);
-    if (me !== shown) return;
-    const onTileError = (err) => {
+  me.events = {
+    onTileError: (err) => {
       if (me !== shown || me.failed) return;
       me.failed = true;
       console.warn(`[cog] tile failed for ${id}:`, err);
       cogbar(id, "partial", "Preview under the tiles — a full-resolution tile failed to load");
       say(`A full-resolution tile of ${id} failed to load — ${err?.message ?? err}. `
         + "The preview stays under the tiles that did.", true);
-    };
-    const onViewportLoad = () => {
+    },
+    onViewportLoad: () => {
       if (me !== shown) return;
-      debug(`[cog] ${id} viewport loaded at ${(performance.now() - me.t0).toFixed(0)} ms`);
+      debug(`[cog] ${id} ${me.bandsKey} viewport loaded at ${(performance.now() - me.t0).toFixed(0)} ms`);
       tilesSettled();
-    };
-    cogLayer = cogTileLayer(cog, `cog-${id}`, { onViewportLoad, onTileError });
-    render();
-    cogbar(id, "loading", "Loading full resolution…");
-    const bitmap = await bitmapP;
-    if (me !== shown) return;
-    // Only thumbnail.jpg paints nodata white; preview.jpg and the .jp2 of
-    // some 2018 rows (which Chrome and Firefox cannot decode, Safari can)
-    // paint it black (cog.js, jpegNodataMask). The file name says which.
-    const white = /\/thumbnail\.jpg$/i.test(new URL(r.thumbnail_url).pathname);
-    const preview = bitmap && previewImage(cog, bitmap, { white });
-    if (preview && !me.settled && !me.failed) {
-      cogPreview = previewLayer(preview, cog, `cog-preview-${id}`);
-      render();
-      cogbar(id, "loading", "Preview shown — loading full resolution…");
-      debug(`[cog] ${id} preview shown at ${(performance.now() - me.t0).toFixed(0)} ms`);
-      // The tiles may have all landed while the JPEG was still coming.
-      tilesSettled();
-    } else if (!preview && !me.settled) {
-      say(`${id}: no preview (thumbnail unreadable) — loading full-resolution tiles…`);
-    }
+    },
+  };
+  try {
+    me.scene ??= openScene(id, sceneDirOf(r));
+    ui.preset = preset;
+    if (band) ui.single = band;
+    $("bandbox").hidden = false;
+    await applySpec(me);
   } catch (err) {
     if (me !== shown) return;
     shown = null;
-    $("cogbar").hidden = true;
+    cogLayer = null; cogPreview = null; render();
+    $("cogbar").hidden = true; $("bandbox").hidden = true;
     say(`Could not show ${id} — ${err.message}`, true);
   } finally {
     button.disabled = false;
@@ -1111,31 +1343,28 @@ $("cog-clear").addEventListener("click", () => {
   cogPreview = null;
   render();
   $("cogbar").hidden = true;
+  $("bandbox").hidden = true;
 });
 
-// The asset links for a card, rendered once its row's `assets` is read.
-async function showLinks(r, holder, button) {
-  button.disabled = true;
-  try {
-    const assets = await assetsFor(r);
-    holder.replaceChildren();
-    for (const [key, label] of ASSET_LINKS) {
-      const href = assetHref(assets, key);
-      if (!href) continue;
-      const a = el("a", null, label);
-      a.href = href;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      a.title = `${label} — ${href}`;
-      holder.append(a);
-    }
-    if (!holder.childElementCount) holder.append(el("span", "hint", "no https asset links"));
-    button.remove();
-  } catch (err) {
-    holder.replaceChildren(el("span", "hint", `links unavailable — ${err.message}`));
-    button.disabled = false;
-  }
+// The panel's controls. A band select under a preset switches it to Custom
+// (the single-band pick stays Single band); the rest apply as they are.
+$("preset").addEventListener("change", () => { ui.preset = $("preset").value; applySpec(); });
+for (const [i, id] of ["sel-r", "sel-g", "sel-b"].entries()) {
+  $(id).addEventListener("change", () => {
+    if (PRESETS[ui.preset].kind === "gray") { ui.single = $(id).value; }
+    else { ui.rgb[i] = $(id).value; ui.preset = "custom"; }
+    applySpec();
+  });
 }
+for (const radio of document.querySelectorAll('input[name="curve"]')) {
+  radio.addEventListener("change", () => { if (radio.checked) { ui.curve = radio.value; scheduleRestyle(); } });
+}
+$("gamma").addEventListener("input", () => {
+  ui.gamma = Number($("gamma").value);
+  $("gamma-out").textContent = ui.gamma.toFixed(2);
+  scheduleRestyle();
+});
+$("nodata").addEventListener("change", () => { ui.nodata = $("nodata").value === "" ? null : 0; scheduleRestyle(); });
 
 // The preview JPEGs carry opaque white nodata around the swath. A blend mode
 // cannot key that out on a dark panel (multiply keeps the white as the panel
@@ -1198,13 +1427,28 @@ function sceneCard(r, i) {
   show.type = "button";
   show.title = "Fly to the footprint and draw the visual COG on the map";
   show.addEventListener("click", () => showOnMap(r, show));
-  const links = el("span", "links");
-  const more = el("button", "mini", "Links");
-  more.type = "button";
-  more.title = "Read this scene's asset hrefs from the item part";
-  more.addEventListener("click", () => showLinks(r, links, more));
-  actions.append(show, more);
-  cap.append(actions, links);
+  actions.append(show);
+  // The band chips: each draws that band (TCI as true colour, B04/B08 as a
+  // single band, SCL as the classes) and carries a small link to the COG
+  // itself, derived from the thumbnail's directory like the map's reads.
+  const chips = el("span", "chips");
+  const dir = sceneDirOrNull(r);
+  for (const [band, preset, single] of [["TCI", "tci"], ["B04", "single", "B04"],
+    ["B08", "single", "B08"], ["SCL", "scl"]]) {
+    const chip = el("button", "mini", band);
+    chip.type = "button";
+    chip.title = `Show ${band} on the map`;
+    chip.addEventListener("click", () => showOnMap(r, chip, preset, single ?? null));
+    chips.append(chip);
+    if (!dir) continue;
+    const a = el("a", null, "↗");
+    a.href = bandHref(dir, band);
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.title = `Download ${band}.tif — ${a.href}`;
+    chips.append(a);
+  }
+  cap.append(actions, chips);
   card.append(cap);
   return card;
 }
@@ -1246,7 +1490,6 @@ async function runQuery() {
     say(`Range-reading ${urls.length} parquet part`
       + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
     const rows = (await conn.query(sql)).toArray();
-    lastParts = urls;
     box.replaceChildren();
     if (!rows.length) {
       box.append(el("p", "hint",

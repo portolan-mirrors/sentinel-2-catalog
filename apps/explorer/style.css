@@ -8,6 +8,9 @@
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
+/* The hidden attribute wins over any display rule below (labels are block,
+   the legend a grid). */
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body {
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -133,6 +136,46 @@ button.mini:not(:disabled):hover { background: #26457a; }
 }
 #cog-state[data-state="partial"]::before { background: #f4a261; }
 @keyframes cog-spin { to { transform: rotate(360deg); } }
+/* The band mapper: a compact block under the cogbar. */
+#bandbox:not([hidden]) {
+  margin: 8px 0 0; padding: 6px 10px 8px; font-size: 12px; border-radius: 3px;
+  background: var(--panel-2); border-left: 3px solid #1a9850;
+}
+#bandbox summary { cursor: pointer; color: var(--dim); font-size: 12px;
+                   text-transform: uppercase; letter-spacing: .09em; }
+#bandbox label { margin: 6px 0 0; }
+#bandbox select { margin-top: 2px; }
+#bandbox .bandrow.three { display: flex; gap: 6px; }
+#bandbox .bandrow.three label { flex: 1 1 0; min-width: 0; }
+#bandbox .bandrow.three select { font-size: 11px; padding: 3px 4px; }
+#bandbox .lbl { color: var(--dim); font-size: 12px; margin-right: 6px; }
+#bandbox label.inline { display: inline; margin: 0 8px 0 0; }
+#bandbox input[type=range] { width: 60%; }
+#bandbox #bandnote:empty { display: none; }
+#bandbox #bandnote { margin: 6px 0 0; }
+.chan-r { color: #ff8a8a; font-weight: 700; } .chan-g { color: #8ae28a; font-weight: 700; }
+.chan-b { color: #8ab4ff; font-weight: 700; }
+.chan { margin-top: 8px; }
+.chan-head { display: flex; align-items: baseline; gap: 6px; font-size: 12px; }
+.chan-head b { color: var(--ink); }
+.chan-head .hint { margin: 0; flex: 1 1 auto; white-space: nowrap; overflow: hidden;
+                   text-overflow: ellipsis; }
+.chan-head button.mini { padding: 0 5px; font-size: 10.5px; }
+.chan canvas.hist { display: block; width: 100%; height: 36px; margin-top: 4px;
+                    background: #0b1020; border-radius: 3px 3px 0 0; }
+.chan .vrange { margin: -4px 0 2px; }
+.chan .minmax { display: flex; gap: 6px; align-items: center; color: var(--dim); font-size: 11px; }
+.chan .minmax input[type=number] { width: 5.5em; padding: 2px 4px; font-size: 11px;
+                                   font-variant-numeric: tabular-nums; }
+#scl-legend { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin-top: 8px;
+              font-size: 11px; color: var(--dim); }
+#scl-legend span::before { content: ""; display: inline-block; width: 10px; height: 10px;
+                            margin-right: 5px; vertical-align: -1px; border-radius: 2px;
+                            background: var(--sw); border: 1px solid #0b1020; }
+.scene .chips { display: inline-flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
+.scene .chips button.mini { padding: 1px 6px; font-size: 11px; }
+.scene .chips a { margin: 0 4px 0 -2px; font-size: 11px; }
+
 .scene.best { position: relative; }
 .scene.best::before {
   content: "best"; position: absolute; left: 4px; top: 4px;

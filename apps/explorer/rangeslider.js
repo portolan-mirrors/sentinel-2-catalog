@@ -79,3 +79,40 @@ export function dayRange({ container, from, to, min, max, onChange }) {
   };
   return { set: setRange, rebound, days, min, max };
 }
+
+// The same two stacked handles over a plain numeric range (Task 28: the
+// band mapper's min/max per channel). Positions are `steps` integers from
+// lo to hi; onInput(min, max) fires on every drag step with the values.
+// Returns set(min, max) for the other direction (the numeric inputs, the
+// percentile buttons), which does not fire onInput.
+export function valueRange({ container, lo, hi, steps = 1000, onInput }) {
+  const a = document.createElement("input"), b = document.createElement("input");
+  for (const r of [a, b]) {
+    r.type = "range"; r.min = 0; r.max = steps; r.step = 1;
+    r.setAttribute("aria-label", r === a ? "Stretch minimum" : "Stretch maximum");
+  }
+  const fill = document.createElement("div");
+  fill.className = "fill";
+  container.replaceChildren(fill, a, b);
+  const span = hi - lo || 1;
+  const toPos = (v) => Math.round(Math.min(steps, Math.max(0, ((v - lo) / span) * steps)));
+  const toVal = (n) => lo + (n / steps) * span;
+  const paint = () => {
+    const x0 = (100 * Number(a.value)) / steps, x1 = (100 * Number(b.value)) / steps;
+    fill.style.left = `${x0}%`;
+    fill.style.width = `${Math.max(0, x1 - x0)}%`;
+    a.style.zIndex = Number(a.value) >= steps - 1 ? 3 : 1;
+    b.style.zIndex = Number(b.value) <= 1 ? 3 : 2;
+  };
+  a.addEventListener("input", () => {
+    if (Number(a.value) >= Number(b.value)) a.value = Math.max(0, Number(b.value) - 1);
+    paint(); onInput?.(toVal(Number(a.value)), toVal(Number(b.value)));
+  });
+  b.addEventListener("input", () => {
+    if (Number(b.value) <= Number(a.value)) b.value = Math.min(steps, Number(a.value) + 1);
+    paint(); onInput?.(toVal(Number(a.value)), toVal(Number(b.value)));
+  });
+  const set = (min, max) => { a.value = toPos(min); b.value = toPos(max); paint(); };
+  set(lo, hi);
+  return { set };
+}

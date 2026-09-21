@@ -39,9 +39,11 @@ export const bandTitle = (b) => {
 
 // The indices: (a - b) / (a + b), and the fixed diverging ramp each is drawn
 // with over -1..1 (three stops; the handles narrow the range the ramp spans,
-// the ramp itself does not change). NDVI: brown -> pale -> green, the
-// ColorBrewer BrBG ends. NDWI (McFeeters, green/NIR): brown -> pale -> blue,
-// so water is blue and land brown.
+// the ramp itself does not change, and it is linear between the handles —
+// the curve and gamma are for bands, where a nonlinear lift has no zero
+// point to move). NDVI: brown -> pale -> green, the ColorBrewer BrBG ends.
+// NDWI (McFeeters, green/NIR): brown -> pale -> blue, so water is blue and
+// land brown.
 export const INDICES = {
   ndvi: { label: "NDVI", a: "B08", b: "B04", ramp: ["#8c510a", "#f5f5f5", "#01665e"] },
   ndwi: { label: "NDWI", a: "B03", b: "B08", ramp: ["#a6611a", "#f5f5f5", "#0571b0"] },
@@ -183,7 +185,7 @@ export function paintRGBA(planes, spec, W, H) {
   if (spec.kind === "index") {
     const ix = INDICES[spec.index], a = planes[ix.a], b = planes[ix.b];
     const ch = spec.channels[0], ramp = rampTable(ix.ramp), off = spec.offset || 0;
-    const lo = ch.min, scale = (LUT_N - 1) / ((ch.max - ch.min) || 1e-9);
+    const lo = ch.min, scale = 255 / ((ch.max - ch.min) || 1e-9);
     if (!a || !b) return new ImageData(out, W, H);
     for (let i = 0; i < N; i++) {
       const av = a[i], bv = b[i];
@@ -191,8 +193,8 @@ export function paintRGBA(planes, spec, W, H) {
       const x = av - off, y = bv - off, v = (x - y) / (x + y);
       if (v !== v) continue;                       // 0/0 at a fully dark pixel
       let t = (v - lo) * scale;
-      t = t < 0 ? 0 : t > LUT_N - 1 ? LUT_N - 1 : t;
-      const k = lut[t | 0] * 3, o = i * 4;
+      t = t < 0 ? 0 : t > 255 ? 255 : t;
+      const k = (t | 0) * 3, o = i * 4;
       out[o] = ramp[k]; out[o + 1] = ramp[k + 1]; out[o + 2] = ramp[k + 2]; out[o + 3] = 255;
     }
     return new ImageData(out, W, H);
