@@ -94,9 +94,10 @@ export const COLLECTIONS = {
 const requestedCollection = new URLSearchParams(location.search).get("collection");
 export const COLLECTION_ID = COLLECTIONS[requestedCollection] ? requestedCollection : DEFAULT_COLLECTION;
 const COL = COLLECTIONS[COLLECTION_ID];
-if (requestedCollection && !COLLECTIONS[requestedCollection]) {
-  console.warn(`unknown ?collection=${requestedCollection}; showing ${COLLECTION_ID}`);
-}
+// An unknown ?collection= is said in the first status sentence the page
+// settles on (init() appends this to it), not only in the console.
+const collectionNote = requestedCollection && !COLLECTIONS[requestedCollection]
+  ? ` (?collection=${requestedCollection} is unknown, showing ${COLLECTION_ID})` : "";
 
 // The stats collection is three parquet products cut from one table
 // (tools/s2_stats.py), under stats/ or stats-c1/: the app never reads the
@@ -222,28 +223,33 @@ await mapReady;
 // the same 33k MGRS tiles whichever collection indexed them, so while a
 // collection's stats are not published yet (Collection 1 during its
 // backfill) the other collection's archive stands in, and there is still
-// a tile to click and search.
-const MGRS_URLS = [...new Set([COL.statsDir, ...Object.values(COLLECTIONS).map((c) => c.statsDir)])]
-  .map((dir) => `${BASE}/${dir}/mgrs.pmtiles`);
-let mgrsUrl = MGRS_URLS[0];
-let archive = new PMTiles(mgrsUrl);
-let tileZoom = { minZoom: 0, maxZoom: 0 };
-let mgrsError = null;
-for (const url of MGRS_URLS) {
-  const candidate = new PMTiles(url);
-  try {
-    const h = await candidate.getHeader();
-    tileZoom = { minZoom: h.minZoom, maxZoom: h.maxZoom };
-    archive = candidate;
-    mgrsUrl = url;
-    mgrsError = null;
-    break;
-  } catch (err) {
-    mgrsError ??= err;
+// a tile to click and search. Only a 404 of the collection's own archive
+// (one HEAD, a CORS-simple request) earns the stand-in: any other failure
+// — a refused read, a truncated file, a bad header — is said out loud and
+// left alone, so a broken stats tileset is never masked by a working one.
+let mgrsUrl = `${BASE}/${COL.statsDir}/mgrs.pmtiles`;
+const mgrsFallback = Object.values(COLLECTIONS).map((c) => `${BASE}/${c.statsDir}/mgrs.pmtiles`)
+  .find((url) => url !== mgrsUrl);
+try {
+  const head = await fetch(mgrsUrl, { method: "HEAD" });
+  await head.arrayBuffer().catch(() => {});
+  if (head.status === 404 && mgrsFallback) {
+    console.warn(`${mgrsUrl} is not published (404); MGRS footprints from ${mgrsFallback} instead`);
+    mgrsUrl = mgrsFallback;
+  } else if (!head.ok) {
+    throw new Error(`HTTP ${head.status}`);
   }
+} catch (err) {
+  say(`Could not open ${mgrsUrl} — ${err.message}`, true);
 }
-if (mgrsError) say(`Could not open ${MGRS_URLS[0]} — ${mgrsError.message}`, true);
-else if (mgrsUrl !== MGRS_URLS[0]) console.info(`MGRS footprints from ${mgrsUrl}; ${MGRS_URLS[0]} is not published yet`);
+const archive = new PMTiles(mgrsUrl);
+let tileZoom = { minZoom: 0, maxZoom: 0 };
+try {
+  const h = await archive.getHeader();
+  tileZoom = { minZoom: h.minZoom, maxZoom: h.maxZoom };
+} catch (err) {
+  say(`Could not open ${mgrsUrl} — ${err.message}`, true);
+}
 map.addSource("mgrs", { type: "vector", url: `pmtiles://${mgrsUrl}` });
 map.addLayer({ id: "mgrs-line", type: "line", source: "mgrs",
   "source-layer": "mgrs",
@@ -798,7 +804,8 @@ async function init() {
   } catch (err) {
     say(`Could not open ${TIMELINE}. The file is unreadable or the bucket `
       + `refused the read (${err.message}). Until publish-stats publishes `
-      + `it, serve a local publish tree and load ?base=http://localhost:8081`, true);
+      + `it, serve a local publish tree and load ?base=http://localhost:8081`
+      + collectionNote, true);
     return;
   }
   if (!found) {
@@ -807,7 +814,8 @@ async function init() {
   }
   if (!span) {
     say("The stats timeline has no rows yet — the backfill has not published "
-      + "any tile-months. The map and timeline will fill in once it does.");
+      + "any tile-months. The map and timeline will fill in once it does."
+      + collectionNote);
     await timelineFor(null);
     return;
   }
@@ -829,6 +837,8 @@ async function init() {
     lagNote = `Stats reach ${span.newest}; scenes are published through ${newestYear} `
       + "— the choropleth updates when the stats rebuild lands.";
   }
+  // Said with the lag note, once, on the first painted month.
+  lagNote = (lagNote + collectionNote).trim();
   month.min = span.oldest;
   month.max = newestYear > statsYear ? `${newestYear}-12` : span.newest;
   month.value = defaultMonth;
@@ -845,9 +855,14 @@ async function init() {
 // The page without stats (a 404 on the collection's timeline): the month
 // picker opens on the current month over the collection's whole span so
 // the search window can be set, the timeline says why it is empty, and the
-// status line says what is and is not published — the year parts are
-// probed the same way the stats-lag note does, from the collection's
-// first year up.
+// status line says what is and is not published. The year parts are
+// probed from the current year downward and the walk stops at the first
+// published one: with no stats there is no year to start an upward walk
+// from, and a backfill fills years in its own order (newest first, or with
+// gaps while it runs), which an upward walk from the first mission year
+// would stop short of. The cost is bounded by the mission's span — one
+// HEAD per part per year, twelve years at most — and only paid on a page
+// without stats.
 async function initWithoutStats() {
   statsMissing = true;
   const month = $("month");
@@ -857,13 +872,17 @@ async function initWithoutStats() {
   month.value = now;
   reboundDateRange(now);
   await timelineFor(null);
-  const newestYear = await newestPublishedYear(COL.since - 1);
+  let newestYear = null;
+  for (let y = CURRENT_YEAR; y >= COL.since && newestYear === null; y--) {
+    if ((await Promise.all(partUrlsFor(y, "1CDK").map(partExists))).some(Boolean)) newestYear = y;
+  }
   statsNote = `No stats published yet for ${COLLECTION_ID} (${COL.statsDir}/timeline.parquet `
     + "is not in the bucket): the map stays unpainted and the timeline empty until "
     + "publish-stats runs for it. "
-    + (newestYear >= COL.since
+    + (newestYear !== null
       ? `Scenes are published through ${newestYear} — click a tile and search.`
-      : "No year parts are published yet either; a search will say so.");
+      : "No year parts are published yet either; a search will say so.")
+    + collectionNote;
   say(statsNote);
 }
 
@@ -1666,7 +1685,7 @@ async function runQuery() {
     const sql = sceneSql(urls, selectedTile, d0, d1, cc, minCoverage);
     $("sql").textContent = sql;
     $("api").textContent = apiMirror(selectedTile, d0, d1, cc, minCoverage);
-    say(`Range-reading ${urls.length} ${COLLECTION_ID} parquet part`
+    say(`Range-reading ${urls.length} parquet part`
       + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
     const rows = (await conn.query(sql)).toArray();
     box.replaceChildren();
@@ -1681,8 +1700,11 @@ async function runQuery() {
     // The results sit below the timeline in the panel; without this the hero
     // flow's answer lands off-screen on a short window.
     box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    // The collection is named only off the default: the default's text is
+    // the page as it always read; the API mirror names it either way.
+    const parts = COLLECTION_ID === DEFAULT_COLLECTION ? "part" : `${COLLECTION_ID} part`;
     say(`${rows.length} scene${rows.length === 1 ? "" : "s"} for ${selectedTile}, `
-      + `clearest first — ${urls.length} range-read ${COLLECTION_ID} part`
+      + `clearest first — ${urls.length} range-read ${parts}`
       + `${urls.length === 1 ? "" : "s"}, no API call.`);
   } catch (err) {
     box.replaceChildren(el("p", "hint", `Query failed — ${err.message}`));
