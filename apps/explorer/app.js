@@ -14,6 +14,11 @@
 //                                 composite, NDVI/NDWI or the SCL classes,
 //                                 read band by band on demand and stretched
 //                                 in the browser (Task 28, bands.js)
+// The same page shows Earth Search's Collection 1 (sentinel-2-c1-l2a, with
+// stats-c1/) under ?collection=: the COLLECTIONS table below is everything
+// that differs — directories, the tile column, which parts a year has, the
+// two extra mask bands — and the sidebar's select reloads the page with
+// the parameter set.
 // There is no API, no server and no database behind this page: DuckDB-WASM
 // issues HTTP range reads straight at the object store, and so do the COG
 // reads. The map is MapLibre for the camera; the tiles are drawn by deck.gl
@@ -29,7 +34,8 @@ import { parse } from "https://esm.sh/@loaders.gl/core@4.5.1";
 import { MVTLoader } from "https://esm.sh/@loaders.gl/mvt@4.5.1";
 import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOverviews,
   sceneIndexStats, bandPreviewImage, bandTileLayer, bandHref } from "./cog.js";
-import { BANDS, bandTitle, INDICES, SCL_CLASSES, PRESETS, bandsOf, HIST_BINS } from "./bands.js";
+import { BANDS, MASK_BANDS, bandInfo, bandTitle, fixedRange, INDICES, SCL_CLASSES, PRESETS,
+  bandsOf, HIST_BINS } from "./bands.js";
 import { dayRange, valueRange } from "./rangeslider.js";
 // deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
 // transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
@@ -49,8 +55,52 @@ const { MapboxOverlay, GeoJsonLayer, MVTLayer } = window.deck;
 export const BASE = new URLSearchParams(location.search).get("base")
   ?? "https://data.source.coop/portolan-mirrors/sentinel-2-catalog";
 
+// The collections this page can show and what differs between them; the
+// rest — the stats products, the scene query, the COG reads — is the same
+// shape under another directory. `parts(year, tile)` are the file stems
+// that may hold a tile's scenes in that year, each HEAD-probed before it is
+// read (partExists): the first collection is the one zone part of the
+// year's tier plus live.parquet for the current year; Collection 1 is one
+// items.parquet per year plus a live.parquet any year may carry (its
+// refresh appends by `created`, so a reprocessed 2019 scene lands in
+// year=2019/live.parquet). `apiTile` is how a STAC API is asked for a tile
+// (apiMirror): Collection 1 items have no s2:mgrs_tile, their tile is
+// grid:code "MGRS-31UET". `masks` are the extra single bands its scenes
+// carry (bands.js MASK_BANDS). `since` is the first year with scenes, for
+// the header and the month picker when no stats say better.
+// DEFAULT_COLLECTION is what loads without ?collection=: one constant, to
+// flip to Collection 1 once its backfill and stats are complete.
+export const DEFAULT_COLLECTION = "sentinel-2-l2a";
+export const COLLECTIONS = {
+  "sentinel-2-l2a": {
+    label: "Sentinel-2 L2A (Earth Search)", title: "Sentinel-2 L2A", since: 2016,
+    dir: "sentinel-2-l2a", statsDir: "stats", tileColumn: "s2:mgrs_tile",
+    parts: (year, tile) => {
+      const archive = archivePartFor(tile, year);
+      return [...(archive ? [archive] : []), ...(year === CURRENT_YEAR ? ["live"] : [])];
+    },
+    apiTile: (tile) => ({ "s2:mgrs_tile": { eq: tile } }),
+    masks: [],
+  },
+  "sentinel-2-c1-l2a": {
+    label: "Sentinel-2 Collection 1 (Earth Search)", title: "Sentinel-2 Collection 1 L2A",
+    since: 2015,
+    dir: "sentinel-2-c1-l2a", statsDir: "stats-c1", tileColumn: "_tile",
+    parts: () => ["items", "live"],
+    apiTile: (tile) => ({ "grid:code": { eq: `MGRS-${tile}` } }),
+    masks: Object.keys(MASK_BANDS),
+  },
+};
+const requestedCollection = new URLSearchParams(location.search).get("collection");
+export const COLLECTION_ID = COLLECTIONS[requestedCollection] ? requestedCollection : DEFAULT_COLLECTION;
+const COL = COLLECTIONS[COLLECTION_ID];
+if (requestedCollection && !COLLECTIONS[requestedCollection]) {
+  console.warn(`unknown ?collection=${requestedCollection}; showing ${COLLECTION_ID}`);
+}
+
 // The stats collection is three parquet products cut from one table
-// (tools/s2_stats.py): the app never reads the full table whole.
+// (tools/s2_stats.py), under stats/ or stats-c1/: the app never reads the
+// full table whole.
 //  - timeline.parquet: one row per month over all tiles, a few KB. Fetched
 //    whole on load; it gives the month span and the global timeline.
 //  - months/YYYY-MM.parquet: one month's rows with the paint columns, sorted
@@ -60,10 +110,10 @@ export const BASE = new URLSearchParams(location.search).get("base")
 //    groups. Only ever range-read over httpfs with WHERE mgrs_tile = ..., the
 //    way the scene search reads the year parts: one tile's history is a
 //    ~55 KB footer plus one row group's column chunks, not the file.
-const STATS = `${BASE}/stats/mgrs-monthly.parquet`;
-const TIMELINE = `${BASE}/stats/timeline.parquet`;
+const STATS = `${BASE}/${COL.statsDir}/mgrs-monthly.parquet`;
+const TIMELINE = `${BASE}/${COL.statsDir}/timeline.parquet`;
 const TIMELINE_FILE = "timeline.parquet";
-const monthUrl = (ym) => `${BASE}/stats/months/${ym}.parquet`;
+const monthUrl = (ym) => `${BASE}/${COL.statsDir}/months/${ym}.parquet`;
 // Only these may reach the SQL string; the <select> is not trusted input.
 const METRICS = new Set(["min_cloud_cover", "scene_count", "median_cloud_cover", "max_cover"]);
 
@@ -76,6 +126,25 @@ const say = (msg, isError = false) => {
   el.textContent = msg;
   el.classList.toggle("error", isError);
 };
+
+// The sidebar's collection switch. The select shows the loaded collection;
+// a change reloads the page with ?collection= set (the other parameters
+// kept), which is how every piece of per-collection state — DuckDB's
+// registered files, the stats, timeline and month, the results, a shown
+// scene — starts over rather than being unpicked one by one.
+{
+  const sel = $("collection");
+  for (const [id, c] of Object.entries(COLLECTIONS)) sel.append(new Option(c.label, id));
+  sel.value = COLLECTION_ID;
+  sel.addEventListener("change", () => {
+    const url = new URL(location.href);
+    url.searchParams.set("collection", sel.value);
+    location.assign(url);
+  });
+  $("title").textContent = COL.title;
+  $("sub").textContent = `${COL.title} scenes since ${COL.since} — every query on this page `
+    + "is a range read against static GeoParquet on Source Cooperative; there is no API.";
+}
 
 async function initDb() {
   const bundles = duckdb.getJsDelivrBundles();
@@ -109,7 +178,7 @@ const db = await initDb();
 const conn = await db.connect();
 // A console handle saves reaching into the module; the deck.gl overlay and
 // the per-month lookup are added below once they exist.
-window.S2 = { BASE, db, conn, map };
+window.S2 = { BASE, collection: COLLECTION_ID, db, conn, map };
 
 // The choropleth ramp, shared by the map fill, the legend and the timeline
 // bars so one colour always means one thing.
@@ -149,18 +218,36 @@ await mapReady;
 // frame under software GL where MapLibre's lines take a few ms. The fills
 // are slotted beneath it with beforeId.
 // ---------------------------------------------------------------------------
-map.addSource("mgrs", { type: "vector", url: `pmtiles://${BASE}/stats/mgrs.pmtiles` });
+// The footprints come from the collection's own stats tileset. The grid is
+// the same 33k MGRS tiles whichever collection indexed them, so while a
+// collection's stats are not published yet (Collection 1 during its
+// backfill) the other collection's archive stands in, and there is still
+// a tile to click and search.
+const MGRS_URLS = [...new Set([COL.statsDir, ...Object.values(COLLECTIONS).map((c) => c.statsDir)])]
+  .map((dir) => `${BASE}/${dir}/mgrs.pmtiles`);
+let mgrsUrl = MGRS_URLS[0];
+let archive = new PMTiles(mgrsUrl);
+let tileZoom = { minZoom: 0, maxZoom: 0 };
+let mgrsError = null;
+for (const url of MGRS_URLS) {
+  const candidate = new PMTiles(url);
+  try {
+    const h = await candidate.getHeader();
+    tileZoom = { minZoom: h.minZoom, maxZoom: h.maxZoom };
+    archive = candidate;
+    mgrsUrl = url;
+    mgrsError = null;
+    break;
+  } catch (err) {
+    mgrsError ??= err;
+  }
+}
+if (mgrsError) say(`Could not open ${MGRS_URLS[0]} — ${mgrsError.message}`, true);
+else if (mgrsUrl !== MGRS_URLS[0]) console.info(`MGRS footprints from ${mgrsUrl}; ${MGRS_URLS[0]} is not published yet`);
+map.addSource("mgrs", { type: "vector", url: `pmtiles://${mgrsUrl}` });
 map.addLayer({ id: "mgrs-line", type: "line", source: "mgrs",
   "source-layer": "mgrs",
   paint: { "line-color": "#8899bb", "line-width": 0.4 } });
-const archive = new PMTiles(`${BASE}/stats/mgrs.pmtiles`);
-let tileZoom = { minZoom: 0, maxZoom: 0 };
-try {
-  const h = await archive.getHeader();
-  tileZoom = { minZoom: h.minZoom, maxZoom: h.maxZoom };
-} catch (err) {
-  say(`Could not open ${BASE}/stats/mgrs.pmtiles — ${err.message}`, true);
-}
 // MVTLayer asks for "{z}/{x}/{y}" of its data template; the bytes come from
 // the PMTiles archive (one range read per tile, cached by the library) and
 // are parsed on this thread with loaders.gl's MVTLoader, using the options
@@ -375,9 +462,18 @@ async function registerRemote(url, name) {
   return true;
 }
 
-async function loadTimeline() {
-  if (!(await registerRemote(TIMELINE, TIMELINE_FILE))) throw new Error("HTTP 404");
-}
+// False when the collection has no stats in the bucket yet (Collection 1
+// until publish-stats first runs for it): init() then keeps the page in its
+// no-stats state below rather than treating the 404 as a broken bucket.
+const loadTimeline = () => registerRemote(TIMELINE, TIMELINE_FILE);
+
+// Set by init() when the collection's stats are not published: the map
+// stays unpainted, the timeline empty, and the month and tile-history reads
+// that would only 404 are not attempted. The scene search is untouched —
+// the year parts are their own files. `statsNote` is the status line that
+// says so, repeated whenever a month change would otherwise paint.
+let statsMissing = false;
+let statsNote = "";
 
 // Month slices already registered with DuckDB: ym -> the registered file
 // name, or null for a month the bucket has no slice for. The value is the
@@ -469,6 +565,7 @@ async function paintMonth() {
   const [y, m] = ($("month").value || "").split("-").map(Number);
   if (!y || !m) return;
   const ym = `${y}-${String(m).padStart(2, "0")}`;
+  if (statsMissing) { say(statsNote); return; }
   const seq = ++paintSeq;
   // Said once, on whichever paintMonth() call happens to be first (the
   // default-month load), then never again.
@@ -528,6 +625,13 @@ let timelineSeq = 0;
 export async function timelineFor(tile) {
   const bars = $("bars");
   const seq = ++timelineSeq;
+  if (statsMissing) {
+    const scope = tile ? `Tile ${tile}` : "All tiles";
+    $("timeline-scope").textContent = `${scope} — no stats published yet for ${COLLECTION_ID}.`;
+    bars.replaceChildren(el("p", "hint",
+      `No stats published yet for ${COLLECTION_ID} (${COL.statsDir}/timeline.parquet is not in the bucket).`));
+    return;
+  }
   let rows;
   try {
     if (tile) say(`Reading tile ${tile}'s history…`);
@@ -687,15 +791,18 @@ async function init() {
   $("mincoverage").addEventListener("input", onSlider);
   $("minscenes").addEventListener("input", onSlider);
   say("Reading the stats timeline…");
-  let span;
+  let span, found;
   try {
-    await loadTimeline();
-    span = await newestMonth();
+    found = await loadTimeline();
+    span = found ? await newestMonth() : null;
   } catch (err) {
-    say(`Could not open ${TIMELINE}. The file is missing, unreadable, or the `
-      + `bucket refused the read (${err.message}). Until publish-stats `
-      + `publishes it, serve a local publish tree and load `
-      + `?base=http://localhost:8081`, true);
+    say(`Could not open ${TIMELINE}. The file is unreadable or the bucket `
+      + `refused the read (${err.message}). Until publish-stats publishes `
+      + `it, serve a local publish tree and load ?base=http://localhost:8081`, true);
+    return;
+  }
+  if (!found) {
+    await initWithoutStats();
     return;
   }
   if (!span) {
@@ -735,12 +842,37 @@ async function init() {
   markActiveBar();
 }
 
+// The page without stats (a 404 on the collection's timeline): the month
+// picker opens on the current month over the collection's whole span so
+// the search window can be set, the timeline says why it is empty, and the
+// status line says what is and is not published — the year parts are
+// probed the same way the stats-lag note does, from the collection's
+// first year up.
+async function initWithoutStats() {
+  statsMissing = true;
+  const month = $("month");
+  const now = new Date().toISOString().slice(0, 7);
+  month.min = `${COL.since}-01`;
+  month.max = now;
+  month.value = now;
+  reboundDateRange(now);
+  await timelineFor(null);
+  const newestYear = await newestPublishedYear(COL.since - 1);
+  statsNote = `No stats published yet for ${COLLECTION_ID} (${COL.statsDir}/timeline.parquet `
+    + "is not in the bucket): the map stays unpainted and the timeline empty until "
+    + "publish-stats runs for it. "
+    + (newestYear >= COL.since
+      ? `Scenes are published through ${newestYear} — click a tile and search.`
+      : "No year parts are published yet either; a search will say so.");
+  say(statsNote);
+}
+
 // init() runs at the end of the module: it probes the item years with the
 // scene query's constants and helpers, which are defined below.
 
 // ---------------------------------------------------------------------------
 // The scene query. Click a tile, pick a window, and DuckDB-WASM range-reads the
-// year parts of sentinel-2-l2a directly. The row's `assets` column (a JSON
+// year parts of the collection directly. The row's `assets` column (a JSON
 // string carrying the upstream STAC assets object) is ~18 KB a row and half
 // the bytes of a part, so the search leaves it out; every COG the page draws
 // or links sits in the scene directory that `thumbnail_url` names (see
@@ -816,26 +948,26 @@ const partExists = (url) => {
   return partProbes.get(url);
 };
 
-// Every part that could hold `tile` in the years y0..y1, filtered to the ones
-// that exist. Per year that is exactly one archive file -- items.parquet, or
-// the one zone part of the year's tier the tile's zone falls in; the other
-// parts of the year are never probed, let alone read -- plus live.parquet for
-// the current year. The tier comes from the year (the thresholds are
-// constants mirrored above); the probe only asks whether the year is
-// published yet.
-// The last year with any published archive part, from `from` upward: the
-// zone-1 part of each year's tier is probed (a year is published whole, so
-// one part stands for the year), plus live.parquet for the current year.
-// Years are probed in order and the walk stops at the first unpublished
-// one, so a page load costs one 404 (which Chrome logs), not one per
-// future year.
+// The URLs of the parts that may hold `tile` in `year`, per the collection
+// (COLLECTIONS[..].parts). For the first collection that is exactly one
+// archive file -- items.parquet, or the one zone part of the year's tier
+// the tile's zone falls in; the other parts of the year are never probed,
+// let alone read -- plus live.parquet for the current year. For Collection
+// 1 it is items.parquet plus the year's live.parquet. The probe only asks
+// whether the file is published yet.
+const partUrlsFor = (year, tile) =>
+  COL.parts(year, tile).map((stem) => `${BASE}/${COL.dir}/year=${year}/${stem}.parquet`);
+
+// The last year with any published part, from `from` upward: a zone-1
+// tile's parts of each year are probed (a year is published whole, so one
+// part stands for the year; live.parquet where the collection may have
+// one). Years are probed in order and the walk stops at the first
+// unpublished one, so a page load costs one 404 (which Chrome logs), not
+// one per future year.
 async function newestPublishedYear(from) {
   let newest = from;
   for (let y = from + 1; y <= CURRENT_YEAR; y++) {
-    const dir = `${BASE}/sentinel-2-l2a/year=${y}`;
-    const probes = [`${dir}/${archivePartFor("1CDK", y)}.parquet`];
-    if (y === CURRENT_YEAR) probes.push(`${dir}/live.parquet`);
-    if (!(await Promise.all(probes.map(partExists))).some(Boolean)) break;
+    if (!(await Promise.all(partUrlsFor(y, "1CDK").map(partExists))).some(Boolean)) break;
     newest = y;
   }
   return newest;
@@ -843,12 +975,7 @@ async function newestPublishedYear(from) {
 
 async function partUrls(y0, y1, tile) {
   const candidates = [];
-  for (let y = y0; y <= y1; y++) {
-    const dir = `${BASE}/sentinel-2-l2a/year=${y}`;
-    const archive = archivePartFor(tile, y);
-    if (archive) candidates.push(`${dir}/${archive}.parquet`);
-    if (y === CURRENT_YEAR) candidates.push(`${dir}/live.parquet`);
-  }
+  for (let y = y0; y <= y1; y++) candidates.push(...partUrlsFor(y, tile));
   const present = await Promise.all(candidates.map(partExists));
   return candidates.filter((_, i) => present[i]);
 }
@@ -859,6 +986,9 @@ function sceneSql(urls, tile, d0, d1, cc, cov) {
   // `_month` is the cheap row-group filter, but it only narrows anything while
   // the window stays inside one calendar year — across a year boundary
   // (2023-11 → 2024-02) months 11..2 is empty, so it widens to the whole year.
+  // Collection 1 parts are sorted by tile then time, not month-major; they
+  // keep the `_month` column, so the predicate is the same and still prunes
+  // by the row groups' min/max where it can.
   const sameYear = d0.slice(0, 4) === d1.slice(0, 4);
   const m0 = sameYear ? Number(d0.slice(5, 7)) : 1;
   const m1 = sameYear ? Number(d1.slice(5, 7)) : 12;
@@ -881,7 +1011,7 @@ function sceneSql(urls, tile, d0, d1, cc, cov) {
        bbox,
        "s2:processing_baseline" AS baseline
 FROM read_parquet(${partList(urls)}, union_by_name=true)
-WHERE "s2:mgrs_tile" = '${tile}'
+WHERE "${COL.tileColumn}" = '${tile}'
   AND _month BETWEEN ${m0} AND ${m1}
   AND (datetime AT TIME ZONE 'UTC')
       BETWEEN TIMESTAMP '${d0} 00:00:00' AND TIMESTAMP '${d1} 23:59:59'
@@ -895,7 +1025,7 @@ LIMIT 30`;
 function apiMirror(tile, d0, d1, cc, cov) {
   const query = {
     "eo:cloud_cover": { lte: cc },
-    "s2:mgrs_tile": { eq: tile },
+    ...COL.apiTile(tile),
   };
   // Mirrors sceneSql's coverage gate: coverage = 100 - nodata, so
   // coverage >= cov is nodata <= 100 - cov. Omitted at the slider's inert
@@ -908,7 +1038,7 @@ function apiMirror(tile, d0, d1, cc, cov) {
     method: "POST",
     url: "https://earth-search.aws.element84.com/v1/search",
     body: {
-      collections: ["sentinel-2-l2a"],
+      collections: [COLLECTION_ID],
       datetime: `${d0}T00:00:00Z/${d1}T23:59:59Z`,
       query,
       sortby: [{ field: "properties.eo:cloud_cover", direction: "asc" }],
@@ -997,9 +1127,12 @@ function hideImagePanel() {
 // ---------------------------------------------------------------------------
 const ui = { preset: "tci", rgb: ["B04", "B03", "B02"], single: "B04", curve: "linear", gamma: 1, nodata: 0 };
 for (const [key, p] of Object.entries(PRESETS)) $("preset").append(new Option(p.label, key));
+// The selectable bands: the L2A set, plus the collection's masks (Collection
+// 1's cloud and snow probabilities) after them.
+const SELECTABLE_BANDS = [...Object.keys(BANDS), ...COL.masks];
 for (const id of ["sel-r", "sel-g", "sel-b"]) {
-  for (const b of Object.keys(BANDS)) {
-    const o = new Option(`${b} ${BANDS[b].label}`, b);
+  for (const b of SELECTABLE_BANDS) {
+    const o = new Option(`${b} ${bandInfo(b).label}`, b);
     o.title = bandTitle(b);
     $(id).append(o);
   }
@@ -1056,6 +1189,12 @@ function syncPanel(spec, me) {
     if (me?.offset === null) notes.push("No processing baseline in the row — the ≥ 04.00 BOA offset (−1000) is not applied.");
     else if (me?.offset) notes.push(`Baseline ${me.r.baseline}: −1000 BOA offset applied before the ratio.`);
   }
+  if (kind === "gray" && fixedRange(ui.single)) {
+    const [lo, hi] = fixedRange(ui.single);
+    notes.push(`${ui.single} is ${bandInfo(ui.single).label.toLowerCase()} in percent, `
+      + `stretched over the whole ${lo}–${hi} scale (the handles can narrow it). `
+      + `Under Auto nodata a ${lo} % pixel is transparent — set Nodata to None to draw it black.`);
+  }
   if (me?.missing.length) notes.push(`${me.missing.join(", ")} could not be opened — shown without.`);
   $("bandnote").textContent = notes.join(" ");
 }
@@ -1071,12 +1210,17 @@ function buildChannels(me, spec) {
     const stats = ch.index
       ? sceneIndexStats(me.scene, INDICES[ch.index].a, INDICES[ch.index].b, me.offset ?? 0)
       : me.scene.overviews.get(ch.band)?.value?.stats ?? null;
-    // No stats (band unreadable): the same 0..10000 the range was seeded with.
-    const lo = ch.index ? -1 : stats?.min ?? 0, hi = ch.index ? 1 : stats?.max ?? 10000;
+    // The slider's span: a mask's fixed scale; else the data's own min..max,
+    // or with no stats (band unreadable) the same 0..10000 the range was
+    // seeded with.
+    const fixed = ch.index ? null : fixedRange(ch.band);
+    const lo = ch.index ? -1 : fixed?.[0] ?? stats?.min ?? 0;
+    const hi = ch.index ? 1 : fixed?.[1] ?? stats?.max ?? 10000;
     const block = el("div", "chan");
     const head = el("div", "chan-head");
     head.append(el("b", null, ch.index ? INDICES[ch.index].label : ch.band),
-      el("span", "hint", ch.index ? `${INDICES[ch.index].a} − ${INDICES[ch.index].b}` : bandTitle(ch.band).slice(4)));
+      el("span", "hint", ch.index ? `${INDICES[ch.index].a} − ${INDICES[ch.index].b}`
+        : bandTitle(ch.band).slice(ch.band.length + 1)));
     const canvas = document.createElement("canvas");
     canvas.className = "hist"; canvas.width = 320; canvas.height = 36;
     canvas.title = "Histogram of the overview (nodata left out); the lit bins are inside the handles";
@@ -1247,7 +1391,11 @@ async function showBandsLoaded(me, spec, serial, failed) {
     const st = ch.index
       ? sceneIndexStats(me.scene, INDICES[ch.index].a, INDICES[ch.index].b, me.offset ?? 0)
       : me.scene.overviews.get(ch.band)?.value?.stats;
-    me.ranges.set(chanKey(ch), ch.index ? { min: -1, max: 1 } : st ? { min: st.p2, max: st.p98 } : { min: 0, max: 10000 });
+    // A mask opens on its fixed scale; a band on its 2–98 %.
+    const fixed = ch.index ? null : fixedRange(ch.band);
+    me.ranges.set(chanKey(ch), ch.index ? { min: -1, max: 1 }
+      : fixed ? { min: fixed[0], max: fixed[1] }
+        : st ? { min: st.p2, max: st.p98 } : { min: 0, max: 10000 });
   }
   spec = me.spec = bandSpec(me);
   syncPanel(spec, me);
@@ -1510,15 +1658,15 @@ async function runQuery() {
       $("sql").textContent = "";
       $("api").textContent = "";
       box.replaceChildren(el("p", "hint",
-        `No published item parts cover ${d0.slice(0, 4)}–${d1.slice(0, 4)}. `
+        `No published ${COLLECTION_ID} parts cover ${d0.slice(0, 4)}–${d1.slice(0, 4)}. `
         + "Pick a window the backfill has reached."));
-      say(`Nothing published for ${d0.slice(0, 4)}–${d1.slice(0, 4)} yet.`);
+      say(`Nothing published for ${d0.slice(0, 4)}–${d1.slice(0, 4)} in ${COLLECTION_ID} yet.`);
       return;
     }
     const sql = sceneSql(urls, selectedTile, d0, d1, cc, minCoverage);
     $("sql").textContent = sql;
     $("api").textContent = apiMirror(selectedTile, d0, d1, cc, minCoverage);
-    say(`Range-reading ${urls.length} parquet part`
+    say(`Range-reading ${urls.length} ${COLLECTION_ID} parquet part`
       + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
     const rows = (await conn.query(sql)).toArray();
     box.replaceChildren();
@@ -1534,7 +1682,7 @@ async function runQuery() {
     // flow's answer lands off-screen on a short window.
     box.scrollIntoView({ block: "nearest", behavior: "smooth" });
     say(`${rows.length} scene${rows.length === 1 ? "" : "s"} for ${selectedTile}, `
-      + `clearest first — ${urls.length} range-read part`
+      + `clearest first — ${urls.length} range-read ${COLLECTION_ID} part`
       + `${urls.length === 1 ? "" : "s"}, no API call.`);
   } catch (err) {
     box.replaceChildren(el("p", "hint", `Query failed — ${err.message}`));

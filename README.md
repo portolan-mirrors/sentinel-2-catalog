@@ -17,7 +17,10 @@ reads against a public bucket: no key, no server, no rate limit.
   static page that behaves like there is an API behind it. DuckDB-WASM range
   reads plus PMTiles, nothing else. Any band, composite, NDVI/NDWI or the
   SCL classes of a scene are drawn on the map straight from its COGs in
-  the browser, with histogram-and-handles stretch controls.
+  the browser, with histogram-and-handles stretch controls. A collection
+  switch in the sidebar (or `?collection=sentinel-2-c1-l2a`) points the
+  same page at Collection 1, reading `sentinel-2-c1-l2a/` and `stats-c1/`
+  as they are published.
 - **Published catalog**: https://source.coop/portolan-mirrors/sentinel-2-catalog
 - **STAC root**: `https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json`
 - **Upstream**: [Earth Search](https://earth-search.aws.element84.com/v1) by

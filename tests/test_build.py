@@ -452,6 +452,33 @@ def test_app_mirrors_both_zone_tiers():
     assert f"const ZONE_SPLIT_8_FROM = {ZONE_SPLIT_8_FROM};" in js
 
 
+def test_app_collections_mirror_the_configs():
+    """The explorer's COLLECTIONS table (Task 9 of the C1 plan) carries, per
+    collection, the directory, the stats directory and the tile column the
+    tools publish under; pin each to s2_collections so a rename there cannot
+    leave the app reading the old path. The default is one of the ids (the
+    constant flips to Collection 1 once its backfill is complete), and the
+    sidebar has the switch."""
+    import s2_collections as cols
+    js = (ROOT / "apps/explorer/app.js").read_text()
+    for name in cols.NAMES:
+        config = cols.get(name)
+        start = js.index(f'  "{name}": {{')
+        entry = js[start:js.index("\n  }", start)]
+        assert f'dir: "{config.catalog_dir}"' in entry, name
+        assert f'statsDir: "{config.stats_dir}"' in entry, name
+        assert f'tileColumn: "{config.tile_column}"' in entry, name
+    default = next(line for line in js.splitlines()
+                   if line.startswith("export const DEFAULT_COLLECTION = "))
+    assert default.split('"')[1] in cols.NAMES
+    assert 'WHERE "${COL.tileColumn}" = ' in js
+    assert 'collections: [COLLECTION_ID]' in js
+    html = (ROOT / "apps/explorer/index.html").read_text()
+    assert '<select id="collection">' in html
+    readme = (ROOT / "README.md").read_text()
+    assert "?collection=sentinel-2-c1-l2a" in readme
+
+
 # ---------------------------------------------------------------------------
 # The eight-part tier (Task 19), and the two flags that make a build resume.
 # ---------------------------------------------------------------------------

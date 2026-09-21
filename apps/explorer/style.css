@@ -27,6 +27,8 @@ h1 { margin: 0 0 6px; font-size: 19px; letter-spacing: .2px; }
 h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
      letter-spacing: .09em; color: var(--dim); }
 .sub { margin: 0 0 12px; color: var(--dim); font-size: 12.5px; }
+/* The collection switch sits between the title and its blurb. */
+.switch { margin: 2px 0 10px; }
 .hint { margin: 6px 0 0; color: var(--dim); font-size: 12px; }
 .status {
   margin: 0 0 14px; padding: 8px 10px; font-size: 12.5px;
