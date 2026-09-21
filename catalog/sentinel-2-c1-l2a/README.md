@@ -164,7 +164,7 @@ Every asset sits at
 (`31/U/ET/2026/9/S2B_T31UET_20260921T105030_L2A/`), the thumbnail being
 `L2A_PVI.jpg` in that directory — but read the href from `assets` rather
 than build it. Nothing is filtered, reclassified or interpolated here. The
-columns added are three query helpers, `_month`, `_hilbert` and `_tile`,
+columns added are four helpers, `thumbnail_url`, `_month`, `_hilbert` and `_tile`,
 documented in the [agent guide](AGENTS.md).
 
 Contains modified Copernicus Sentinel data. The
