@@ -143,14 +143,16 @@ export async function readCogTile(cog, bbox, signal) {
 }
 
 // Which thumbnail pixels are the swath's nodata, as one flag per pixel. The
-// JPEG paints nodata in one flat colour — black on preview.jpg, white on
-// thumbnail.jpg (checked on 31UFU partial scenes of every year 2018-2026;
-// 2024 has both file names, and the name decides, not the year) — and
-// compression smears a fringe of near-that-colour pixels along the swath
-// edge. So: exactly that colour, grown by one pixel into near-that-colour
-// neighbours. Real dark water (black era) and bright cloud (white era) are
-// only lost where they are exactly the flat colour or touch the fringe;
-// an isolated exact match is not grown from, so the loss stays at the edge.
+// thumbnail paints nodata in one flat colour — white on thumbnail.jpg,
+// black on everything else: preview.jpg, and the thumbnail.jp2 that 22% of
+// the 2018 rows carry (checked on 31UFU partial scenes of every year
+// 2018-2026; 2024 has both .jpg names, and the name decides, not the year)
+// — and compression smears a fringe of near-that-colour pixels along the
+// swath edge. So: every pixel of exactly that colour, plus its immediate
+// near-that-colour neighbours (grown once, from every exact match, so the
+// growth is bounded to one pixel). Real dark water (black) and bright
+// cloud (white) are lost only where they are exactly the flat colour or
+// sit next to such a pixel.
 function jpegNodataMask(data, w, h, white) {
   const exact = white ? (k) => data[k] >= 250 && data[k + 1] >= 250 && data[k + 2] >= 250
     : (k) => data[k] === 0 && data[k + 1] === 0 && data[k + 2] === 0;
@@ -179,14 +181,19 @@ function jpegNodataMask(data, w, h, white) {
 // a BitmapLayer with `_imageCoordinateSystem: "lnglat"` — that spans a whole
 // degree of latitude, where the Mercator-linear default would misplace the
 // middle by a couple of pixels. The JPEG is treated as one more overview
-// level of the COG, its pixel size the base's scaled by the width ratio.
-// `white` says the JPEG's nodata colour (see jpegNodataMask).
+// level of the COG, its pixel size the base's scaled by the width ratio;
+// null if the thumbnail is not the COG's shape. `white` says the
+// thumbnail's nodata colour (see jpegNodataMask).
 export function previewImage(cog, bitmap, { white = false } = {}) {
   const [west, south, east, north] = cog.bounds;
   // Long side by the scene's on-screen shape: longitude shrinks by cos(lat).
   const aspect = ((east - west) * Math.cos(((south + north) / 2) * Math.PI / 180)) / (north - south);
   const W = Math.round(aspect >= 1 ? PREVIEW : PREVIEW * aspect);
   const H = Math.round(aspect >= 1 ? PREVIEW / aspect : PREVIEW);
+  // One scale serves both axes, so the thumbnail must have the COG's
+  // shape (both are square; a thumbnail cut to another shape would be
+  // stretched into the wrong place). More than a pixel off: no preview.
+  if (Math.abs(bitmap.width * cog.h - bitmap.height * cog.w) > bitmap.width) return null;
   const canvas = document.createElement("canvas");
   canvas.width = bitmap.width; canvas.height = bitmap.height;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });

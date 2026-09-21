@@ -62,6 +62,9 @@ const monthUrl = (ym) => `${BASE}/stats/months/${ym}.parquet`;
 const METRICS = new Set(["min_cloud_cover", "scene_count", "median_cloud_cover", "max_cover"]);
 
 const $ = (id) => document.getElementById(id);
+// ?debug logs the COG timeline (preview shown, viewport loaded) to the console.
+const DEBUG = new URLSearchParams(location.search).has("debug");
+const debug = (...args) => { if (DEBUG) console.info(...args); };
 const say = (msg, isError = false) => {
   const el = $("status");
   el.textContent = msg;
@@ -1052,7 +1055,12 @@ async function showOnMap(r, button) {
   try {
     const href = visualHrefOf(r);
     say(`Preview of ${id} — loading full-resolution tiles…`);
-    const [bitmap, cog] = await Promise.all([thumbnailBitmap(r.thumbnail_url), openCog(href)]);
+    // Both start now; the tiles are not made to wait for the JPEG, nor the
+    // preview for a tile. Whichever of the two lands second draws the
+    // preview (it needs the headers for its placement, and it goes under
+    // tiles that may already be arriving).
+    const bitmapP = thumbnailBitmap(r.thumbnail_url);
+    const cog = await openCog(href);
     if (me !== shown) return;
     const onTileError = (err) => {
       if (me !== shown || me.failed) return;
@@ -1064,19 +1072,29 @@ async function showOnMap(r, button) {
     };
     const onViewportLoad = () => {
       if (me !== shown) return;
-      console.info(`[cog] ${id} viewport loaded at ${(performance.now() - me.t0).toFixed(0)} ms`);
+      debug(`[cog] ${id} viewport loaded at ${(performance.now() - me.t0).toFixed(0)} ms`);
       tilesSettled();
     };
-    // The older thumbnail.jpg paints nodata white, the newer preview.jpg
-    // black (cog.js, jpegNodataMask); the file name says which.
-    const white = !/\/preview\.jpg$/i.test(new URL(r.thumbnail_url).pathname);
-    cogPreview = bitmap ? previewLayer(previewImage(cog, bitmap, { white }), cog, `cog-preview-${id}`) : null;
     cogLayer = cogTileLayer(cog, `cog-${id}`, { onViewportLoad, onTileError });
     render();
-    cogbar(id, "loading", cogPreview ? "Preview shown — loading full resolution…"
-      : "Loading full resolution…");
-    console.info(`[cog] ${id} preview ${cogPreview ? "shown" : "unavailable"} at ${(performance.now() - me.t0).toFixed(0)} ms`);
-    if (!cogPreview) say(`${id}: no preview (thumbnail unreadable) — loading full-resolution tiles…`);
+    cogbar(id, "loading", "Loading full resolution…");
+    const bitmap = await bitmapP;
+    if (me !== shown) return;
+    // Only thumbnail.jpg paints nodata white; preview.jpg and the .jp2 of
+    // some 2018 rows (which Chrome and Firefox cannot decode, Safari can)
+    // paint it black (cog.js, jpegNodataMask). The file name says which.
+    const white = /\/thumbnail\.jpg$/i.test(new URL(r.thumbnail_url).pathname);
+    const preview = bitmap && previewImage(cog, bitmap, { white });
+    if (preview && !me.settled && !me.failed) {
+      cogPreview = previewLayer(preview, cog, `cog-preview-${id}`);
+      render();
+      cogbar(id, "loading", "Preview shown — loading full resolution…");
+      debug(`[cog] ${id} preview shown at ${(performance.now() - me.t0).toFixed(0)} ms`);
+      // The tiles may have all landed while the JPEG was still coming.
+      tilesSettled();
+    } else if (!preview && !me.settled) {
+      say(`${id}: no preview (thumbnail unreadable) — loading full-resolution tiles…`);
+    }
   } catch (err) {
     if (me !== shown) return;
     shown = null;
