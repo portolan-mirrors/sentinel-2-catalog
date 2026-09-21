@@ -45,6 +45,13 @@ jobs:
         run: |
           set -euo pipefail
           case "$NAME" in */*|..*) echo "::error::name must be a bare file name"; exit 1;; esac
+          # dest is a directory inside the catalog: relative, no `..`
+          # segment, no leading slash, so the file cannot land outside
+          # staging/publish/ (and so outside the catalog prefix on upload).
+          case "$DEST" in
+            ''|/*|..|../*|*/..|*/../*)
+              echo "::error::dest must be a relative directory inside the catalog, e.g. stats"; exit 1;;
+          esac
           mkdir -p "staging/publish/$DEST"
           curl -fsSL --retry 3 -o "staging/publish/$DEST/$NAME" "$URL"
           ls -la "staging/publish/$DEST"

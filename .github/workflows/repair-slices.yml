@@ -119,10 +119,20 @@ jobs:
       # attempt whatever days remain, whether or not it found prior
       # progress to resume from.
       - name: Repair the month from the bucket
+        env:
+          # The dispatch input reaches the shell through the environment,
+          # never by interpolation, and is checked before anything runs it.
+          WORKERS: ${{ inputs.workers }}
+          MONTH: ${{ matrix.month }}
         run: |
+          set -euo pipefail
+          if ! [[ "$WORKERS" =~ ^[0-9]+$ ]]; then
+            echo "::error::workers must be a whole number, not '$WORKERS'"
+            exit 1
+          fi
           pip install --quiet duckdb boto3
-          python3 tools/s2_repair.py --month "${{ matrix.month }}" --out ./staging/chunks \
-            --workers "${{ inputs.workers }}"
+          python3 tools/s2_repair.py --month "$MONTH" --out ./staging/chunks \
+            --workers "$WORKERS"
 
       # if: always() -- an eviction mid-month must not discard the days
       # that already finished before it hit. if-no-files-found: error
