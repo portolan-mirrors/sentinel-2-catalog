@@ -224,9 +224,14 @@ jobs:
       # the stats collection from its published timeline. The Collection 1
       # pair only under C1_LIVE_ENABLED: before that its committed metadata
       # is the truth. On the dispatch that seeds stats-c1 the first entry
-      # runs before the Collection 1 entry has published a timeline, so a
-      # 404 there keeps the committed stats-c1 collection and says so; any
-      # other answer stops the job.
+      # runs before the Collection 1 entry has published a timeline, so the
+      # timeline is probed through s2_build.published_url (retried; exit 0
+      # published, 3 not, anything else could not answer): a 404 keeps the
+      # committed stats-c1 collection and says so; an unanswered probe
+      # stops the job. The variable set before any Collection 1 year is
+      # published fails the Collection 1 entry here with "nothing to
+      # describe" (make_collection): the documented order publishes the
+      # backfill first.
       - name: Restamp collection metadata
         if: steps.guard.outputs.published == 'true'
         run: |
@@ -252,15 +257,20 @@ jobs:
             python3 tools/make_collection.py --collection sentinel-2-c1-l2a \
               --data-dir ./staging/baseline/sentinel-2-c1-l2a --remote-baseline
             if [ "$STATS_DIR" != stats-c1 ]; then
-              CODE=$(curl -sS -o /dev/null -w '%{http_code}' -I "$TIMELINE")
+              CODE=0
+              python3 -c '
+          import sys; sys.path.insert(0, "tools")
+          from s2_build import published_url
+          sys.exit(0 if published_url(sys.argv[1], what="stats-c1/timeline.parquet") else 3)' \
+                "$TIMELINE" || CODE=$?
               case "$CODE" in
-                200)
+                0)
                   python3 tools/make_stats_collection.py --collection sentinel-2-c1-l2a \
                     --data-dir ./staging/baseline/stats-c1 --remote-baseline ;;
-                404)
+                3)
                   echo "::notice::stats-c1/timeline.parquet is not published yet; keeping the committed stats-c1 collection" ;;
                 *)
-                  echo "::error::stats-c1/timeline.parquet: HEAD answered $CODE, not 200 or 404"
+                  echo "::error::stats-c1/timeline.parquet: the probe could not answer (exit $CODE; published_url said why above)"
                   exit 1 ;;
               esac
             fi

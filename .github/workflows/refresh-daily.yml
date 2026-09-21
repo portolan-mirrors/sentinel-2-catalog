@@ -273,10 +273,12 @@ jobs:
       # both generators read the published parts (--remote-baseline); a
       # year with nothing published is skipped. The stats collection reads
       # the published stats-c1 timeline, which exists only once
-      # publish-stats has run for Collection 1: a 404 keeps the committed
-      # collection (the truth until then) and says so, so the variable set
-      # a day before that dispatch cannot fail the first collection's
-      # refresh; any other answer stops this step. Only under
+      # publish-stats has run for Collection 1, probed through
+      # s2_build.published_url (retried; exit 0 published, 3 not, anything
+      # else could not answer): a 404 keeps the committed collection (the
+      # truth until then) and says so, so the variable set a day before
+      # that dispatch cannot fail the first collection's refresh; an
+      # unanswered probe stops this step. Only under
       # C1_LIVE_ENABLED: before that the committed Collection 1 metadata is
       # the truth. continue-on-error: this step is a courtesy to Collection
       # 1 that refresh-c1 repeats minutes later and fails loudly on when
@@ -297,15 +299,20 @@ jobs:
             --data-dir ./staging/baseline/sentinel-2-c1-l2a --remote-baseline
           python3 tools/make_collection.py --collection sentinel-2-c1-l2a \
             --data-dir ./staging/baseline/sentinel-2-c1-l2a --remote-baseline
-          CODE=$(curl -sS -o /dev/null -w '%{http_code}' -I "$TIMELINE")
+          CODE=0
+          python3 -c '
+          import sys; sys.path.insert(0, "tools")
+          from s2_build import published_url
+          sys.exit(0 if published_url(sys.argv[1], what="stats-c1/timeline.parquet") else 3)' \
+            "$TIMELINE" || CODE=$?
           case "$CODE" in
-            200)
+            0)
               python3 tools/make_stats_collection.py --collection sentinel-2-c1-l2a \
                 --data-dir ./staging/baseline/stats-c1 --remote-baseline ;;
-            404)
+            3)
               echo "::notice::stats-c1/timeline.parquet is not published (publish-stats has not run for Collection 1); keeping the committed stats-c1 collection" ;;
             *)
-              echo "::error::stats-c1/timeline.parquet: HEAD answered $CODE, not 200 or 404"
+              echo "::error::stats-c1/timeline.parquet: the probe could not answer (exit $CODE; published_url said why above)"
               exit 1 ;;
           esac
       - name: Validate before upload
@@ -329,14 +336,15 @@ jobs:
 
   # Collection 1: the same loop on a `created` lookback, one items.parquet
   # per year as the archive, live at zstd 3, no consolidation here (the
-  # header says why). `needs: refresh` orders the two publishes; the job
-  # still runs when the first collection's job failed (`!cancelled()`),
-  # because the two tails are independent and a day of Collection 1 should
-  # not wait on an Earth Search error in the other window. Its own staging
-  # tree (staging-c1/) so nothing of the first job's is assumed.
+  # header says why). `needs: refresh` orders the two publishes, and the
+  # job runs only when the first one succeeded (the implicit success() of
+  # `needs`): whatever broke `refresh` -- Earth Search, the bucket, the
+  # tools -- gets no second production write in the same run. A day of
+  # Collection 1 is fetched again by the next run's lookback. Its own
+  # staging tree (staging-c1/) so nothing of the first job's is assumed.
   refresh-c1:
     needs: refresh
-    if: ${{ !cancelled() && vars.C1_LIVE_ENABLED == 'true' }}
+    if: vars.C1_LIVE_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
