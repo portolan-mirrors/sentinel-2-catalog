@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stamp catalog/stats/collection.json from the stats table's timeline.
+"""Stamp catalog/<stats_dir>/collection.json from the stats table's timeline.
 
 The stats collection is a committed, mostly static file: its columns, assets
 and links do not change when the table is rebuilt. Three fields do, and they
@@ -11,6 +11,7 @@ from 2016-11 onward.
 
     python3 tools/make_stats_collection.py --data-dir ./staging/publish/stats
     python3 tools/make_stats_collection.py --data-dir ... --remote-baseline
+    python3 tools/make_stats_collection.py --collection sentinel-2-c1-l2a
 
 The measurement comes from `timeline.parquet` (one row per (year, month)
 over every tile, a few KB): the extent runs from the first day of the
@@ -23,6 +24,12 @@ refresh-daily both stage one, so the fallback is for a run from a clean
 checkout). Every other key of the collection is preserved in place, in its
 order, with the same 2-space indent, so a diff of a restamp is the three
 fields and nothing else; mirror of make_collection.py's restamp_root().
+
+`--collection` picks which stats collection (s2_collections; default the
+first one, so every existing call is unchanged). Everything that names a
+place follows config.stats_dir (`stats`, `stats-c1`): the collection.json
+stamped, the default staged directory, and the published timeline that
+`--remote-baseline` falls back to.
 """
 from __future__ import annotations
 
@@ -39,10 +46,30 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
-from make_items import PUBLIC  # noqa: E402
+import s2_collections as cols  # noqa: E402
+from s2_collections import CollectionConfig  # noqa: E402
 
+DEFAULT_CONFIG = cols.get(cols.DEFAULT)
 TIMELINE = "timeline.parquet"
-PUBLISHED_TIMELINE = f"{PUBLIC}/stats/{TIMELINE}"
+
+
+def collection_path(config: CollectionConfig = DEFAULT_CONFIG) -> Path:
+    """The committed collection.json this tool stamps."""
+    return ROOT / "catalog" / config.stats_dir / "collection.json"
+
+
+def staged_dir(config: CollectionConfig = DEFAULT_CONFIG) -> Path:
+    """Where the workflows stage the collection's stats (s2_stats --out)."""
+    return Path("./staging/publish") / config.stats_dir
+
+
+def published_timeline(config: CollectionConfig = DEFAULT_CONFIG) -> str:
+    """The published timeline.parquet, read when --remote-baseline is given
+    and nothing is staged."""
+    return f"{cols.PUBLIC}/{config.stats_dir}/{TIMELINE}"
+
+
+PUBLISHED_TIMELINE = published_timeline()
 
 
 def connect() -> duckdb.DuckDBPyConnection:
@@ -94,23 +121,27 @@ def stamp(collection: dict, span: list[str], rows: int, when: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--data-dir", default="./staging/publish/stats",
-                    help="staged stats/ directory holding timeline.parquet "
-                         "(default ./staging/publish/stats)")
+    dirs = ", ".join(cols.get(n).stats_dir for n in cols.NAMES)
+    cols.add_collection_arg(ap)
+    ap.add_argument("--data-dir",
+                    help="staged stats directory holding timeline.parquet "
+                         f"(default ./staging/publish/<stats_dir>: {dirs})")
     ap.add_argument("--out",
-                    default=str(ROOT / "catalog" / "stats" / "collection.json"),
-                    help="collection.json path")
+                    help="collection.json path (default "
+                         f"catalog/<stats_dir>/collection.json: {dirs})")
     ap.add_argument("--remote-baseline", action="store_true",
                     help="when --data-dir holds no timeline.parquet, read the "
-                         f"published one at {PUBLISHED_TIMELINE}")
+                         f"published one at {cols.PUBLIC}/<stats_dir>/{TIMELINE}")
     a = ap.parse_args()
+    config = cols.get(a.collection)
 
-    out = Path(a.out).resolve()
-    staged = Path(a.data_dir).resolve() / TIMELINE
+    out = Path(a.out).resolve() if a.out else collection_path(config)
+    data_dir = Path(a.data_dir) if a.data_dir else staged_dir(config)
+    staged = data_dir.resolve() / TIMELINE
     if staged.is_file():
         location = str(staged)
     elif a.remote_baseline:
-        location = PUBLISHED_TIMELINE
+        location = published_timeline(config)
     else:
         raise SystemExit(f"{staged} does not exist and --remote-baseline was "
                          f"not given; nothing to stamp the extent from")
