@@ -117,6 +117,69 @@ tile-major sort `(tile, datetime)` measured here is worth considering as the
 rebuild's sort instead — it beats the month-major plan for every tile-scoped
 query (11–20 vs 29 GETs) at equal bytes.
 
+## Round 2: pure standard parquet + sidecar index + hyparquet client
+
+The tile-pack's container is bespoke. The generic version keeps the file
+**100 % standard parquet** and moves the trick into a sidecar: a JSON index
+`{key: [byteStart, byteLen, rowStart, rowCount]}` derived mechanically from
+the footer (column chunks within consecutive row groups are contiguous bytes,
+so a key-sorted file gives every key one contiguous byte span — verified
+non-overlapping for all 4,759 tiles). Any parquet file sorted by a key column
+admits this index; nothing about it is Sentinel-2-specific.
+
+Two grain choices for the same slim table, plus the pack for reference:
+
+| file | groups | size | footer | median span/tile | index (gz) |
+|---|---|---|---|---|---|
+| mid-grain (~2k rows/group) | 428 | 14.5 MB | 680 KB | 31 KB | 43 KB |
+| tile-aligned (1 group/tile) | 4,759 | 25.8 MB | 3.5 MB | 4 KB | 67 KB |
+| tile-pack (bespoke) | — | 22.8 MB | none | 5 KB | 45 KB |
+
+Per-tile row groups cost real money in pure parquet: 1.8× the bytes (tiny
+groups restart every dictionary) and a 3.5 MB footer (thrift per-chunk
+metadata × 52k chunks). The mid-grain file wins: normal groups, small footer,
+and the client slices exact rows with `rowStart`/`rowEnd`.
+
+**Client:** hyparquet (a ~10 KB-gzipped pure-JS parquet reader; the
+`hyparquet-compressors` add-on decodes zstd) with a custom `AsyncBuffer` that
+serves absolute file offsets from two prefetched regions — the footer
+(fetched once per session, length known from the sidecar) and the tile's
+span (one range GET per query). A counting fallback proves the span
+suffices. Measured over the 0.4 s-latency server, DuckDB numbers repeated
+for context:
+
+| client | init (once) | per search | GET | KiB |
+|---|---|---|---|---|
+| DuckDB-httpfs, V2 part | — | 6.2–6.9 s | 74–122 | ~2,300 |
+| DuckDB-httpfs, slim sidecar file | — | 4.3 s | 9 | ~400 |
+| hyparquet naive (no sidecar, stats pruning) | — | 1.5 s | 2 | 544 |
+| hyparquet + sidecar, mid-grain | 1.3 s (2 GET, 842 KiB) | **0.4 s** | **1** | 31 |
+| hyparquet + sidecar, tile-aligned | 2.8 s (2 GET, 3.7 MiB) | **0.4 s** | **1** | 5–8 |
+| hyparquet on tile-pack | — | **0.4 s** | **1** | 5–7 |
+
+Every mode returns rows byte-identical to the DuckDB answer (diffed on
+31UFU). Three things worth underlining:
+
+- **Even naive hyparquet beats DuckDB-httpfs 4×** (1.5 s vs 6.5 s): it
+  fetches the footer in one suffix read and coalesces a row-group range into
+  one request, where DuckDB chains HEAD, footer, bloom and per-column reads.
+  Dropping DuckDB-WASM for the search is a win before any layout change —
+  and the app stops shipping a ~36 MB WASM bundle for it.
+- **The sidecar removes the footer from the per-query path**, and the footer
+  is the only reason a pure-parquet client ever needs more than one request.
+  Cold-start cost is one index + one footer fetch per session; mid-grain
+  keeps that at ~900 KB.
+- **The pack is now just an optimization of the cold start** (no footer at
+  all), at the price of a non-standard container. With the mid-grain sidecar
+  at 0.4 s per search and 1.3 s init, the standard file is the better
+  trade: other readers see an ordinary (geo)parquet file and the index is
+  optional acceleration, derivable from the footer by anyone.
+
+The recipe, generically: sort by the query key, keep normal row-group sizes,
+publish `<file>.idx.json` beside the file, and the client is ~60 lines of
+hyparquet glue. `exp/make_index.py` builds the index for any key-sorted
+parquet file; `exp/hyclient.mjs` is the client.
+
 ## Artifacts
 
 Scratchpad `exp/` (session-local, not committed): `build_variants.py`,
