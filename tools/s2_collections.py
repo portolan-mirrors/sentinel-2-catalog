@@ -22,6 +22,7 @@ PUBLIC = "https://data.source.coop/portolan-mirrors/sentinel-2-catalog"
 class CollectionConfig:
     id: str
     api_collection: str
+    title: str                  # what the collection is called in links and item titles
     schema: object              # module with COLUMNS and normalize()
     tile_column: str
     id_re: re.Pattern           # groups: tile, day (YYYYMMDD)
@@ -45,7 +46,8 @@ class CollectionConfig:
 
 
 _FIRST = CollectionConfig(
-    id="sentinel-2-l2a", api_collection="sentinel-2-l2a", schema=s2_schema,
+    id="sentinel-2-l2a", api_collection="sentinel-2-l2a",
+    title="Sentinel-2 L2A scenes", schema=s2_schema,
     tile_column="s2:mgrs_tile",
     id_re=re.compile(r"^S2[A-Z]_(?P<tile>\d{1,2}[A-Z]{3})_(?P<day>\d{8})_\d+_L2A$"),
     bucket="sentinel-cogs", key_root="sentinel-s2-l2a-cogs/",
@@ -60,7 +62,8 @@ _FIRST = CollectionConfig(
     live_zstd_level=18, lookback_field="datetime")
 
 _C1 = CollectionConfig(
-    id="sentinel-2-c1-l2a", api_collection="sentinel-2-c1-l2a", schema=s2c1_schema,
+    id="sentinel-2-c1-l2a", api_collection="sentinel-2-c1-l2a",
+    title="Sentinel-2 Collection 1 L2A scenes", schema=s2c1_schema,
     tile_column="_tile",
     id_re=re.compile(r"^S2[A-Z]_T(?P<tile>\d{1,2}[A-Z]{3})_(?P<day>\d{8})T\d{6}_L2A$"),
     bucket="e84-earth-search-sentinel-data", key_root="sentinel-2-c1-l2a/",

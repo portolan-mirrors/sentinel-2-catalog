@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate catalog/sentinel-2-l2a/collection.json from the published data.
+"""Generate catalog/<catalog_dir>/collection.json from the published data.
 
 Row counts, the temporal extent and the partition file count are measured,
 never hand-written: from each year's committed item where one exists, and from
@@ -23,10 +23,22 @@ union of the items plus whatever is staged that has no item.
 that is staged but has no committed item, parts missing from --data-dir are
 read from the published copy over HTTP rather than assumed absent.
 
-`table:columns` is generated from tools/s2_schema.py, which is the single
-source of truth for the published schema. `item_assets` comes from the
-committed tools/item_assets.json cache, never the network; refresh it
-deliberately with --refresh-item-assets.
+`table:columns` is generated from the collection's schema module
+(tools/s2_schema.py, tools/s2c1_schema.py), which is the single source of
+truth for the published schema. `item_assets` comes from the committed cache
+for the collection (tools/item_assets.json, tools/item_assets_c1.json), never
+the network; refresh it deliberately with --refresh-item-assets.
+
+--collection picks the collection (s2_collections; default the first one, so
+every existing call is unchanged). Everything that names the collection
+follows the config: id and title, the description's layout and sort-order
+sentences (derived from s2_build's rules for that collection, so the prose
+cannot say one order when the builder writes another), the columns, the
+item_assets cache, the partition glob, the canonical link and the default
+--out (catalog/<catalog_dir>/collection.json):
+
+    python3 tools/make_collection.py --collection sentinel-2-c1-l2a \\
+        --data-dir ./staging/publish/sentinel-2-c1-l2a --remote-baseline
 """
 from __future__ import annotations
 
@@ -42,15 +54,17 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
+import s2_collections as cols  # noqa: E402
 from make_items import (  # noqa: E402
-    PUBLIC, UA, as_dt, connect, discover, load_httpfs, part_stats,
+    DEFAULT_CONFIG, PUBLIC, UA, as_dt, connect, discover, load_httpfs,
+    part_stats,
 )
 from publish import load_config  # noqa: E402
 from s2_build import (  # noqa: E402
-    TILE_SORT_FROM, ZONE_PARTS, ZONE_PARTS_8, ZONE_SPLIT_8_FROM,
+    ROW_GROUP, TILE_SORT_FROM, ZONE_PARTS, ZONE_PARTS_8, ZONE_SPLIT_8_FROM,
     ZONE_SPLIT_FROM, sort_key,
 )
-from s2_schema import COLUMNS  # noqa: E402
+from s2_collections import CollectionConfig  # noqa: E402
 
 S3 = "s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog"
 REPO = "https://github.com/portolan-mirrors/sentinel-2-catalog"
@@ -58,9 +72,28 @@ APP = "https://portolan-mirrors.github.io/sentinel-2-catalog/"
 
 EARTH_SEARCH = "https://earth-search.aws.element84.com/v1"
 EARTH_SEARCH_PAGE = "https://element84.com/earth-search/"
+# One registry entry covers both: the sentinel-cogs bucket the first
+# collection's hrefs point at, and (under "Resources on AWS", read
+# 2026-09-21) the e84-earth-search-sentinel-data bucket of Collection 1.
 AWS_REGISTRY = "https://registry.opendata.aws/sentinel-2-l2a-cogs/"
-ITEM_ASSETS_URL = f"{EARTH_SEARCH}/collections/sentinel-2-l2a"
-ITEM_ASSETS_CACHE = HERE / "item_assets.json"
+
+# The committed item_assets cache per collection. Named rather than derived
+# from the id so that the first collection's file keeps the name every
+# workflow and doc already uses.
+ITEM_ASSETS_CACHES = {
+    "sentinel-2-l2a": HERE / "item_assets.json",
+    "sentinel-2-c1-l2a": HERE / "item_assets_c1.json",
+}
+
+
+def item_assets_url(config: CollectionConfig = DEFAULT_CONFIG) -> str:
+    """The upstream collection whose item_assets block is mirrored; also
+    the collection's rel:canonical."""
+    return f"{EARTH_SEARCH}/collections/{config.api_collection}"
+
+
+def item_assets_cache(config: CollectionConfig = DEFAULT_CONFIG) -> Path:
+    return ITEM_ASSETS_CACHES[config.id]
 
 # Earth Search's item_assets template carries proj:shape and proj:transform
 # taken from one scene. They are true of that scene and of no other, so they
@@ -78,6 +111,7 @@ TYPE_NAMES = {
     "BIGINT": "int64",
     "TINYINT": "int8",
     "UINTEGER": "uint32",
+    "BOOLEAN": "bool",
     "TIMESTAMP WITH TIME ZONE": "timestamp[us, tz=UTC]",
     "GEOMETRY": "geometry",
 }
@@ -110,30 +144,58 @@ def zone_parts_text() -> str:
             f"tile id opens only the part whose zone range holds it.")
 
 
+def year_file_text(config: CollectionConfig) -> str:
+    """The layout of a collection that never zone-splits, in prose, from
+    the config that defines it: one items.parquet per year, row groups cut
+    on month boundaries at the config's target, and the tail."""
+    target = config.row_group_size or ROW_GROUP
+    return (f"Every year is one items.parquet, whose row groups are cut on "
+            f"month boundaries at {target:,} rows or fewer -- a group never "
+            f"spans two months, so a month filter reads only that month's "
+            f"groups and each `{config.tile_column}` sits in few of them. Any "
+            f"year may add live.parquet, the tail fetched daily since the "
+            f"last fold, which the periodic fold merges back into the year "
+            f"file. There is no zone= directory and no zone split: every "
+            f"part sits in year=YYYY/ and matches partition:glob.")
+
+
+def layout_text(config: CollectionConfig = DEFAULT_CONFIG) -> str:
+    """The part layout for the collection: the zone tiers of the first,
+    or the one-file-per-year rule of one that never splits."""
+    return zone_parts_text() if config.zone_split else year_file_text(config)
+
+
 # The sort keys as a reader knows them (s2_build.sort_key names the columns).
 _SORT_WORDS = {"_month": "month", "s2:mgrs_tile": "MGRS tile",
-               "_hilbert": "Hilbert index"}
+               "_tile": "MGRS tile", "_hilbert": "Hilbert index"}
 
 
-def sort_order_text() -> str:
-    """The row order of the parts, in prose, from s2_build.sort_key: parts
-    published before TILE_SORT_FROM are (_month, _hilbert), parts from
-    that year on put the tile between them. Derived per vintage so this
-    sentence cannot say one order when the builder writes two."""
+def sort_order_text(config: CollectionConfig = DEFAULT_CONFIG) -> str:
+    """The row order of the parts, in prose, from s2_build.sort_key: the
+    first collection's parts published before TILE_SORT_FROM are
+    (_month, _hilbert), parts from that year on put the tile between them;
+    a collection whose every year sorts the same way gets one sentence.
+    Derived per vintage so this text cannot say one order when the builder
+    writes two."""
     def words(year: int) -> str:
-        keys = [_SORT_WORDS[k] for k in sort_key(year).split(",")]
+        keys = [_SORT_WORDS[k] for k in sort_key(year, config).split(",")]
         return ", then ".join(keys)
+    before, after = words(TILE_SORT_FROM - 1), words(TILE_SORT_FROM)
+    if before == after:
+        return (f"Rows in every part are ordered by {after}, so a reader "
+                f"prunes on both time and space, and one tile's month sits "
+                f"in a single row group.")
     return (f"Rows in parts published through {TILE_SORT_FROM - 1} are "
-            f"ordered by {words(TILE_SORT_FROM - 1)}, so a reader prunes on "
+            f"ordered by {before}, so a reader prunes on "
             f"both time and space; parts from {TILE_SORT_FROM} are ordered "
-            f"by {words(TILE_SORT_FROM)}, which also puts one tile's month "
+            f"by {after}, which also puts one tile's month "
             f"in a single row group.")
 
 
-def table_columns() -> list[dict]:
+def table_columns(config: CollectionConfig = DEFAULT_CONFIG) -> list[dict]:
     """The table:columns array, generated from the canonical schema."""
     out = []
-    for name, duck_type, description in COLUMNS:
+    for name, duck_type, description in config.schema.COLUMNS:
         out.append({
             "name": name,
             # An unmapped compound type (the `links` struct array) is reported
@@ -145,22 +207,23 @@ def table_columns() -> list[dict]:
     return out
 
 
-def refresh_item_assets() -> None:
+def refresh_item_assets(config: CollectionConfig = DEFAULT_CONFIG) -> None:
     """Re-fetch the upstream item_assets block into the committed cache."""
-    request = urllib.request.Request(ITEM_ASSETS_URL, headers=UA)
+    url, path = item_assets_url(config), item_assets_cache(config)
+    request = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(request, timeout=60) as response:
         upstream = json.loads(response.read().decode())
     cache = {
-        "source": ITEM_ASSETS_URL,
+        "source": url,
         "fetched": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "item_assets": upstream["item_assets"],
     }
-    ITEM_ASSETS_CACHE.write_text(json.dumps(cache, indent=2) + "\n")
-    print(f"refreshed {ITEM_ASSETS_CACHE.name}: "
-          f"{len(cache['item_assets'])} asset(s) from {ITEM_ASSETS_URL}")
+    path.write_text(json.dumps(cache, indent=2) + "\n")
+    print(f"refreshed {path.name}: {len(cache['item_assets'])} asset(s) "
+          f"from {url}")
 
 
-def item_assets() -> dict:
+def item_assets(config: CollectionConfig = DEFAULT_CONFIG) -> dict:
     """Per-asset band metadata, mirrored for clients that expect it here.
 
     This is documentation, not a contract: each item's `assets` column carries
@@ -168,7 +231,7 @@ def item_assets() -> dict:
     is the band metadata (eo:bands, raster:bands, gsd) that the per-item object
     does not repeat for every scene.
     """
-    cache = json.loads(ITEM_ASSETS_CACHE.read_text())
+    cache = json.loads(item_assets_cache(config).read_text())
     out = {}
     for key, asset in cache["item_assets"].items():
         out[key] = {k: v for k, v in asset.items() if k not in PER_SCENE_FIELDS}
@@ -242,38 +305,181 @@ def committed_items(collection_dir: Path) -> dict[int, dict]:
     return found
 
 
+def description(config: CollectionConfig, rows: int, span: str) -> str:
+    """The collection's description: what the rows are, how the parts are
+    laid out and sorted (derived from the build rules), and what the
+    record covers. The first collection's text is the one it has always
+    published; Collection 1's says what differs -- the tile column, the
+    reprocessing that keeps growing old years, and the fold model."""
+    if config.id == cols.DEFAULT:
+        return (
+            f"The AWS Earth Search item index for Sentinel-2 L2A, republished "
+            f"as one year-partitioned GeoParquet 2.0 table of {rows:,} rows "
+            f"covering {span}. One row per scene, carrying the whole "
+            f"STAC item: footprint, acquisition time, MGRS tile, cloud cover, "
+            f"the scene-classification percentages, and the complete upstream "
+            f"`assets` object as a JSON string. Every Cloud-Optimized GeoTIFF "
+            f"URL is therefore in the table -- no API call, no URL template to "
+            f"guess -- while the imagery itself stays in the `sentinel-cogs` "
+            f"bucket on AWS. {sort_order_text(config)} "
+            f"{zone_parts_text()} The record starts in November 2016, "
+            f"when Earth Search's first L2A Cloud-Optimized GeoTIFFs were "
+            f"produced; 2015 and most of 2016 have no COG products, and "
+            f"2017-2018 are partial, which is what Earth Search serves "
+            f"rather than a gap introduced here. "
+            f"Contains modified Copernicus Sentinel data. "
+            f"Read the [agent guide](AGENTS.md) before querying: "
+            f"`sat:orbit_state` and `s2:granule_id` are NULL on newer items, "
+            f"and `assets` is a JSON string, not a struct."
+        )
+    return (
+        f"The AWS Earth Search item index for Sentinel-2 Collection 1 L2A "
+        f"(ESA's reprocessing of the whole archive to one processing "
+        f"baseline), republished as one year-partitioned GeoParquet 2.0 "
+        f"table of {rows:,} rows covering {span}. One row per scene, "
+        f"carrying the whole STAC item: footprint, acquisition time, MGRS "
+        f"tile, cloud cover, the scene-classification percentages, the "
+        f"viewing and sun angles, `created`/`updated`, and the complete "
+        f"upstream `assets` object as a JSON string. Every Cloud-Optimized "
+        f"GeoTIFF URL is therefore in the table -- no API call, no URL "
+        f"template to guess -- while the imagery itself stays in the "
+        f"`{config.bucket}` bucket on AWS. Collection 1 items carry no "
+        f"`s2:mgrs_tile`: the tile is `grid:code` (`MGRS-31UET`), and the "
+        f"bare id (`31UET`) is the added `{config.tile_column}` column, THE "
+        f"spatial join key. {sort_order_text(config)} {year_file_text(config)} "
+        f"ESA's reprocessing is still running, so old years keep gaining "
+        f"scenes with recent `created` timestamps; the daily refresh looks "
+        f"back on `created`, not `datetime`, and appends what it finds to "
+        f"the year's live.parquet. Contains modified Copernicus Sentinel "
+        f"data. Read the [agent guide](AGENTS.md) before querying: "
+        f"`s2:dark_features_percentage` is NULL from processing baseline "
+        f"05.11, `processing:software` and `assets` are JSON strings, not "
+        f"structs."
+    )
+
+
+def keywords(config: CollectionConfig) -> list[str]:
+    base = ["sentinel-2", "l2a", "stac-geoparquet", "earth-search",
+            "esa", "copernicus", "satellite imagery", "cloud cover", "mgrs"]
+    if config.id == cols.DEFAULT:
+        return base
+    return [*base[:2], "collection-1", *base[2:]]
+
+
+def providers(config: CollectionConfig) -> list[dict]:
+    """Who made what. "host" belongs to whoever serves THESE files, and
+    rashid (PTL-PRV-002) allows exactly one provider to claim it; the
+    parties who serve the imagery this index points at are processors,
+    because that is a different set of bytes."""
+    esa = {"name": "European Space Agency (ESA)",
+           "description": "Operates the Sentinel-2 mission and produces the "
+                          "L2A surface reflectance products for the "
+                          "Copernicus programme.",
+           "roles": ["producer", "licensor"],
+           "url": "https://sentinels.copernicus.eu/web/sentinel/missions/sentinel-2"}
+    portolan = {"name": "Portolan Mirrors",
+                "description": "Republishes the Earth Search item index as "
+                               "partitioned STAC-GeoParquet.",
+                "roles": ["processor", "host"],
+                "url": REPO}
+    if config.id == cols.DEFAULT:
+        return [
+            esa,
+            # Sinergise and AWS serve the imagery this index points at,
+            # which is a different set of bytes, so the role that fits is
+            # processor: they turn ESA's products into the COGs.
+            {"name": "Sinergise and AWS Open Data",
+             "description": "Convert the ESA L2A products to Cloud-Optimized "
+                            "GeoTIFFs and serve them in the public "
+                            "sentinel-cogs bucket that every asset href in "
+                            "this table points at.",
+             "roles": ["processor"],
+             "url": AWS_REGISTRY},
+            {"name": "Element 84 (Earth Search)",
+             "description": "Runs the Earth Search STAC API whose "
+                            "sentinel-2-l2a items this table mirrors.",
+             "roles": ["processor"],
+             "url": EARTH_SEARCH},
+            portolan,
+        ]
+    return [
+        esa,
+        # Element 84 both converts the Collection 1 products to COGs (the
+        # e84-earth-search-sentinel-data bucket is theirs, listed on the
+        # AWS Registry of Open Data as "Collection 1 Level 2A scenes and
+        # metadata", managed by Element 84) and runs the API.
+        {"name": "Element 84 (Earth Search)",
+         "description": "Converts the ESA Collection 1 L2A products to "
+                        "Cloud-Optimized GeoTIFFs, serves them in the public "
+                        f"{config.bucket} bucket on AWS Open Data that every "
+                        "asset href in this table points at, and runs the "
+                        f"Earth Search STAC API whose {config.api_collection} "
+                        "items this table mirrors.",
+         "roles": ["processor"],
+         "url": EARTH_SEARCH},
+        portolan,
+    ]
+
+
+def via_links(config: CollectionConfig) -> list[dict]:
+    """rel:via names the upstream, and Portolan wants a page a person can
+    read (PTL-PRO-001 requires text/html on every one). The API endpoint
+    itself is the machine-readable upstream, so it is the rel:canonical
+    rather than a via link claiming to be HTML."""
+    registry_title = ("Sentinel-2 L2A COGs on the AWS Registry of Open Data"
+                      if config.id == cols.DEFAULT else
+                      "Sentinel-2 Collection 1 L2A COGs on the AWS Registry "
+                      "of Open Data")
+    return [
+        {"rel": "via", "href": EARTH_SEARCH_PAGE, "type": "text/html",
+         "title": "Earth Search by Element 84 (upstream source)"},
+        {"rel": "via", "href": AWS_REGISTRY, "type": "text/html",
+         "title": registry_title},
+    ]
+
+
+def preview_url(config: CollectionConfig) -> str:
+    """The explorer, on this collection. The app's default collection is
+    the first one; any other is named in the query string."""
+    return APP if config.id == cols.DEFAULT else f"{APP}?collection={config.id}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    dirs = ", ".join(cols.get(n).catalog_dir for n in cols.NAMES)
+    cols.add_collection_arg(ap)
     ap.add_argument("--data-dir", required=True,
-                    help="staged sentinel-2-l2a/ directory holding year=*/")
+                    help="staged collection directory holding year=*/")
     ap.add_argument("--out",
-                    default=str(ROOT / "catalog" / "sentinel-2-l2a" / "collection.json"),
-                    help="collection.json path")
+                    help="collection.json path (default "
+                         f"catalog/<catalog_dir>/collection.json: {dirs})")
     ap.add_argument("--remote-baseline", action="store_true",
                     help="for a staged year with no committed item, read parts "
                          "missing from --data-dir from the published catalog")
     ap.add_argument("--refresh-item-assets", action="store_true",
-                    help="re-fetch tools/item_assets.json from Earth Search, "
-                         "then continue")
+                    help="re-fetch the collection's tools/item_assets*.json "
+                         "from Earth Search, then continue")
     a = ap.parse_args()
+    config = cols.get(a.collection)
 
     # The hrefs this tool writes and the bytes tools/publish.py uploads have to
     # name the same place. They are separate constants on purpose -- one is
     # metadata, one is deploy config -- so the drift is checked rather than
     # hoped for.
-    config = load_config()
-    for label, ours, theirs in (("public_base", PUBLIC, config["public_base"]),
-                                ("write_prefix", S3, config["write_prefix"])):
+    deploy = load_config()
+    for label, ours, theirs in (("public_base", PUBLIC, deploy["public_base"]),
+                                ("write_prefix", S3, deploy["write_prefix"])):
         if ours.rstrip("/") != theirs.rstrip("/"):
             raise SystemExit(
                 f"{label} in catalog.publish.yaml is {theirs!r}, but this "
                 f"generator writes {ours!r}. Fix one of them.")
 
     if a.refresh_item_assets:
-        refresh_item_assets()
+        refresh_item_assets(config)
 
     data = Path(a.data_dir).resolve()
-    out = Path(a.out).resolve()
+    out = (Path(a.out).resolve() if a.out
+           else ROOT / "catalog" / config.catalog_dir / "collection.json")
     if not data.is_dir():
         raise SystemExit(f"--data-dir does not exist: {data}")
 
@@ -309,7 +515,7 @@ def main() -> int:
             continue
         if year in items:
             continue
-        for part in discover(year_dir, year, a.remote_baseline):
+        for part in discover(year_dir, year, a.remote_baseline, config=config):
             stats = part["stats"] or part_stats(con, part["location"])
             if stats is None:
                 raise SystemExit(f"year={year}: cannot read {part['location']}")
@@ -341,64 +547,14 @@ def main() -> int:
             "https://stac-extensions.github.io/web-map-links/v1.3.0/schema.json",
             "https://stac-extensions.github.io/file/v2.1.0/schema.json",
         ],
-        "id": "sentinel-2-l2a",
-        "title": "Sentinel-2 L2A scenes (item index)",
-        "description": (
-            f"The AWS Earth Search item index for Sentinel-2 L2A, republished "
-            f"as one year-partitioned GeoParquet 2.0 table of {rows:,} rows "
-            f"covering {span}. One row per scene, carrying the whole "
-            f"STAC item: footprint, acquisition time, MGRS tile, cloud cover, "
-            f"the scene-classification percentages, and the complete upstream "
-            f"`assets` object as a JSON string. Every Cloud-Optimized GeoTIFF "
-            f"URL is therefore in the table -- no API call, no URL template to "
-            f"guess -- while the imagery itself stays in the `sentinel-cogs` "
-            f"bucket on AWS. {sort_order_text()} "
-            f"{zone_parts_text()} The record starts in November 2016, "
-            f"when Earth Search's first L2A Cloud-Optimized GeoTIFFs were "
-            f"produced; 2015 and most of 2016 have no COG products, and "
-            f"2017-2018 are partial, which is what Earth Search serves "
-            f"rather than a gap introduced here. "
-            f"Contains modified Copernicus Sentinel data. "
-            f"Read the [agent guide](AGENTS.md) before querying: "
-            f"`sat:orbit_state` and `s2:granule_id` are NULL on newer items, "
-            f"and `assets` is a JSON string, not a struct."
-        ),
+        "id": config.id,
+        "title": f"{config.title} (item index)",
+        "description": description(config, rows, span),
         # The Copernicus Sentinel Data Terms and Conditions, by its SPDX id.
         "license": "CC-BY-SA-3.0-IGO",
-        "keywords": ["sentinel-2", "l2a", "stac-geoparquet", "earth-search",
-                     "esa", "copernicus", "satellite imagery", "cloud cover",
-                     "mgrs"],
+        "keywords": keywords(config),
         "updated": now,
-        "providers": [
-            {"name": "European Space Agency (ESA)",
-             "description": "Operates the Sentinel-2 mission and produces the "
-                            "L2A surface reflectance products for the "
-                            "Copernicus programme.",
-             "roles": ["producer", "licensor"],
-             "url": "https://sentinels.copernicus.eu/web/sentinel/missions/sentinel-2"},
-            # "host" belongs to whoever serves THESE files, and rashid
-            # (PTL-PRV-002) allows exactly one provider to claim it. Sinergise
-            # and AWS serve the imagery this index points at, which is a
-            # different set of bytes, so the role that fits is processor: they
-            # turn ESA's products into the COGs.
-            {"name": "Sinergise and AWS Open Data",
-             "description": "Convert the ESA L2A products to Cloud-Optimized "
-                            "GeoTIFFs and serve them in the public "
-                            "sentinel-cogs bucket that every asset href in "
-                            "this table points at.",
-             "roles": ["processor"],
-             "url": AWS_REGISTRY},
-            {"name": "Element 84 (Earth Search)",
-             "description": "Runs the Earth Search STAC API whose "
-                            "sentinel-2-l2a items this table mirrors.",
-             "roles": ["processor"],
-             "url": EARTH_SEARCH},
-            {"name": "Portolan Mirrors",
-             "description": "Republishes the Earth Search item index as "
-                            "partitioned STAC-GeoParquet.",
-             "roles": ["processor", "host"],
-             "url": REPO},
-        ],
+        "providers": providers(config),
         "extent": {
             # Sentinel-2 acquires between roughly 83N and 56S, but the index is
             # global by design and a partial year must not narrow what the
@@ -411,17 +567,17 @@ def main() -> int:
         "partition:strategy": "temporal",
         "partition:keys": [
             {"name": "year", "type": "int32",
-             "description": f"Year of acquisition (UTC). {zone_parts_text()}"}
+             "description": f"Year of acquisition (UTC). {layout_text(config)}"}
         ],
         "partition:file_count": files,
         # The `*` part name covers items.parquet, the z*.parquet zone parts
         # and live.parquet alike, so a reader that globs gets the whole year
         # including today, whichever shape the year has.
-        "partition:glob": f"{S3}/sentinel-2-l2a/year=*/*.parquet",
+        "partition:glob": f"{S3}/{config.catalog_dir}/year=*/*.parquet",
         "table:primary_geometry": "geometry",
         "table:row_count": rows,
-        "table:columns": table_columns(),
-        "item_assets": item_assets(),
+        "table:columns": table_columns(config),
+        "item_assets": item_assets(config),
         "assets": collection_assets(out.parent),
         # No self link. Portolan forbids one: a static object that hardcodes
         # its own location cannot be mirrored or moved. stac-check nags; rashid
@@ -435,21 +591,14 @@ def main() -> int:
              "title": "Collection README"},
             {"rel": "agents", "href": "./AGENTS.md", "type": "text/markdown",
              "title": "Collection agent guide"},
-            # rel:via names the upstream, and Portolan wants a page a person
-            # can read (PTL-PRO-001 requires text/html on every one). The API
-            # endpoint itself is the machine-readable upstream, so it is the
-            # rel:canonical below rather than a via link claiming to be HTML.
-            {"rel": "via", "href": EARTH_SEARCH_PAGE, "type": "text/html",
-             "title": "Earth Search by Element 84 (upstream source)"},
-            {"rel": "via", "href": AWS_REGISTRY, "type": "text/html",
-             "title": "Sentinel-2 L2A COGs on the AWS Registry of Open Data"},
-            {"rel": "canonical", "href": f"{EARTH_SEARCH}/collections/sentinel-2-l2a",
+            *via_links(config),
+            {"rel": "canonical", "href": item_assets_url(config),
              "type": "application/json",
              "title": "The upstream Earth Search collection"},
             # STAC uses rel:preview for a preview of the data itself, which is
             # what an interactive map is. rel:alternate is reserved by the
             # Language extension.
-            {"rel": "preview", "href": APP, "type": "text/html",
+            {"rel": "preview", "href": preview_url(config), "type": "text/html",
              "title": "Interactive scene explorer"},
         ],
     }
@@ -462,7 +611,7 @@ def main() -> int:
         collection["links"].append({
             "rel": "item", "href": f"./year={year}/{year}.json",
             "type": "application/geo+json",
-            "title": f"Sentinel-2 L2A scenes, {year}"})
+            "title": f"{config.title}, {year}"})
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(collection, indent=2) + "\n")

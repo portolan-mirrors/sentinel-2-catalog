@@ -381,3 +381,153 @@ def test_unrecorded_unknown_part_halts_only_without_a_record():
         with pytest.raises(SystemExit):
             discover(year_dir, 2026, True, None,
                      prober(ABSENT, **{"z21-35.parquet": (UNKNOWN, None)}))
+
+
+# ---------------------------------------------------------------------------
+# --collection sentinel-2-c1-l2a: two part candidates, its own public base,
+# and a collection.json generated from the config.
+# ---------------------------------------------------------------------------
+import os  # noqa: E402
+import subprocess  # noqa: E402
+
+import s2_collections as cols  # noqa: E402
+from make_items import PARTS, parts_for  # noqa: E402
+
+C1 = cols.get("sentinel-2-c1-l2a")
+FIRST = cols.get(cols.DEFAULT)
+
+
+def staged_c1_year(directory: Path, year: int = 2026) -> Path:
+    """One built Collection 1 year (the full 57-column schema, native
+    GEOMETRY, month-aligned row groups) plus a tail, through the real
+    build, so the generators read what s2_build --collection writes."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from test_build import _build_c1, _mk_c1_full_chunk
+    chunks = directory / "chunks" / "api"
+    chunks.mkdir(parents=True)
+    _mk_c1_full_chunk(chunks / "a.parquet", rows=300, months=3)
+    out = directory / "publish" / "sentinel-2-c1-l2a"
+    proc = _build_c1(out, chunks, ["--row-group-size", "100"], years=str(year))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    year_dir = out / f"year={year}"
+    assert (year_dir / "items.parquet").is_file()
+    # The tail: the same rows built again under the tail's name.
+    tail = directory / "tail"
+    proc = _build_c1(tail, chunks, ["--name", "live.parquet"], years=str(year))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    (tail / f"year={year}" / "live.parquet").rename(year_dir / "live.parquet")
+    return year_dir
+
+
+def test_c1_parts_are_the_year_file_and_the_tail():
+    """No zone split, so a Collection 1 year has two candidates -- and the
+    first collection keeps its fourteen, PARTS being that list."""
+    assert [(key, name) for key, name, _, _ in parts_for(C1)] == [
+        ("data", "items.parquet"), ("live", "live.parquet")]
+    assert parts_for(FIRST) == PARTS and len(PARTS) == 14
+    assert parts_for() == PARTS
+
+
+def test_c1_discover_probes_the_c1_base_and_only_two_names():
+    """--remote-baseline for Collection 1 asks about two files under the
+    Collection 1 public base, never a zone part."""
+    asked = []
+
+    def probe(url):
+        asked.append(url)
+        return PRESENT, 7
+
+    with tempfile.TemporaryDirectory() as td:
+        year_dir = Path(td) / "year=2026"
+        year_dir.mkdir()
+        parts = discover(year_dir, 2026, True, None, probe, config=C1)
+    assert asked == [f"{C1.public_base}/year=2026/items.parquet",
+                     f"{C1.public_base}/year=2026/live.parquet"]
+    assert C1.public_base.endswith("/sentinel-2-c1-l2a")
+    assert [(p["key"], p["source"]) for p in parts] == [
+        ("data", "remote"), ("live", "remote")]
+
+
+def test_c1_year_item_links_items_and_live_only():
+    with tempfile.TemporaryDirectory() as td:
+        year_dir = staged_c1_year(Path(td))
+        parts = discover(year_dir, 2026, False, None, config=C1)
+        assert [(p["key"], p["source"]) for p in parts] == [
+            ("data", "local"), ("live", "local")]
+        item = build_item(connect(), 2026, parts, None, config=C1)
+
+    assert item["collection"] == "sentinel-2-c1-l2a"
+    assert item["id"] == "2026"
+    assert item["properties"]["title"] == "Sentinel-2 Collection 1 L2A scenes, 2026"
+    assert [a["href"] for a in item["assets"].values()] == [
+        "./items.parquet", "./live.parquet"]
+    assert item["assets"]["data"]["title"] == "2026 scenes, GeoParquet 2.0"
+    assert item["assets"]["data"]["table:row_count"] == 300
+    assert item["properties"]["table:row_count"] == 600
+    assert item["properties"]["start_datetime"].startswith("2026-01-01T")
+    assert item["properties"]["end_datetime"].startswith("2026-03-")
+    assert item["properties"]["s2:platforms"] == ["sentinel-2b"]
+    assert all(link["rel"] != "self" for link in item["links"])
+    parent = next(l for l in item["links"] if l["rel"] == "parent")
+    assert parent["title"] == "Sentinel-2 Collection 1 L2A scenes (item index)"
+
+
+def test_c1_collection_json_comes_from_the_config():
+    """make_collection --collection sentinel-2-c1-l2a on a staged year with
+    no committed items: the collection's id, glob, canonical link,
+    item_assets and columns are Collection 1's, and nothing about it is
+    the first collection's."""
+    with tempfile.TemporaryDirectory() as td:
+        year_dir = staged_c1_year(Path(td))
+        out_dir = Path(td) / "catalog" / "sentinel-2-c1-l2a"
+        out_dir.mkdir(parents=True)
+        proc = subprocess.run(
+            [sys.executable, "tools/make_collection.py",
+             "--collection", "sentinel-2-c1-l2a",
+             "--data-dir", str(year_dir.parent),
+             "--out", str(out_dir / "collection.json")],
+            cwd=ROOT, env=dict(os.environ), capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        coll = json.loads((out_dir / "collection.json").read_text())
+
+    assert coll["id"] == "sentinel-2-c1-l2a"
+    assert coll["title"] == "Sentinel-2 Collection 1 L2A scenes (item index)"
+    assert coll["partition:glob"].endswith("/sentinel-2-c1-l2a/year=*/*.parquet")
+    assert "sentinel-2-l2a/" not in coll["partition:glob"]
+    assert coll["partition:file_count"] == 2
+    assert coll["table:row_count"] == 600
+    assert coll["extent"]["temporal"]["interval"][0][0].startswith("2026-01-01T")
+    assert all(link["rel"] != "self" for link in coll["links"])
+    canonical = next(l for l in coll["links"] if l["rel"] == "canonical")
+    assert canonical["href"] == (
+        "https://earth-search.aws.element84.com/v1/collections/sentinel-2-c1-l2a")
+    # No item link: the year has no committed item yet.
+    assert [l for l in coll["links"] if l["rel"] == "item"] == []
+
+    names = [c["name"] for c in coll["table:columns"]]
+    assert names == [name for name, _, _ in C1.schema.COLUMNS]
+    assert "_tile" in names and "s2:mgrs_tile" not in names
+    types = {c["name"]: c["type"] for c in coll["table:columns"]}
+    assert types["storage:requester_pays"] == "bool"
+    assert types["created"] == "timestamp[us, tz=UTC]"
+    assert types["_tile"] == "string"
+
+    # The description names the tile column and the Collection 1 layout,
+    # and says nothing about the first collection's zone parts.
+    desc = coll["description"]
+    assert "`_tile`" in desc and "month, then MGRS tile, then Hilbert index" in desc
+    assert "20,000" in desc and "live.parquet" in desc
+    assert "z01-20" not in desc
+    # The one mention of the first collection's tile column is the negation.
+    assert desc.count("s2:mgrs_tile") == 1 and "no `s2:mgrs_tile`" in desc
+    key_text = coll["partition:keys"][0]["description"]
+    assert "s2:mgrs_tile" not in key_text and "z01-20" not in key_text
+    assert "20,000" in key_text
+
+    # item_assets from the committed Collection 1 cache: the keys the first
+    # collection's template lacks are here, the per-scene proj fields are not.
+    assets = coll["item_assets"]
+    assert {"cloud", "snow", "preview", "thumbnail"} <= set(assets)
+    assert "visual-jp2" not in assets
+    assert assets["thumbnail"]["type"] == "image/jpeg"
+    assert not any(k.startswith("proj:") for a in assets.values() for k in a)

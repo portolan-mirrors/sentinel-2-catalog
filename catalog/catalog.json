@@ -28,6 +28,18 @@
       "title": "MGRS coverage and cloud statistics"
     },
     {
+      "rel": "child",
+      "href": "./sentinel-2-c1-l2a/collection.json",
+      "type": "application/json",
+      "title": "Sentinel-2 Collection 1 L2A scenes"
+    },
+    {
+      "rel": "child",
+      "href": "./stats-c1/collection.json",
+      "type": "application/json",
+      "title": "MGRS coverage and cloud statistics (Collection 1)"
+    },
+    {
       "rel": "describedby",
       "href": "./README.md",
       "type": "text/markdown",

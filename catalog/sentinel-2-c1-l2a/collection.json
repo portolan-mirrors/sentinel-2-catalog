@@ -1,0 +1,930 @@
+{
+  "type": "Collection",
+  "stac_version": "1.1.0",
+  "stac_extensions": [
+    "https://schemas.portolan-sdi.org/portolan/v0.2.0/schema.json",
+    "https://schemas.portolan-sdi.org/incubating/partition/v1.0.0/schema.json",
+    "https://stac-extensions.github.io/table/v1.2.0/schema.json",
+    "https://stac-extensions.github.io/web-map-links/v1.3.0/schema.json",
+    "https://stac-extensions.github.io/file/v2.1.0/schema.json"
+  ],
+  "id": "sentinel-2-c1-l2a",
+  "title": "Sentinel-2 Collection 1 L2A scenes (item index)",
+  "description": "The AWS Earth Search item index for Sentinel-2 Collection 1 L2A (ESA's reprocessing of the whole archive to one processing baseline), republished as one year-partitioned GeoParquet 2.0 table. The backfill is in progress and no year is published yet, so table:row_count is 0, partition:file_count is 0 and the temporal extent is the source's (its earliest scene is 2015-10-22); all three are measured from the published years at each publish. One row per scene, carrying the whole STAC item: footprint, acquisition time, MGRS tile, cloud cover, the scene-classification percentages, the viewing and sun angles, `created`/`updated`, and the complete upstream `assets` object as a JSON string. Every Cloud-Optimized GeoTIFF URL is therefore in the table -- no API call, no URL template to guess -- while the imagery itself stays in the `e84-earth-search-sentinel-data` bucket on AWS. Collection 1 items carry no `s2:mgrs_tile`: the tile is `grid:code` (`MGRS-31UET`), and the bare id (`31UET`) is the added `_tile` column, THE spatial join key. Rows in every part are ordered by month, then MGRS tile, then Hilbert index, so a reader prunes on both time and space, and one tile's month sits in a single row group. Every year is one items.parquet, whose row groups are cut on month boundaries at 20,000 rows or fewer -- a group never spans two months, so a month filter reads only that month's groups and each `_tile` sits in few of them. Any year may add live.parquet, the tail fetched daily since the last fold, which the periodic fold merges back into the year file. There is no zone= directory and no zone split: every part sits in year=YYYY/ and matches partition:glob. ESA's reprocessing is still running, so old years keep gaining scenes with recent `created` timestamps; the daily refresh looks back on `created`, not `datetime`, and appends what it finds to the year's live.parquet. Contains modified Copernicus Sentinel data. Read the [agent guide](AGENTS.md) before querying: `s2:dark_features_percentage` is NULL from processing baseline 05.11, `processing:software` and `assets` are JSON strings, not structs.",
+  "license": "CC-BY-SA-3.0-IGO",
+  "keywords": [
+    "sentinel-2",
+    "l2a",
+    "collection-1",
+    "stac-geoparquet",
+    "earth-search",
+    "esa",
+    "copernicus",
+    "satellite imagery",
+    "cloud cover",
+    "mgrs"
+  ],
+  "updated": "2026-09-21T19:39:23Z",
+  "providers": [
+    {
+      "name": "European Space Agency (ESA)",
+      "description": "Operates the Sentinel-2 mission and produces the L2A surface reflectance products for the Copernicus programme.",
+      "roles": [
+        "producer",
+        "licensor"
+      ],
+      "url": "https://sentinels.copernicus.eu/web/sentinel/missions/sentinel-2"
+    },
+    {
+      "name": "Element 84 (Earth Search)",
+      "description": "Converts the ESA Collection 1 L2A products to Cloud-Optimized GeoTIFFs, serves them in the public e84-earth-search-sentinel-data bucket on AWS Open Data that every asset href in this table points at, and runs the Earth Search STAC API whose sentinel-2-c1-l2a items this table mirrors.",
+      "roles": [
+        "processor"
+      ],
+      "url": "https://earth-search.aws.element84.com/v1"
+    },
+    {
+      "name": "Portolan Mirrors",
+      "description": "Republishes the Earth Search item index as partitioned STAC-GeoParquet.",
+      "roles": [
+        "processor",
+        "host"
+      ],
+      "url": "https://github.com/portolan-mirrors/sentinel-2-catalog"
+    }
+  ],
+  "extent": {
+    "spatial": {
+      "bbox": [
+        [
+          -180,
+          -90,
+          180,
+          90
+        ]
+      ]
+    },
+    "temporal": {
+      "interval": [
+        [
+          "2015-10-22T00:00:00Z",
+          null
+        ]
+      ]
+    }
+  },
+  "partition:scheme": "hive",
+  "partition:strategy": "temporal",
+  "partition:keys": [
+    {
+      "name": "year",
+      "type": "int32",
+      "description": "Year of acquisition (UTC). Every year is one items.parquet, whose row groups are cut on month boundaries at 20,000 rows or fewer -- a group never spans two months, so a month filter reads only that month's groups and each `_tile` sits in few of them. Any year may add live.parquet, the tail fetched daily since the last fold, which the periodic fold merges back into the year file. There is no zone= directory and no zone split: every part sits in year=YYYY/ and matches partition:glob."
+    }
+  ],
+  "partition:file_count": 0,
+  "partition:glob": "s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=*/*.parquet",
+  "table:primary_geometry": "geometry",
+  "table:row_count": 0,
+  "table:columns": [
+    {
+      "name": "thumbnail_url",
+      "type": "string",
+      "description": "Preview JPEG on the e84-earth-search-sentinel-data bucket."
+    },
+    {
+      "name": "type",
+      "type": "string",
+      "description": "Always 'Feature'."
+    },
+    {
+      "name": "stac_version",
+      "type": "string",
+      "description": "STAC version of the source item."
+    },
+    {
+      "name": "stac_extensions",
+      "type": "list<string>",
+      "description": "Extension schema URIs of the source item."
+    },
+    {
+      "name": "id",
+      "type": "string",
+      "description": "Earth Search item id, e.g. S2B_T31UET_20260921T105030_L2A."
+    },
+    {
+      "name": "bbox",
+      "type": "list<double>",
+      "description": "Item bounding box [w, s, e, n], CRS84."
+    },
+    {
+      "name": "links",
+      "type": "STRUCT(href VARCHAR, rel VARCHAR, title VARCHAR, \"type\" VARCHAR)[]",
+      "description": "Source item links (canonical et al.); paging links are stripped."
+    },
+    {
+      "name": "collection",
+      "type": "string",
+      "description": "Always 'sentinel-2-c1-l2a'."
+    },
+    {
+      "name": "datetime",
+      "type": "timestamp[us, tz=UTC]",
+      "description": "Acquisition datetime, UTC."
+    },
+    {
+      "name": "created",
+      "type": "timestamp[us, tz=UTC]",
+      "description": "When Earth Search created the item; the incremental-fetch lookback field."
+    },
+    {
+      "name": "updated",
+      "type": "timestamp[us, tz=UTC]",
+      "description": "When Earth Search last updated the item."
+    },
+    {
+      "name": "platform",
+      "type": "string",
+      "description": "sentinel-2a / sentinel-2b / sentinel-2c."
+    },
+    {
+      "name": "constellation",
+      "type": "string",
+      "description": "Always 'sentinel-2'."
+    },
+    {
+      "name": "instruments",
+      "type": "list<string>",
+      "description": "Always ['msi']."
+    },
+    {
+      "name": "grid:code",
+      "type": "string",
+      "description": "MGRS grid code, e.g. MGRS-31UET. `_tile` is the bare id."
+    },
+    {
+      "name": "mgrs:utm_zone",
+      "type": "int64",
+      "description": "UTM zone number, 1-60."
+    },
+    {
+      "name": "mgrs:latitude_band",
+      "type": "string",
+      "description": "MGRS latitude band letter."
+    },
+    {
+      "name": "mgrs:grid_square",
+      "type": "string",
+      "description": "MGRS 100 km grid square."
+    },
+    {
+      "name": "proj:epsg",
+      "type": "int64",
+      "description": "UTM EPSG code of the scene grid."
+    },
+    {
+      "name": "proj:centroid",
+      "type": "STRUCT(lat DOUBLE, lon DOUBLE)",
+      "description": "Scene centroid, CRS84."
+    },
+    {
+      "name": "eo:cloud_cover",
+      "type": "double",
+      "description": "Scene cloud cover percentage, 0-100."
+    },
+    {
+      "name": "s2:tile_id",
+      "type": "string",
+      "description": "ESA tile (granule) id."
+    },
+    {
+      "name": "s2:degraded_msi_data_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:nodata_pixel_percentage",
+      "type": "double",
+      "description": "Nodata share; high values = partial scenes."
+    },
+    {
+      "name": "s2:saturated_defective_pixel_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:dark_features_percentage",
+      "type": "double",
+      "description": "Scene classification percentage. Present on processing baselines <= 05.10; NULL on 05.11+."
+    },
+    {
+      "name": "s2:cloud_shadow_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:vegetation_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:not_vegetated_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:water_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:unclassified_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:medium_proba_clouds_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:high_proba_clouds_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:thin_cirrus_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:snow_ice_percentage",
+      "type": "double",
+      "description": "Scene classification percentage."
+    },
+    {
+      "name": "s2:product_type",
+      "type": "string",
+      "description": "Always 'S2MSI2A'."
+    },
+    {
+      "name": "s2:processing_baseline",
+      "type": "string",
+      "description": "e.g. 05.13."
+    },
+    {
+      "name": "s2:product_uri",
+      "type": "string",
+      "description": "ESA product name."
+    },
+    {
+      "name": "s2:generation_time",
+      "type": "string",
+      "description": "Processing generation time; dedupe tiebreak."
+    },
+    {
+      "name": "s2:datatake_id",
+      "type": "string",
+      "description": "ESA datatake id."
+    },
+    {
+      "name": "s2:datatake_type",
+      "type": "string",
+      "description": "e.g. INS-NOBS."
+    },
+    {
+      "name": "s2:datastrip_id",
+      "type": "string",
+      "description": "ESA datastrip id."
+    },
+    {
+      "name": "s2:reflectance_conversion_factor",
+      "type": "double",
+      "description": "Sun-distance reflectance factor."
+    },
+    {
+      "name": "view:azimuth",
+      "type": "double",
+      "description": "Mean viewing azimuth angle, degrees."
+    },
+    {
+      "name": "view:incidence_angle",
+      "type": "double",
+      "description": "Mean viewing incidence angle, degrees."
+    },
+    {
+      "name": "view:sun_azimuth",
+      "type": "double",
+      "description": "Mean solar azimuth angle, degrees."
+    },
+    {
+      "name": "view:sun_elevation",
+      "type": "double",
+      "description": "Mean solar elevation angle, degrees."
+    },
+    {
+      "name": "storage:platform",
+      "type": "string",
+      "description": "Always 'AWS'."
+    },
+    {
+      "name": "storage:region",
+      "type": "string",
+      "description": "Always 'us-west-2'."
+    },
+    {
+      "name": "storage:requester_pays",
+      "type": "bool",
+      "description": "Always false."
+    },
+    {
+      "name": "processing:software",
+      "type": "string",
+      "description": "The upstream processing:software object (name -> version), verbatim, as a compact JSON string."
+    },
+    {
+      "name": "earthsearch:payload_id",
+      "type": "string",
+      "description": "Earth Search ingest payload id."
+    },
+    {
+      "name": "assets",
+      "type": "string",
+      "description": "The upstream STAC assets object, verbatim, as a compact JSON string. Parse with json_extract or JSON.parse."
+    },
+    {
+      "name": "_month",
+      "type": "int8",
+      "description": "month(datetime); first sort key. Query helper, not STAC."
+    },
+    {
+      "name": "_hilbert",
+      "type": "uint32",
+      "description": "ST_Hilbert(geometry, world bounds); second sort key. Query helper, not STAC."
+    },
+    {
+      "name": "_tile",
+      "type": "string",
+      "description": "MGRS tile id from grid:code, e.g. 31UET. THE spatial join key."
+    },
+    {
+      "name": "geometry",
+      "type": "geometry",
+      "description": "Scene footprint, CRS84."
+    }
+  ],
+  "item_assets": {
+    "red": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Red - 10m",
+      "eo:bands": [
+        {
+          "name": "B04",
+          "common_name": "red",
+          "center_wavelength": 0.665,
+          "full_width_half_max": 0.038
+        }
+      ],
+      "gsd": 10,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 10,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "green": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Green - 10m",
+      "eo:bands": [
+        {
+          "name": "B03",
+          "common_name": "green",
+          "center_wavelength": 0.56,
+          "full_width_half_max": 0.045
+        }
+      ],
+      "gsd": 10,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 10,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "blue": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Blue - 10m",
+      "eo:bands": [
+        {
+          "name": "B02",
+          "common_name": "blue",
+          "center_wavelength": 0.49,
+          "full_width_half_max": 0.098
+        }
+      ],
+      "gsd": 10,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 10,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "visual": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "True color image",
+      "eo:bands": [
+        {
+          "name": "B04",
+          "common_name": "red",
+          "center_wavelength": 0.665,
+          "full_width_half_max": 0.038
+        },
+        {
+          "name": "B03",
+          "common_name": "green",
+          "center_wavelength": 0.56,
+          "full_width_half_max": 0.045
+        },
+        {
+          "name": "B02",
+          "common_name": "blue",
+          "center_wavelength": 0.49,
+          "full_width_half_max": 0.098
+        }
+      ],
+      "gsd": 10,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint8",
+          "spatial_resolution": 10
+        },
+        {
+          "nodata": 0,
+          "data_type": "uint8",
+          "spatial_resolution": 10
+        },
+        {
+          "nodata": 0,
+          "data_type": "uint8",
+          "spatial_resolution": 10
+        }
+      ],
+      "roles": [
+        "visual"
+      ]
+    },
+    "nir": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "NIR 1 - 10m",
+      "eo:bands": [
+        {
+          "name": "B08",
+          "common_name": "nir",
+          "center_wavelength": 0.842,
+          "full_width_half_max": 0.145
+        }
+      ],
+      "gsd": 10,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 10,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "swir22": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "SWIR 2.2\u03bcm - 20m",
+      "eo:bands": [
+        {
+          "name": "B12",
+          "common_name": "swir22",
+          "center_wavelength": 2.19,
+          "full_width_half_max": 0.242
+        }
+      ],
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 20,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "rededge2": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Red Edge 2 - 20m",
+      "eo:bands": [
+        {
+          "name": "B06",
+          "common_name": "rededge",
+          "center_wavelength": 0.74,
+          "full_width_half_max": 0.018
+        }
+      ],
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 20,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "rededge3": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Red Edge 3 - 20m",
+      "eo:bands": [
+        {
+          "name": "B07",
+          "common_name": "rededge",
+          "center_wavelength": 0.783,
+          "full_width_half_max": 0.028
+        }
+      ],
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 20,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "rededge1": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Red Edge 1 - 20m",
+      "eo:bands": [
+        {
+          "name": "B05",
+          "common_name": "rededge",
+          "center_wavelength": 0.704,
+          "full_width_half_max": 0.019
+        }
+      ],
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 20,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "swir16": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "SWIR 1.6\u03bcm - 20m",
+      "eo:bands": [
+        {
+          "name": "B11",
+          "common_name": "swir16",
+          "center_wavelength": 1.61,
+          "full_width_half_max": 0.143
+        }
+      ],
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 20,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "wvp": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Water Vapour (WVP)",
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 20,
+          "unit": "cm",
+          "scale": 0.001,
+          "offset": 0
+        }
+      ],
+      "roles": [
+        "data"
+      ]
+    },
+    "nir08": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "NIR 2 - 20m",
+      "eo:bands": [
+        {
+          "name": "B8A",
+          "common_name": "nir08",
+          "center_wavelength": 0.865,
+          "full_width_half_max": 0.033
+        }
+      ],
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 20,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "scl": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Scene classification map (SCL)",
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint8",
+          "spatial_resolution": 20
+        }
+      ],
+      "roles": [
+        "data"
+      ]
+    },
+    "aot": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Aerosol optical thickness (AOT)",
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 20,
+          "scale": 0.001,
+          "offset": 0
+        }
+      ],
+      "roles": [
+        "data"
+      ]
+    },
+    "coastal": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Coastal - 60m",
+      "eo:bands": [
+        {
+          "name": "B01",
+          "common_name": "coastal",
+          "center_wavelength": 0.443,
+          "full_width_half_max": 0.027
+        }
+      ],
+      "gsd": 60,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 60,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "nir09": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "NIR 3 - 60m",
+      "eo:bands": [
+        {
+          "name": "B09",
+          "common_name": "nir09",
+          "center_wavelength": 0.945,
+          "full_width_half_max": 0.026
+        }
+      ],
+      "gsd": 60,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint16",
+          "spatial_resolution": 60,
+          "scale": 0.0001,
+          "offset": -0.1
+        }
+      ],
+      "roles": [
+        "data",
+        "reflectance"
+      ]
+    },
+    "cloud": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Cloud Probabilities",
+      "gsd": 20,
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint8",
+          "spatial_resolution": 20
+        }
+      ],
+      "roles": [
+        "data",
+        "cloud"
+      ]
+    },
+    "snow": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Snow Probabilities",
+      "raster:bands": [
+        {
+          "nodata": 0,
+          "data_type": "uint8",
+          "spatial_resolution": 20
+        }
+      ],
+      "roles": [
+        "data",
+        "snow-ice"
+      ]
+    },
+    "preview": {
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "True color preview",
+      "eo:bands": [
+        {
+          "name": "B04",
+          "common_name": "red",
+          "center_wavelength": 0.665,
+          "full_width_half_max": 0.038
+        },
+        {
+          "name": "B03",
+          "common_name": "green",
+          "center_wavelength": 0.56,
+          "full_width_half_max": 0.045
+        },
+        {
+          "name": "B02",
+          "common_name": "blue",
+          "center_wavelength": 0.49,
+          "full_width_half_max": 0.098
+        }
+      ],
+      "roles": [
+        "overview"
+      ]
+    },
+    "granule_metadata": {
+      "type": "application/xml",
+      "roles": [
+        "metadata"
+      ]
+    },
+    "tileinfo_metadata": {
+      "type": "application/json",
+      "roles": [
+        "metadata"
+      ]
+    },
+    "product_metadata": {
+      "type": "application/xml",
+      "roles": [
+        "metadata"
+      ]
+    },
+    "thumbnail": {
+      "type": "image/jpeg",
+      "title": "Thumbnail of preview image",
+      "roles": [
+        "thumbnail"
+      ]
+    }
+  },
+  "assets": {
+    "thumbnail": {
+      "href": "./thumbnail.png",
+      "type": "image/png",
+      "title": "Scene density, rendered from the published index",
+      "roles": [
+        "thumbnail"
+      ],
+      "file:size": 26757,
+      "file:checksum": "122072bc0e753fbcbec53b37699f99260cdc9e2379ad81e54b15ec9b7d21d6f65118"
+    }
+  },
+  "links": [
+    {
+      "rel": "root",
+      "href": "../catalog.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
+    },
+    {
+      "rel": "parent",
+      "href": "../catalog.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
+    },
+    {
+      "rel": "describedby",
+      "href": "./README.md",
+      "type": "text/markdown",
+      "title": "Collection README"
+    },
+    {
+      "rel": "agents",
+      "href": "./AGENTS.md",
+      "type": "text/markdown",
+      "title": "Collection agent guide"
+    },
+    {
+      "rel": "via",
+      "href": "https://element84.com/earth-search/",
+      "type": "text/html",
+      "title": "Earth Search by Element 84 (upstream source)"
+    },
+    {
+      "rel": "via",
+      "href": "https://registry.opendata.aws/sentinel-2-l2a-cogs/",
+      "type": "text/html",
+      "title": "Sentinel-2 Collection 1 L2A COGs on the AWS Registry of Open Data"
+    },
+    {
+      "rel": "canonical",
+      "href": "https://earth-search.aws.element84.com/v1/collections/sentinel-2-c1-l2a",
+      "type": "application/json",
+      "title": "The upstream Earth Search collection"
+    },
+    {
+      "rel": "preview",
+      "href": "https://portolan-mirrors.github.io/sentinel-2-catalog/?collection=sentinel-2-c1-l2a",
+      "type": "text/html",
+      "title": "Interactive scene explorer"
+    }
+  ]
+}

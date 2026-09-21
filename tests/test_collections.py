@@ -138,3 +138,18 @@ def test_c1_normalize_tile_fallback_and_error():
     del f["properties"]["mgrs:grid_square"]
     with pytest.raises(ValueError, match="grid:code"):
         s2c1_schema.normalize(f)
+
+
+def test_c1_agents_schema_table_is_the_schema():
+    """catalog/sentinel-2-c1-l2a/AGENTS.md carries a schema table generated
+    from s2c1_schema.COLUMNS (through make_collection.TYPE_NAMES). This
+    pins the prose to the module: every column, in order, with its type
+    and description, and no column the module does not have."""
+    from make_collection import TYPE_NAMES
+    text = (Path(__file__).resolve().parents[1]
+            / "catalog/sentinel-2-c1-l2a/AGENTS.md").read_text()
+    rows = [line for line in text.splitlines()
+            if line.startswith("| `") and line.count("|") == 4]
+    expected = [f"| `{name}` | {TYPE_NAMES.get(kind, kind)} | {desc} |"
+                for name, kind, desc in s2c1_schema.COLUMNS]
+    assert rows == expected

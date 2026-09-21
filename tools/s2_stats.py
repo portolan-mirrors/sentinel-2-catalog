@@ -186,18 +186,18 @@ def existing_sql(con, existing: str) -> str:
     cover column the old file lacks comes through as NULL, not a failed read.
     """
     have = _columns(con, f"read_parquet('{existing}')")
-    cols = ["mgrs_tile::VARCHAR AS mgrs_tile",
-            "year::SMALLINT AS year",
-            "month::TINYINT AS month",
-            "scene_count::USMALLINT AS scene_count"]
+    columns = ["mgrs_tile::VARCHAR AS mgrs_tile",
+               "year::SMALLINT AS year",
+               "month::TINYINT AS month",
+               "scene_count::USMALLINT AS scene_count"]
     for c in PERCENT_COLUMNS:
-        cols.append(f"{_pct(c) if c in have else 'NULL::UTINYINT'} AS {c}")
-    cols.append("best_item_id::VARCHAR AS best_item_id")
+        columns.append(f"{_pct(c) if c in have else 'NULL::UTINYINT'} AS {c}")
+    columns.append("best_item_id::VARCHAR AS best_item_id")
     if "best_item_date" in have:
-        cols.append("best_item_date::DATE AS best_item_date")
+        columns.append("best_item_date::DATE AS best_item_date")
     else:
-        cols.append("(best_item_datetime AT TIME ZONE 'UTC')::DATE AS best_item_date")
-    return f"SELECT {', '.join(cols)} FROM read_parquet('{existing}')"
+        columns.append("(best_item_datetime AT TIME ZONE 'UTC')::DATE AS best_item_date")
+    return f"SELECT {', '.join(columns)} FROM read_parquet('{existing}')"
 
 
 def _month_name(year: int, month: int) -> str:
@@ -254,12 +254,12 @@ def build_month_slices(con, months_dir: Path) -> list[str]:
     months_dir.mkdir(parents=True, exist_ok=True)
     months = con.execute(
         "SELECT DISTINCT year, month FROM stats ORDER BY 1, 2").fetchall()
-    cols = ", ".join(MONTH_COLUMNS)
+    columns = ", ".join(MONTH_COLUMNS)
     written = []
     for year, month in months:
         name = _month_name(year, month)
         con.execute(f"""
-          COPY (SELECT {cols} FROM stats
+          COPY (SELECT {columns} FROM stats
                 WHERE year = {year} AND month = {month}
                 ORDER BY mgrs_tile)
           TO '{months_dir / name}.parquet' ({SLICE_OPTS})
