@@ -10,8 +10,17 @@ was not reaching the file; parts now publish at zstd 18, which cannot make
 that number larger — and lossless beats clever. This module is the single
 source of truth for the column list; collection metadata is generated
 from it.
+
+normalize() turns one Earth Search sentinel-2-l2a item into one row on this
+schema. It lives here, next to the columns, so that s2_collections can
+hand every tool a schema module with the same two names (COLUMNS,
+normalize) for either collection; s2_fetch re-exports it. Only stdlib is
+needed for it, which keeps this module free of duckdb for upload_part.
 """
 from __future__ import annotations
+
+import json
+import re
 
 
 # (name, duckdb type, description). Order is the upstream item's property
@@ -77,3 +86,75 @@ COLUMNS = [
 # dependencies, so upload_part can import it without pulling duckdb in.
 USER_AGENT = ("sentinel-2-catalog-tools/1.0 "
               "(+https://github.com/portolan-mirrors/sentinel-2-catalog)")
+
+# Everything normalize() emits: the two sort helpers are computed at build
+# time, so a chunk parquet carries every column but those.
+DATA_COLUMNS = [c for c in COLUMNS if c[0] not in ("_month", "_hilbert")]
+_ROW_KEYS = [c[0] for c in DATA_COLUMNS if c[0] != "geometry"] + ["_geometry_json"]
+_REL_ORBIT = re.compile(r"_R(\d{3})_")
+
+
+def normalize(f: dict) -> dict:
+    """One Earth Search sentinel-2-l2a item -> one canonical row, with the
+    geometry as `_geometry_json` for the NDJSON -> parquet COPY step
+    (s2_fetch.copy_ndjson_to_parquet).
+
+    Newer items moved off the s2 extension for several fields; the archive
+    keeps the seed schema:
+      s2:mgrs_tile          <- props or mgrs:utm_zone + mgrs:latitude_band + mgrs:grid_square
+      sat:relative_orbit    <- props or _R(\\d{3})_ in s2:product_uri
+      s2:mean_solar_zenith  <- props or 90 - view:sun_elevation
+      s2:mean_solar_azimuth <- props or view:sun_azimuth
+    Absent values stay NULL rather than being invented (s2:granule_id,
+    sat:orbit_state on newer items). Raises ValueError for an item with
+    neither s2:mgrs_tile nor the three mgrs:* fields."""
+    p = f["properties"]
+    tile = p.get("s2:mgrs_tile")
+    if not tile:
+        try:
+            tile = (f"{p['mgrs:utm_zone']}{p['mgrs:latitude_band']}"
+                    f"{p['mgrs:grid_square']}")
+        except KeyError as e:
+            raise ValueError(
+                f"{f.get('id', '<unknown id>')}: missing mgrs field {e} "
+                "and no s2:mgrs_tile") from e
+    rel = p.get("sat:relative_orbit")
+    if rel is None and p.get("s2:product_uri"):
+        m = _REL_ORBIT.search(p["s2:product_uri"])
+        rel = int(m.group(1)) if m else None
+    zen = p.get("s2:mean_solar_zenith")
+    if zen is None and p.get("view:sun_elevation") is not None:
+        zen = 90.0 - p["view:sun_elevation"]
+    azi = p.get("s2:mean_solar_azimuth", p.get("view:sun_azimuth"))
+    row = {
+        "assets": json.dumps(f.get("assets", {}), separators=(",", ":")),
+        "thumbnail_url": (f.get("assets", {}).get("thumbnail") or {}).get("href"),
+        "type": "Feature",
+        "stac_version": f.get("stac_version"),
+        "stac_extensions": f.get("stac_extensions") or [],
+        "id": f["id"],
+        "bbox": f.get("bbox"),
+        "links": [{"href": l.get("href"), "rel": l.get("rel"),
+                   "title": l.get("title"), "type": l.get("type")}
+                  for l in f.get("links", [])
+                  if l.get("rel") not in ("next", "prev", "root", "parent")],
+        "collection": "sentinel-2-l2a",
+        "datetime": p["datetime"],
+        "platform": p.get("platform"),
+        "proj:epsg": p.get("proj:epsg"),
+        "instruments": p.get("instruments") or [],
+        "s2:mgrs_tile": tile,
+        "constellation": p.get("constellation"),
+        "s2:granule_id": p.get("s2:granule_id"),
+        "eo:cloud_cover": p.get("eo:cloud_cover"),
+        "sat:orbit_state": p.get("sat:orbit_state"),
+        "sat:relative_orbit": rel,
+        "s2:mean_solar_zenith": zen,
+        "s2:mean_solar_azimuth": azi,
+        "_geometry_json": json.dumps(f["geometry"]),
+    }
+    # Every remaining s2:* column comes straight from properties.
+    for name in _ROW_KEYS:
+        if name not in row:
+            row[name] = p.get(name)
+    return {k: row[k] for k in _ROW_KEYS}
