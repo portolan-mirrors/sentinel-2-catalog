@@ -213,9 +213,11 @@ Search stopped publishing them. The
 | `publish-catalog` | manual | Publishes the committed `catalog/` metadata as-is. |
 | `pages` | on push to `apps/explorer/` | Deploys the explorer to GitHub Pages. |
 
-`tools/make_collection.py` regenerates the `updated` stamps and each
-collection's row count and temporal extent from the published parts on every
-refresh. `collection.json` is therefore the authority on what is here now.
+`tools/make_collection.py` regenerates the item index's `updated` stamp, row
+count and temporal extent from the published parts on every refresh, and
+`tools/make_stats_collection.py` does the same for the stats collection from
+`timeline.parquet`. Each `collection.json` is therefore the authority on what
+is here now.
 
 ## The repository
 
@@ -229,8 +231,9 @@ in object storage next to it, referenced by URL and never committed.
 | Neither | gitignored | GeoParquet, COGs, PMTiles, credentials |
 
 `tools/s2_fetch.py` and `tools/s2_build.py` fetch and compact the parts,
-`tools/s2_stats.py` builds the aggregates, `tools/make_items.py` and
-`tools/make_collection.py` restamp the metadata, and `tools/publish.py` and
+`tools/s2_stats.py` builds the aggregates, `tools/make_items.py`,
+`tools/make_collection.py` and `tools/make_stats_collection.py` restamp the
+metadata, and `tools/publish.py` and
 `tools/upload_data.py` carry metadata and data to the bucket. The design and
 its amendments are in
 [`docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md`](docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md).

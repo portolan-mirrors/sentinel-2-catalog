@@ -733,3 +733,64 @@ def test_keep_footprint_table_flag():
         tiles = {r[0] for r in con.execute(
             f"SELECT mgrs_tile FROM read_parquet('{fp}')").fetchall()}
         assert tiles == {"31ABC"}
+
+
+def test_stats_collection_extent_is_stamped_from_the_timeline():
+    """make_stats_collection.py measures the collection's temporal extent
+    from timeline.parquet: first day of the earliest month at 00:00:00Z to
+    the last day of the latest month at 23:59:59Z (a leap February here),
+    table:row_count as the sum of tile_count, `updated` restamped, and
+    every other key preserved in place and in order with 2-space indent."""
+    from make_stats_collection import interval, month_span, stamp
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        timeline = Path(td) / "timeline.parquet"
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            (2023::SMALLINT, 12::TINYINT, 1, 1, 100::UTINYINT),
+            (2024::SMALLINT,  1::TINYINT, 3, 7,   5::UTINYINT),
+            (2024::SMALLINT,  2::TINYINT, 2, 4,   0::UTINYINT)
+          ) t(year, month, tile_count, scene_count, min_cloud_cover)
+          ) TO '{timeline}' (FORMAT PARQUET)""")
+        assert month_span(con, str(timeline)) == (2023, 12, 2024, 2, 6)
+        assert interval(2023, 12, 2024, 2) == \
+            ["2023-12-01T00:00:00Z", "2024-02-29T23:59:59Z"]
+
+        # The committed file through the CLI: only the three measured
+        # fields move, and the file still round-trips byte-for-byte.
+        src = ROOT / "catalog" / "stats" / "collection.json"
+        out = Path(td) / "collection.json"
+        out.write_text(src.read_text())
+        subprocess.run([sys.executable, "tools/make_stats_collection.py",
+                        "--data-dir", td, "--out", str(out)],
+                       check=True, cwd=ROOT, capture_output=True)
+        before, after = json.loads(src.read_text()), json.loads(out.read_text())
+        assert after["extent"]["temporal"]["interval"] == \
+            [["2023-12-01T00:00:00Z", "2024-02-29T23:59:59Z"]]
+        assert after["table:row_count"] == 6
+        assert after["updated"] != before["updated"]
+        assert list(after) == list(before)
+        assert list(after["extent"]) == list(before["extent"])
+        for key in before:
+            if key not in ("extent", "table:row_count", "updated"):
+                assert after[key] == before[key], key
+        assert after["extent"]["spatial"] == before["extent"]["spatial"]
+        assert out.read_text() == json.dumps(after, indent=2) + "\n"
+
+        # stamp() on a minimal object keeps whatever order it was given.
+        minimal = {"type": "Collection", "updated": "x",
+                   "extent": {"temporal": {"interval": [["a", "b"]]},
+                              "spatial": {"bbox": [[0, 0, 1, 1]]}},
+                   "table:row_count": 0, "links": []}
+        stamped = stamp(minimal, ["s", "e"], 9, "now")
+        assert list(stamped) == ["type", "updated", "extent",
+                                 "table:row_count", "links"]
+        assert stamped["extent"]["temporal"]["interval"] == [["s", "e"]]
+        assert (stamped["table:row_count"], stamped["updated"]) == (9, "now")
+
+        # No timeline and no --remote-baseline is a refusal, not a guess.
+        proc = subprocess.run(
+            [sys.executable, "tools/make_stats_collection.py",
+             "--data-dir", str(Path(td) / "empty"), "--out", str(out)],
+            cwd=ROOT, capture_output=True, text=True)
+        assert proc.returncode != 0 and "--remote-baseline" in proc.stderr

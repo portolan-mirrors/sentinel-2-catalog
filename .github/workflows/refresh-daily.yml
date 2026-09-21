@@ -155,11 +155,16 @@ jobs:
                       "./staging/publish/sentinel-2-l2a/year=$Y/live.parquet" \
             --out ./staging/publish/stats \
             --merge-years "$Y" --existing "$BASE/stats/mgrs-monthly.parquet"
+      # Both collections: the item index from its published parts plus the
+      # live part just built, and the stats collection's extent, row count
+      # and `updated` from the timeline the splice just wrote.
       - name: Restamp collection metadata
         if: steps.guard.outputs.published == 'true'
         run: |
+          set -euo pipefail
           python3 tools/make_items.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
           python3 tools/make_collection.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
+          python3 tools/make_stats_collection.py --data-dir ./staging/publish/stats --remote-baseline
       - name: Validate before upload
         if: steps.guard.outputs.published == 'true'
         run: python3 tests/run_all.py

@@ -118,11 +118,15 @@ on different cadences by design.
 
 ## Status
 
-Generated from a pilot slice of the mirrored archive (two days,
-2026-09-12 to 2026-09-13) while the full historical backfill runs. Expect
-tile counts and cloud-cover statistics to change substantially as more years
-land — do not treat a tile's absence here as evidence Sentinel-2 never
-imaged it.
+The table covers every month of the mirrored archive: as of 2026-09-19,
+119 months from 2016-11 through 2026-09 and 3,135,156 tile-months (one row
+each in `mgrs-monthly.parquet`, measured from its footer). Read the current
+span from `timeline.parquet` rather than from this file; the collection's
+`extent.temporal`, `table:row_count` and `updated` are measured from that
+timeline at each publish by `tools/make_stats_collection.py`. Coverage
+before December 2018 is partial, as in `sentinel-2-l2a`, so a tile's
+absence in an early month is upstream's record, not evidence Sentinel-2
+never imaged it.
 
 Structural links resolve relative to the object that carries them. This
 collection carries no `self` link, so a client tracks its own location.

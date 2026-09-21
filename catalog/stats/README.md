@@ -70,10 +70,14 @@ ORDER BY year DESC, month DESC LIMIT 1;
 
 ## Status
 
-Generated from a pilot slice of the mirrored archive (two days,
-2026-09-12 to 2026-09-13: 31,264 scenes across 21,040 MGRS tiles) while the
-full historical backfill runs in CI. Both products are refreshed, and this
-collection's `updated`/extent restamped, as more of the archive lands.
+The table covers every month of the mirrored archive. As of 2026-09-19 that
+is 119 months, 2016-11 through 2026-09, and 3,135,156 tile-months in
+`mgrs-monthly.parquet`; the newest month is the `max(year, month)` row of
+`timeline.parquet`. The daily refresh recomputes the current year and
+rewrites the month slices and the timeline; `tools/make_stats_collection.py`
+measures this collection's temporal extent, row count and `updated` from
+the timeline at each publish, so the collection never has to be edited by
+hand to follow the table.
 
 ## Provenance and license
 

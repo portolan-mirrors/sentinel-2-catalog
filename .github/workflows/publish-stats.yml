@@ -30,9 +30,13 @@ name: publish-stats
 # through. So the "enumerate published parts" step below resolves the glob
 # itself, by probing, and the build step gets an explicit list of URLs.
 #
-# No catalog metadata publish here: the stats collection.json is committed
-# and static, and its `updated` timestamp restamps on refresh-daily's normal
-# cycle. Running tools/publish.py here would just duplicate that.
+# The stats collection.json is committed, but three of its fields are
+# measured, not typed: the temporal extent, the row count and `updated`.
+# tools/make_stats_collection.py stamps them from the timeline this run
+# writes, the catalog is validated, and tools/publish.py uploads the
+# metadata after the data -- otherwise the published collection keeps
+# describing whatever table it was last stamped from (it claimed the
+# two-day pilot slice for days after the full table was up).
 
 on:
   workflow_dispatch:
@@ -78,7 +82,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq && sudo apt-get install -y -qq tippecanoe
           # geoparquet-io pinned on purpose: see ci.yml and gpio-fix-report.md.
-          pip install --quiet duckdb boto3 'geoparquet-io==1.5.0' pmtiles pytz
+          pip install --quiet duckdb boto3 'geoparquet-io==1.5.0' pmtiles pytz \
+            'rashid>=0.1.8,<0.2.0' stac-check
 
       # Resolve the "every published year part" glob by hand: probe every
       # archive part name a year can hold -- items.parquet for a year
@@ -161,6 +166,16 @@ jobs:
           set -euo pipefail
           mv ./staging/publish/stats/mgrs-tiles.parquet ./staging/
 
+      - name: Restamp the stats collection from the timeline
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tools/make_stats_collection.py --data-dir ./staging/publish/stats
+
+      - name: Validate before upload
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tests/run_all.py
+        env:
+          CI_LIGHT: "1"
+
       - name: Assume the Source Cooperative write role
         if: steps.guard.outputs.published == 'true'
         uses: aws-actions/configure-aws-credentials@v4
@@ -172,6 +187,12 @@ jobs:
       - name: Upload data
         if: steps.guard.outputs.published == 'true'
         run: python3 tools/upload_data.py --confirm --data-dir ./staging/publish
+
+      # After the data, so the stamped extent never describes a table that
+      # is not up yet.
+      - name: Publish catalog metadata
+        if: steps.guard.outputs.published == 'true'
+        run: python3 tools/publish.py --confirm
 
       # Uploaded as a workflow artifact (not to the bucket) so the tileset
       # can be independently rebuilt and compared locally -- tippecanoe vs
