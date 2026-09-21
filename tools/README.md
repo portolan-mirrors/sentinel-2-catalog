@@ -21,7 +21,7 @@ cluster, and GitHub only appends its daily tail.
 | | `sentinel-2-l2a` | `sentinel-2-c1-l2a` |
 |---|---|---|
 | Backfill | `backfill` then `publish-backfill` (GitHub) | `tools/rails/` on RAILS |
-| Daily tail | `refresh-daily`: `live.parquet` per year, zstd 18 | `refresh-daily`: `live.parquet` per year, zstd 3, lookback on `created` |
+| Daily tail | `refresh-daily`: `live.parquet` per year, zstd 18 | `refresh-daily`'s Collection 1 job (added by the refresh-daily change): `live.parquet` per year, zstd 3, lookback on `created` |
 | Consolidation | `consolidate-month`, the 3rd of each month | `fold_live.sbatch` on RAILS, by hand, every 1 to 2 months |
 | Repair | `repair-slices` (bucket crawl) | `repair_month.sbatch` |
 | Audit | `s2_audit.py` by hand | `audit_year.sbatch` |
@@ -130,11 +130,13 @@ The full instructions, the credentials setup and every script are in
    with `--collection sentinel-2-c1-l2a --remote-baseline`, the gates,
    commit, `publish-catalog`) → `publish-stats` for the collection →
    flip the explorer's default.
-6. **Daily**: `refresh-daily`'s Collection 1 job fetches the lookback by
+6. **Daily**: `refresh-daily`'s Collection 1 job (added by the
+   refresh-daily change, after the backfill) fetches the lookback by
    `created` (so a scene ESA reprocessed last week, whatever its
    acquisition date, is caught), appends to `year=YYYY/live.parquet` at
    zstd 3 with the year file's ids excluded, and restamps. It never
-   consolidates.
+   consolidates. It starts only once every year it appends to is
+   uploaded, and so does the fold below.
 
 **The periodic duty.** Every one to two months, and at the end of each
 year, a person runs the fold:

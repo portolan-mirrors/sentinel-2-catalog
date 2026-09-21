@@ -13,7 +13,10 @@
 #   1. HEAD the year's published live.parquet; skip the year when it is
 #      not published or holds no rows.
 #   2. Download live.parquet and, when published, items.parquet to
-#      $PUBLISH/fold/in/year=YYYY/ (on /u; /tmp is too small).
+#      $PUBLISH/fold/in/year=YYYY/ (on /u; /tmp is too small). A year with
+#      no published items.parquet is folded from live alone only when the
+#      backfill never fetched it (no $SLICES/YYYY-*.parquet): a year whose
+#      backfill is fetched but not uploaded stops the job.
 #   3. s2_build.py --collection sentinel-2-c1-l2a over both: dedupe by id
 #      keeping the highest s2:generation_time, sort (_tile, datetime),
 #      uniform 6,144-row groups, zstd 18, gpio check.
@@ -82,8 +85,15 @@ for Y in ${YEARS//,/ }; do
   fi
   if published "$ITEMS_URL"; then
     run curl -fSL --retry 5 --retry-all-errors -o "$IN/year=$Y/items.parquet" "$ITEMS_URL"
+  elif compgen -G "$SLICES/$Y-*.parquet" > /dev/null; then
+    # The backfill fetched this year but its items.parquet is not in the
+    # bucket: a fold now would publish a year file holding the tail alone,
+    # and build_year would then refuse to replace it. Upload the year first.
+    echo "year=$Y: no items.parquet published, but $SLICES holds this year's slices;"
+    echo "year=$Y: build and upload the year (build_year, upload_year) before folding it"
+    exit 1
   else
-    echo "year=$Y: no items.parquet published yet; live is the whole year (first fold)"
+    echo "year=$Y: no items.parquet published and no slices fetched; live is the whole year (first fold of a new year)"
   fi
   run rm -f "$OUT/year=$Y/items.parquet"
   run python3 "$REPO/tools/s2_build.py" --collection "$COLLECTION" \

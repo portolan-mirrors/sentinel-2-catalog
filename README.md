@@ -241,7 +241,10 @@ in object storage next to it, referenced by URL and never committed.
 `tools/s2_stats.py` builds the aggregates, `tools/make_items.py`,
 `tools/make_collection.py` and `tools/make_stats_collection.py` restamp the
 metadata, and `tools/publish.py` and
-`tools/upload_data.py` carry metadata and data to the bucket. The design and
+`tools/upload_data.py` carry metadata and data to the bucket. How each
+collection is kept in sync with Earth Search, and how each was backfilled
+(GitHub for the first, the RAILS cluster for Collection 1), is in
+[`tools/README.md`](tools/README.md), "Sync & backfill". The design and
 its amendments are in
 [`docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md`](docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md).
 

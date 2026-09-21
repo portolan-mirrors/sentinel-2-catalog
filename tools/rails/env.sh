@@ -26,9 +26,10 @@ export SMOKE_MONTH=2017-07
 # Node-local scratch is fast and private to the job. $SLURM_JOB_ID is unset
 # outside Slurm (a dry run on a laptop), so fall back to the shell pid.
 # /tmp on a RAILS node is a 64 GB tmpfs: fine for logs and small files,
-# too small for a year file or a DuckDB spill, which stay on /u.
-export WORK="/tmp/${JOB_NAME:-s2}-${SLURM_JOB_ID:-$$}"
-[ "$DRY_RUN" = 1 ] || mkdir -p "$WORK"
+# too small for a year file or a DuckDB spill, which stay on /u. Only
+# named here: a job that needs it runs `run mkdir -p "$WORK"` itself, so
+# sourcing this file creates nothing.
+export WORK="${WORK:-/tmp/${JOB_NAME:-s2}-${SLURM_JOB_ID:-$$}}"
 
 # Where fetched month slices live between the fetch and the build: the
 # shared project space, so a build job on another node can read them.

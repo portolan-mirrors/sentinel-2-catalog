@@ -117,9 +117,9 @@ from `source_profile`, so an upload that runs longer than an hour does
 not fail on an expired session.
 
 **Test the profile** before the first upload (boto3 is in the
-environment; the aws CLI is not). Under (a) the last line answers
-`AccessDenied`, which is correct: the policy has no delete, and the one
-marker object is overwritten by the next test rather than accumulating.
+environment; the aws CLI is not). Under (a) the delete is denied, which
+is correct: the policy has no delete, and the one marker object is
+overwritten by the next test rather than accumulating.
 
 ```bash
 source ~/s2-catalog/tools/rails/env.sh
@@ -128,7 +128,8 @@ import boto3, datetime
 s = boto3.Session(profile_name="source-coop"); print(s.client("sts").get_caller_identity()["Arn"])
 s3, b, k = s.client("s3"), "us-west-2.opendata.source.coop", "portolan-mirrors/sentinel-2-catalog/_work/write-test.txt"
 s3.put_object(Bucket=b, Key=k, Body=datetime.datetime.now(datetime.timezone.utc).isoformat().encode()); print("put ok:", s3.head_object(Bucket=b, Key=k)["ContentLength"], "bytes")
-s3.delete_object(Bucket=b, Key=k); print("delete ok")
+try: s3.delete_object(Bucket=b, Key=k); print("delete ok")
+except s3.exceptions.ClientError as e: print("delete denied (expected under option a):", e.response["Error"]["Code"])
 EOF
 ```
 
@@ -195,12 +196,19 @@ cancel with `scancel <jobid>`.
    collection).
 9. **Explorer**: flip the default collection when the backfill and the
    stats are complete.
+10. **Folds** start only after step 5 has uploaded every year the daily
+    refresh appends to (the current year, and the previous one in
+    January); see the next section.
 
 ## The periodic duty: fold live
 
-The daily GitHub refresh appends Collection 1's new and reprocessed items
-to `year=YYYY/live.parquet` at zstd 3 and never consolidates. Every one to
-two months, and at the end of each year:
+The daily GitHub refresh (its Collection 1 job, added by the refresh-daily
+change) appends Collection 1's new and reprocessed items to
+`year=YYYY/live.parquet` at zstd 3 and never consolidates. A year is
+folded only after its backfill is uploaded: `fold_live` stops on a year
+that has slices under `$SLICES` but no published `items.parquet`, so a
+live-only year file can never take the place of an unbuilt year. Every
+one to two months, and at the end of each year:
 
 ```bash
 ssh rails 'cd ~/s2-catalog && sbatch --export=ALL,YEARS=2026 tools/rails/fold_live.sbatch'

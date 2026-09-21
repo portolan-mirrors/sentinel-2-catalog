@@ -72,4 +72,5 @@ con = duckdb.connect()
 print(con.execute(f"SELECT count(*) AS rows FROM read_parquet('{p}')").fetchone())
 print(con.execute(f"SELECT num_row_groups FROM parquet_file_metadata('{p}')").fetchone())
 EOF
-echo "year=$YEAR: built $DEST; next: sbatch --export=ALL,YEAR=$YEAR tools/rails/upload_year.sbatch"
+NEXT="--export=ALL,YEAR=$YEAR"; [ "$SMOKE" = 1 ] && NEXT="--export=ALL,SMOKE=1"
+echo "year=$YEAR: built $DEST; next: sbatch $NEXT tools/rails/upload_year.sbatch"

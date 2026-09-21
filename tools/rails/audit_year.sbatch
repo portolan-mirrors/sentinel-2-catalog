@@ -15,7 +15,7 @@
 # Anonymous reads only; no AWS profile. The inventory has ~420 data files
 # of ~20 MB, all read once per audit, so one job per year is the unit.
 #
-# SMOKE=1 audits the smoke year under $PUBLISH/_smoke. DRY_RUN=1 prints
+# SMOKE=1 audits the smoke month under $PUBLISH/_smoke. DRY_RUN=1 prints
 # the command.
 #SBATCH --job-name=s2c1-audit
 #SBATCH --partition=cpu
@@ -35,6 +35,7 @@ YEAR="${YEAR:?set YEAR=YYYY via sbatch --export=ALL,YEAR=...}"
 PUBLISHED_BASE="${PUBLISHED_BASE:-$PUBLISH/$COLLECTION}"
 TOLERANCE="${TOLERANCE:-0}"
 MONTHS=$(python3 "$REPO/tools/rails/months.py" "$YEAR-01" "$YEAR-12" | paste -sd, -)
+if [ "$SMOKE" = 1 ]; then MONTHS="$SMOKE_MONTH"; fi
 if [ ! -s "$PUBLISHED_BASE/year=$YEAR/items.parquet" ] && [ "$DRY_RUN" != 1 ]; then
   echo "year=$YEAR: $PUBLISHED_BASE/year=$YEAR/items.parquet is not built; nothing to audit"; exit 1
 fi

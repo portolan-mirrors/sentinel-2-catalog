@@ -89,7 +89,8 @@ def test_dry_run_prints_the_tools_and_touches_nothing(script, extra):
     prints the s2_* command it would run, with --collection
     sentinel-2-c1-l2a, and writes nothing under $SLICES or $PUBLISH."""
     with tempfile.TemporaryDirectory() as td:
-        env = _dry_env(SLICES=f"{td}/slices", PUBLISH=f"{td}/publish", **extra)
+        env = _dry_env(SLICES=f"{td}/slices", PUBLISH=f"{td}/publish",
+                       WORK=f"{td}/work", **extra)
         proc = _bash(RAILS / script, env)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "dry-run: python3 " in proc.stdout
@@ -119,6 +120,47 @@ def test_build_year_refuses_a_short_year_outside_dry_run():
         proc = _bash(RAILS / "build_year.sbatch", env)
     assert proc.returncode == 1
     assert "not building a short year" in proc.stdout
+
+
+def test_env_sh_creates_nothing_when_sourced():
+    with tempfile.TemporaryDirectory() as td:
+        proc = subprocess.run(
+            ["bash", "-c", f'source "{RAILS}/env.sh"; echo "$WORK"'], cwd=td,
+            env=dict(os.environ, WORK=f"{td}/work", DRY_RUN="0"),
+            capture_output=True, text=True)
+        assert proc.returncode == 0 and proc.stdout.strip() == f"{td}/work"
+        assert os.listdir(td) == []
+
+
+def test_fold_live_refuses_a_live_only_fold_of_a_fetched_year():
+    """No items.parquet in the bucket but the year's slices on /u: the
+    backfill is not uploaded, and a fold must not publish the tail as the
+    year. The probes are faked through a PATH shim for curl (HEAD live ->
+    200, HEAD items -> 404) and python3 (the live row count)."""
+    with tempfile.TemporaryDirectory() as td:
+        shim = Path(td) / "bin"; shim.mkdir()
+        (shim / "curl").write_text(
+            "#!/bin/bash\n"
+            "for a in \"$@\"; do last=\"$a\"; done\n"
+            "case \" $* \" in *\" -I \"*)"
+            " if [[ $last == *live.parquet ]]; then echo -n 200; else echo -n 404; fi; exit 0;; esac\n"
+            "for ((i=1;i<=$#;i++)); do if [[ ${!i} == -o ]]; then j=$((i+1)); echo x > \"${!j}\"; fi; done\n")
+        (shim / "curl").chmod(0o755)
+        (shim / "python3").write_text("#!/bin/bash\necho 5\n"); (shim / "python3").chmod(0o755)
+        slices = Path(td) / "slices"; slices.mkdir()
+        (slices / "2026-01.parquet").write_bytes(b"x")
+        env = _dry_env(YEARS="2026", SLICES=str(slices), PUBLISH=f"{td}/publish",
+                       PATH=f"{shim}:{os.environ['PATH']}")
+        env["DRY_RUN"] = "0"
+        proc = _bash(RAILS / "fold_live.sbatch", env)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "build and upload the year" in proc.stdout
+    assert "s2_build.py" not in proc.stdout
+
+
+def test_audit_smoke_audits_the_smoke_month_only():
+    out = _bash(RAILS / "audit_year.sbatch", _dry_env(SMOKE="1")).stdout
+    assert "--months 2017-07 " in out and "2017-08" not in out
 
 
 def test_fold_live_uploads_parts_before_live_with_force():

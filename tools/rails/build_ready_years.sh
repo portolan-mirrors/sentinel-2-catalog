@@ -22,6 +22,11 @@ QUEUED=""
 if command -v squeue >/dev/null 2>&1; then
   QUEUED=$(squeue -u "$USER" -h -o '%j' 2>/dev/null || true)
 fi
+# A build submitted by hand keeps the script's own name, s2c1-build, and
+# says nothing about its year; this script cannot skip that year.
+if printf '%s\n' "$QUEUED" | grep -qx "s2c1-build"; then
+  echo "warning: a job named s2c1-build (submitted by hand, year unknown) is queued or running; its year may be submitted twice"
+fi
 READY=()
 for Y in $(seq "$FIRST_YEAR" "$NOW_Y"); do
   if [ -s "$PUBLISH/$COLLECTION/year=$Y/items.parquet" ]; then echo "year=$Y: built"; continue; fi
