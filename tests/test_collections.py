@@ -37,8 +37,11 @@ def test_names_and_public_base():
 def test_c1_config():
     c = cols.get("sentinel-2-c1-l2a")
     assert c.tile_column == "_tile" and c.schema is s2c1_schema
-    assert c.zone_split is False and c.row_group_mode == "month_aligned"
-    assert c.row_group_size == 20_000 and c.live_zstd_level == 3
+    # Spec Amendment 1: tile-major, uniform groups near 6,000 rows.
+    assert c.zone_split is False and c.row_group_mode == "uniform"
+    assert c.sort_key == "_tile,datetime"
+    assert c.row_group_size == 6_000 and c.live_zstd_level == 3
+    assert cols.get(cols.DEFAULT).sort_key == "_month,s2:mgrs_tile,_hilbert"
     assert c.lookback_field == "created"
     assert c.bucket == "e84-earth-search-sentinel-data"
     assert c.key_root == "sentinel-2-c1-l2a/"

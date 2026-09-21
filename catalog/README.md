@@ -34,7 +34,11 @@ adds no items and drops none, so that gap is Earth Search's record, not an
 artifact of the mirroring.
 
 [`sentinel-2-l2a`](sentinel-2-l2a/collection.json) holds the item index and
-[`stats`](stats/collection.json) holds the MGRS aggregates. Check
+[`stats`](stats/collection.json) holds the MGRS aggregates. A second pair,
+[`sentinel-2-c1-l2a`](sentinel-2-c1-l2a/collection.json) and
+[`stats-c1`](stats-c1/collection.json), mirrors Earth Search's Sentinel-2
+Collection 1 index (ESA's reprocessing of the archive) the same way; its
+backfill is in progress, so it holds no published year yet. Check
 [`catalog.json`](catalog.json) for the current list of collections.
 
 ## License

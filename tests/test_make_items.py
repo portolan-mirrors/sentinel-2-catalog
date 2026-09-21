@@ -515,14 +515,18 @@ def test_c1_collection_json_comes_from_the_config():
     # The description names the tile column and the Collection 1 layout,
     # and says nothing about the first collection's zone parts.
     desc = coll["description"]
-    assert "`_tile`" in desc and "month, then MGRS tile, then Hilbert index" in desc
-    assert "20,000" in desc and "live.parquet" in desc
-    assert "z01-20" not in desc
+    assert "`_tile`" in desc
+    # Spec Amendment 1: tile-major sort, uniform groups near 6,000 rows.
+    assert "ordered by MGRS tile, then acquisition time" in desc
+    assert "one contiguous run" in desc
+    assert "uniform row groups of about 6,000 rows" in desc
+    assert "month-aligned" not in desc and "Hilbert" not in desc
+    assert "live.parquet" in desc and "z01-20" not in desc
     # The one mention of the first collection's tile column is the negation.
     assert desc.count("s2:mgrs_tile") == 1 and "no `s2:mgrs_tile`" in desc
     key_text = coll["partition:keys"][0]["description"]
     assert "s2:mgrs_tile" not in key_text and "z01-20" not in key_text
-    assert "20,000" in key_text
+    assert "uniform row groups of about 6,000 rows" in key_text
 
     # item_assets from the committed Collection 1 cache: the keys the first
     # collection's template lacks are here, the per-scene proj fields are not.

@@ -100,10 +100,15 @@ COLUMNS = [
     ("assets", "VARCHAR",
      "The upstream STAC assets object, verbatim, as a compact JSON string. "
      "Parse with json_extract or JSON.parse."),
-    ("_month", "TINYINT", "month(datetime); first sort key. Query helper, not STAC."),
+    ("_month", "TINYINT",
+     "month(datetime). Query helper, not STAC; not a sort key here (rows are "
+     "ordered (_tile, datetime))."),
     ("_hilbert", "UINTEGER",
-     "ST_Hilbert(geometry, world bounds); second sort key. Query helper, not STAC."),
-    ("_tile", "VARCHAR", "MGRS tile id from grid:code, e.g. 31UET. THE spatial join key."),
+     "ST_Hilbert(geometry, world bounds). Query helper, not STAC; not a sort "
+     "key here."),
+    ("_tile", "VARCHAR",
+     "MGRS tile id from grid:code, e.g. 31UET. THE spatial join key and the "
+     "first sort key; datetime is the second."),
     ("geometry", "GEOMETRY", "Scene footprint, CRS84."),
 ]
 

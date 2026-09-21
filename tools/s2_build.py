@@ -126,12 +126,16 @@ log, not inferred from a timeout.
 so every existing call is unchanged). The tile column, the sort key, the
 zone split, the row-group size and mode all come from the config. For
 `sentinel-2-c1-l2a` that means: the tile is `_tile`, every year sorts
-(_month, _tile, _hilbert), `--split zones` is refused (zone_split=False:
-a year is one items.parquet), row groups are month-aligned at 20,000 rows
-(see month_align), and the daily live build passes `--zstd-level 3`
+(_tile, datetime) -- tile-major, so one tile's year is one contiguous run
+and any tile window is one or two row groups (spec Amendment 1, issue #9)
+-- `--split zones` is refused (zone_split=False: a year is one
+items.parquet), row groups are uniform at a 6,000-row target (6,144 as
+DuckDB writes them), and the daily live build passes `--zstd-level 3`
 (config.live_zstd_level) because a live.parquet is rewritten every day and
 folded into the year within weeks, so nobody downloads it enough to earn
-the zstd-18 encode.
+the zstd-18 encode. The month-aligned writer (month_align) stays behind
+`--row-group-mode month_aligned` for experiments; it needs a month-major
+order, so that mode puts `_month` in front of the collection's key.
 """
 from __future__ import annotations
 
@@ -266,13 +270,15 @@ TILE_SORT_FROM = 2026
 
 
 def sort_key(year: int, config: CollectionConfig = DEFAULT_CONFIG) -> str:
-    """The gpio --sort column list for a year's parts. The first
-    collection's years before TILE_SORT_FROM keep the key they were
-    published with; a collection built after that lesson (Collection 1)
-    has no such history and sorts every year by tile."""
+    """The gpio sort column list for a year's parts: config.sort_key,
+    except that the first collection's years before TILE_SORT_FROM keep
+    the (_month, _hilbert) they were published with. Collection 1 has no
+    such history and sorts every year `_tile,datetime` (spec Amendment 1:
+    tile-major, so a tile's year is one contiguous run; gpio 1.5.0 sorts
+    on the TIMESTAMPTZ column directly)."""
     if config.id == cols.DEFAULT and year < TILE_SORT_FROM:
         return "_month,_hilbert"
-    return f"_month,{config.tile_column},_hilbert"
+    return config.sort_key
 
 
 def zone_parts_for(year: int, config: CollectionConfig = DEFAULT_CONFIG,
@@ -370,7 +376,8 @@ def gather(sources: list[str]) -> list[str]:
 
 
 # The columns the build computes rather than reads, at the position the
-# schema declares them: _month is the first sort key, _hilbert the last, and
+# schema declares them: _month and _hilbert are the first collection's sort
+# helpers (Collection 1 carries them too, sorted `_tile,datetime`), and
 # the geometry goes through untouched. Both schemas end (..., _month,
 # _hilbert, [_tile,] geometry): a reader's `SELECT * EXCLUDE (geometry),
 # geometry` round-trips, and the published column order is the schema's.
@@ -604,8 +611,11 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
     file exists (the disk then holds two copies of the part, not three:
     the sorted staging file and the dotfile month_align() writes),
     month_align() rewrites it as the dotfile at `zstd_level`, and the same
-    check and rename follow. `row_group_size` None means the collection's,
-    then ROW_GROUP.
+    check and rename follow. Groups cut on month boundaries need a
+    month-major order, so in that mode `_month` leads the sort key when
+    the collection's key does not start with it (Collection 1's
+    `_tile,datetime` becomes `_month,_tile,datetime`). `row_group_size`
+    None means the collection's, then ROW_GROUP.
     """
     name = final.name
     aligned = row_group_mode == "month_aligned"
@@ -617,6 +627,8 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
     gpio_level = STAGE_ZSTD_LEVEL if aligned else zstd_level
     groups_of = row_group_size or config.row_group_size or ROW_GROUP
     key = sort_key(year, config)
+    if aligned and key.split(",")[0] != "_month":
+        key = f"_month,{key}"
     t0 = time.monotonic()
     try:
         con.execute(f"SET memory_limit='{GPIO_HANDOFF}';")
@@ -910,10 +922,13 @@ def exclude_published_ids(con, staged: Path, urls: list[str], year: int,
     404 skips with a log line, anything else stops the build). The archive
     is read with DuckDB httpfs, projecting only `id` and
     `s2:generation_time` and filtering on `_month` to the months the staged
-    rows span: the parts are sorted (_month, ...) so the filter prunes on
-    row-group statistics and the read is a few range requests per part
-    rather than the part. `_month` is the same session-UTC month(datetime)
-    on both sides (see connect()).
+    rows span: the first collection's parts are sorted (_month, ...) so the
+    filter prunes on row-group statistics and the read is a few range
+    requests per part rather than the part. A tile-major part (Collection
+    1, `_tile,datetime`) has every month in nearly every group, so there
+    the filter is correct but prunes little: the read is the two projected
+    columns across the part. `_month` is the same session-UTC
+    month(datetime) on both sides (see connect()).
 
     The generation comparison is the year build's own dedupe rule (highest
     s2:generation_time wins, NULLS LAST) applied across the archive
@@ -1156,8 +1171,9 @@ def main() -> int:
     ap.add_argument("--row-group-mode", choices=["uniform", "month_aligned"],
                     help="uniform: gpio's fixed-size groups; month_aligned: "
                          "groups of at most --row-group-size rows that never "
-                         "span a change of _month (month_align). Default: "
-                         "the collection's")
+                         "span a change of _month (month_align; _month is "
+                         "put in front of the collection's sort key). "
+                         "Default: the collection's")
     ap.add_argument("--zstd-level", type=int, choices=range(1, 23),
                     metavar="1-22", default=ZSTD_LEVEL,
                     help=f"zstd level of the published part (default "

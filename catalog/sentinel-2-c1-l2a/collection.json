@@ -10,7 +10,7 @@
   ],
   "id": "sentinel-2-c1-l2a",
   "title": "Sentinel-2 Collection 1 L2A scenes (item index)",
-  "description": "The AWS Earth Search item index for Sentinel-2 Collection 1 L2A (ESA's reprocessing of the whole archive to one processing baseline), republished as one year-partitioned GeoParquet 2.0 table. The backfill is in progress and no year is published yet, so table:row_count is 0, partition:file_count is 0 and the temporal extent is the source's (its earliest scene is 2015-10-22); all three are measured from the published years at each publish. One row per scene, carrying the whole STAC item: footprint, acquisition time, MGRS tile, cloud cover, the scene-classification percentages, the viewing and sun angles, `created`/`updated`, and the complete upstream `assets` object as a JSON string. Every Cloud-Optimized GeoTIFF URL is therefore in the table -- no API call, no URL template to guess -- while the imagery itself stays in the `e84-earth-search-sentinel-data` bucket on AWS. Collection 1 items carry no `s2:mgrs_tile`: the tile is `grid:code` (`MGRS-31UET`), and the bare id (`31UET`) is the added `_tile` column, THE spatial join key. Rows in every part are ordered by month, then MGRS tile, then Hilbert index, so a reader prunes on both time and space, and one tile's month sits in a single row group. Every year is one items.parquet, whose row groups are cut on month boundaries at 20,000 rows or fewer -- a group never spans two months, so a month filter reads only that month's groups and each `_tile` sits in few of them. Any year may add live.parquet, the tail fetched daily since the last fold, which the periodic fold merges back into the year file. There is no zone= directory and no zone split: every part sits in year=YYYY/ and matches partition:glob. ESA's reprocessing is still running, so old years keep gaining scenes with recent `created` timestamps; the daily refresh looks back on `created`, not `datetime`, and appends what it finds to the year's live.parquet. Contains modified Copernicus Sentinel data. Read the [agent guide](AGENTS.md) before querying: `s2:dark_features_percentage` is NULL from processing baseline 05.11, `processing:software` and `assets` are JSON strings, not structs.",
+  "description": "The AWS Earth Search item index for Sentinel-2 Collection 1 L2A (ESA's reprocessing of the whole archive to one processing baseline), republished as one year-partitioned GeoParquet 2.0 table. The backfill is in progress and no year is published yet, so table:row_count is 0, partition:file_count is 0 and the temporal extent is the source's (its earliest scene is 2015-10-22); all three are measured from the published years at each publish. One row per scene, carrying the whole STAC item: footprint, acquisition time, MGRS tile, cloud cover, the scene-classification percentages, the viewing and sun angles, `created`/`updated`, and the complete upstream `assets` object as a JSON string. Every Cloud-Optimized GeoTIFF URL is therefore in the table -- no API call, no URL template to guess -- while the imagery itself stays in the `e84-earth-search-sentinel-data` bucket on AWS. Collection 1 items carry no `s2:mgrs_tile`: the tile is `grid:code` (`MGRS-31UET`), and the bare id (`31UET`) is the added `_tile` column, THE spatial join key. Rows in every part are ordered by MGRS tile, then acquisition time, so one tile's year is one contiguous run and a tile-and-window query reads one or two row groups. Every year is one items.parquet, in uniform row groups of about 6,000 rows, so a tile's run is a small number of groups and a tile lookup reads only those. Any year may add live.parquet, the tail fetched daily since the last fold, which the periodic fold merges back into the year file. There is no zone= directory and no zone split: every part sits in year=YYYY/ and matches partition:glob. ESA's reprocessing is still running, so old years keep gaining scenes with recent `created` timestamps; the daily refresh looks back on `created`, not `datetime`, and appends what it finds to the year's live.parquet. Contains modified Copernicus Sentinel data. Read the [agent guide](AGENTS.md) before querying: `s2:dark_features_percentage` is NULL from processing baseline 05.11, `processing:software` and `assets` are JSON strings, not structs.",
   "license": "CC-BY-SA-3.0-IGO",
   "keywords": [
     "sentinel-2",
@@ -24,7 +24,7 @@
     "cloud cover",
     "mgrs"
   ],
-  "updated": "2026-09-21T19:39:23Z",
+  "updated": "2026-09-21T20:02:50Z",
   "providers": [
     {
       "name": "European Space Agency (ESA)",
@@ -79,7 +79,7 @@
     {
       "name": "year",
       "type": "int32",
-      "description": "Year of acquisition (UTC). Every year is one items.parquet, whose row groups are cut on month boundaries at 20,000 rows or fewer -- a group never spans two months, so a month filter reads only that month's groups and each `_tile` sits in few of them. Any year may add live.parquet, the tail fetched daily since the last fold, which the periodic fold merges back into the year file. There is no zone= directory and no zone split: every part sits in year=YYYY/ and matches partition:glob."
+      "description": "Year of acquisition (UTC). Every year is one items.parquet, in uniform row groups of about 6,000 rows, so a tile's run is a small number of groups and a tile lookup reads only those. Any year may add live.parquet, the tail fetched daily since the last fold, which the periodic fold merges back into the year file. There is no zone= directory and no zone split: every part sits in year=YYYY/ and matches partition:glob."
     }
   ],
   "partition:file_count": 0,
@@ -355,17 +355,17 @@
     {
       "name": "_month",
       "type": "int8",
-      "description": "month(datetime); first sort key. Query helper, not STAC."
+      "description": "month(datetime). Query helper, not STAC; not a sort key here (rows are ordered (_tile, datetime))."
     },
     {
       "name": "_hilbert",
       "type": "uint32",
-      "description": "ST_Hilbert(geometry, world bounds); second sort key. Query helper, not STAC."
+      "description": "ST_Hilbert(geometry, world bounds). Query helper, not STAC; not a sort key here."
     },
     {
       "name": "_tile",
       "type": "string",
-      "description": "MGRS tile id from grid:code, e.g. 31UET. THE spatial join key."
+      "description": "MGRS tile id from grid:code, e.g. 31UET. THE spatial join key and the first sort key; datetime is the second."
     },
     {
       "name": "geometry",

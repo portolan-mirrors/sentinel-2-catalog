@@ -146,17 +146,22 @@ def zone_parts_text() -> str:
 
 def year_file_text(config: CollectionConfig) -> str:
     """The layout of a collection that never zone-splits, in prose, from
-    the config that defines it: one items.parquet per year, row groups cut
-    on month boundaries at the config's target, and the tail."""
+    the config that defines it: one items.parquet per year, the row-group
+    rule of its mode at its target, and the tail."""
     target = config.row_group_size or ROW_GROUP
-    return (f"Every year is one items.parquet, whose row groups are cut on "
-            f"month boundaries at {target:,} rows or fewer -- a group never "
-            f"spans two months, so a month filter reads only that month's "
-            f"groups and each `{config.tile_column}` sits in few of them. Any "
-            f"year may add live.parquet, the tail fetched daily since the "
-            f"last fold, which the periodic fold merges back into the year "
-            f"file. There is no zone= directory and no zone split: every "
-            f"part sits in year=YYYY/ and matches partition:glob.")
+    if config.row_group_mode == "month_aligned":
+        groups = (f"whose row groups are cut on month boundaries at "
+                  f"{target:,} rows or fewer -- a group never spans two "
+                  f"months, so a month filter reads only that month's groups")
+    else:
+        groups = (f"in uniform row groups of about {target:,} rows, so a "
+                  f"tile's run is a small number of groups and a tile lookup "
+                  f"reads only those")
+    return (f"Every year is one items.parquet, {groups}. Any year may add "
+            f"live.parquet, the tail fetched daily since the last fold, "
+            f"which the periodic fold merges back into the year file. There "
+            f"is no zone= directory and no zone split: every part sits in "
+            f"year=YYYY/ and matches partition:glob.")
 
 
 def layout_text(config: CollectionConfig = DEFAULT_CONFIG) -> str:
@@ -167,21 +172,27 @@ def layout_text(config: CollectionConfig = DEFAULT_CONFIG) -> str:
 
 # The sort keys as a reader knows them (s2_build.sort_key names the columns).
 _SORT_WORDS = {"_month": "month", "s2:mgrs_tile": "MGRS tile",
-               "_tile": "MGRS tile", "_hilbert": "Hilbert index"}
+               "_tile": "MGRS tile", "datetime": "acquisition time",
+               "_hilbert": "Hilbert index"}
 
 
 def sort_order_text(config: CollectionConfig = DEFAULT_CONFIG) -> str:
     """The row order of the parts, in prose, from s2_build.sort_key: the
     first collection's parts published before TILE_SORT_FROM are
     (_month, _hilbert), parts from that year on put the tile between them;
-    a collection whose every year sorts the same way gets one sentence.
-    Derived per vintage so this text cannot say one order when the builder
-    writes two."""
+    a collection whose every year sorts the same way gets one sentence,
+    worded for a tile-major key (Collection 1's `_tile,datetime`) or a
+    month-major one. Derived per vintage so this text cannot say one
+    order when the builder writes two."""
     def words(year: int) -> str:
         keys = [_SORT_WORDS[k] for k in sort_key(year, config).split(",")]
         return ", then ".join(keys)
     before, after = words(TILE_SORT_FROM - 1), words(TILE_SORT_FROM)
     if before == after:
+        if sort_key(TILE_SORT_FROM, config).startswith(config.tile_column):
+            return (f"Rows in every part are ordered by {after}, so one "
+                    f"tile's year is one contiguous run and a tile-and-"
+                    f"window query reads one or two row groups.")
         return (f"Rows in every part are ordered by {after}, so a reader "
                 f"prunes on both time and space, and one tile's month sits "
                 f"in a single row group.")

@@ -32,7 +32,6 @@ SELECT id, datetime, "eo:cloud_cover", thumbnail_url,
        json_extract_string(assets, '$.visual.href') AS visual_cog
 FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=2021/items.parquet')
 WHERE _tile = '31UFU'
-  AND _month BETWEEN 8 AND 10
   AND datetime BETWEEN '2021-08-01' AND '2021-10-15 23:59:59'
   AND "eo:cloud_cover" < 10
 ORDER BY "eo:cloud_cover", id LIMIT 20;
@@ -44,11 +43,11 @@ any other key; the [agent guide](AGENTS.md) lists them all.
 
 Three things make that query cheap. A year names the file (`year=2021/items.parquet`;
 there is one per year), so it opens one file. Rows inside it are sorted by
-`(_month, _tile, _hilbert)` and the row groups are cut on month boundaries,
-so the month filter skips every other month's groups and the tile filter
-lands on the one or two groups that hold `31UFU` for those months. And the
-whole answer comes from HTTP range requests against the Parquet file: there
-is no API in front of this, so there is nothing to rate limit.
+`(_tile, datetime)`, so `31UFU`'s whole year is one contiguous run of rows
+and the tile filter lands on the one or two row groups that hold it; the
+date window then trims that run. And the whole answer comes from HTTP range
+requests against the Parquet file: there is no API in front of this, so
+there is nothing to rate limit.
 
 The collection's partition glob, `year=*/*.parquet`, is a Hive layout:
 `hive_partitioning = true` exposes `year` as a column that is not stored in
@@ -91,15 +90,21 @@ on — see Coverage below for how many, and how that keeps changing.
 
 A year's archive is one `items.parquet`, whatever its size: there is no zone
 split here, because this collection is built on a compute cluster rather
-than inside a CI job. Rows are sorted by `(_month, _tile, _hilbert)` — month
-first, so a month filter prunes row groups; tile second, so one tile's month
-sits in a single row group; Hilbert position last, so each row group's
-bounding box stays tight and a bbox filter prunes too. Row groups are cut
-on `_month` boundaries at 20,000 rows or fewer: a group never spans two
-months (a month of 45,000 rows becomes groups of 20,000 / 20,000 / 5,000),
-so the groups a month filter reads are exactly that month's. The files are
-GeoParquet 2.0 (native `GEOMETRY` column with per-row-group geo statistics),
-zstd level 18.
+than inside a CI job. Rows are sorted by `(_tile, datetime)` — tile-major,
+so one tile's year is one contiguous run in acquisition order, and any
+tile-and-window query reads the one or two row groups that hold the run
+rather than a group per month. Row groups are uniform at a target of 6,000
+rows (6,144 as DuckDB writes them), small enough that a tile lookup fetches
+little beyond its own rows. This is the layout the search-latency
+experiments behind
+[issue #9](https://github.com/portolan-mirrors/sentinel-2-catalog/issues/9)
+measured as the fastest for tile-window searches (the month-major sort of
+the older `sentinel-2-l2a` parts scatters a tile's year across twelve month
+sections, so a three-month window admits six or seven row groups where
+this layout admits one or two). `_month` and `_hilbert` are still columns, so a month filter or
+a Hilbert-range filter still works; they just no longer set the order. The
+files are GeoParquet 2.0 (native `GEOMETRY` column with per-row-group geo
+statistics), zstd level 18.
 
 Any year — not only the current one — may also carry `live.parquet`. ESA's
 reprocessing is still running, so scenes from old years keep appearing with
@@ -108,7 +113,7 @@ recent `created` timestamps; the daily refresh looks back on `created`, not
 scene belongs to, at zstd level 3 so the daily write stays cheap. A live file
 can hold a whole year's worth of late arrivals. Every month or two, and at
 year end, a fold job merges each live file into its year's `items.parquet`
-(re-sorted, month-aligned, zstd 18) and empties it. Between folds, a glob over
+(re-sorted by tile and time, zstd 18) and empties it. Between folds, a glob over
 `year=YYYY/*.parquet` reads the archive plus the tail; the two do not overlap
 except for a reprocessed scene, which keeps its id with a newer
 `s2:generation_time` — dedupe on `id` keeping the highest generation time

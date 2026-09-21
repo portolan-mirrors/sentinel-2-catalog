@@ -1418,7 +1418,8 @@ def _month_groups(con, part):
 def test_c1_config_shapes_the_build_interfaces():
     """Every per-collection decision the build makes is a function of the
     config, and the first collection's answers are the old ones."""
-    assert sort_key(2017, C1) == sort_key(2026, C1) == "_month,_tile,_hilbert"
+    # Spec Amendment 1: tile-major for every Collection 1 year.
+    assert sort_key(2017, C1) == sort_key(2026, C1) == "_tile,datetime"
     assert sort_key(2017) == "_month,_hilbert"
     assert sort_key(2026) == "_month,s2:mgrs_tile,_hilbert"
     for year in (2017, ZONE_SPLIT_FROM, ZONE_SPLIT_8_FROM, 2026):
@@ -1436,16 +1437,26 @@ def test_c1_config_shapes_the_build_interfaces():
     assert plan["include"] == [{"year": 2026, "part": "items", "exists": True}]
 
 
-def test_c1_build_sorts_by_month_tile_hilbert_and_writes_one_file():
-    """A C1 year is one items.parquet sorted (_month, _tile, _hilbert)
-    whatever the year, its row groups month-aligned at the config's 20,000
-    (here every month fits one group), no zone part anywhere."""
+def _tile_groups(con, part):
+    """(min, max, rows) of `_tile` per row group, in file order."""
+    return con.execute(f"""
+        SELECT stats_min, stats_max, num_values
+        FROM parquet_metadata('{part}')
+        WHERE path_in_schema = '_tile' ORDER BY row_group_id""").fetchall()
+
+
+def test_c1_build_sorts_tile_major_and_writes_one_file():
+    """A C1 year is one items.parquet sorted (_tile, datetime) whatever
+    the year (spec Amendment 1), in uniform row groups at the config's
+    6,000 target (DuckDB fills them in 2,048-row steps, so 6,144), no
+    zone part anywhere and no month alignment. Each tile's year is one
+    contiguous run, so a tile spans at most a couple of groups."""
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
     with tempfile.TemporaryDirectory() as td:
         chunks = Path(td) / "chunks" / "api"
         chunks.mkdir(parents=True)
-        _mk_c1_chunk(con, chunks / "a.parquet", rows=6_000, year=2019)
+        _mk_c1_chunk(con, chunks / "a.parquet", rows=15_000, year=2019)
         out = Path(td) / "publish"
         proc = _build_c1(out, chunks, years="2019")
         assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -1453,15 +1464,20 @@ def test_c1_build_sorts_by_month_tile_hilbert_and_writes_one_file():
         assert [p.name for p in year_dir.iterdir()] == ["items.parquet"]
         f = year_dir / "items.parquet"
         keys = con.execute(
-            f"SELECT _month, _tile, _hilbert FROM read_parquet('{f}')").fetchall()
-        assert len(keys) == 6_000 and keys == sorted(keys)
-        assert len({k[0] for k in keys}) == 12 and len({k[1] for k in keys}) == 3
-        assert "sorted (_month,_tile,_hilbert)" in proc.stdout
-        assert "12 month-aligned row groups (<= 20,000 rows, 12 month(s))" \
-            in proc.stdout
-        groups = _month_groups(con, f)
-        assert [(lo, hi) for lo, hi, _ in groups] == [(m, m) for m in range(1, 13)]
-        assert sum(n for _, _, n in groups) == 6_000
+            f"SELECT _tile, datetime FROM read_parquet('{f}')").fetchall()
+        assert len(keys) == 15_000 and keys == sorted(keys)
+        assert len({k[0] for k in keys}) == 3
+        assert "sorted (_tile,datetime)" in proc.stdout
+        assert "month-aligned" not in proc.stdout
+        groups = _tile_groups(con, f)
+        assert [n for _, _, n in groups] == [6_144, 6_144, 2_712]
+        # 5,000 rows per tile: a tile's run starts in one group and ends in
+        # the next, never in a third.
+        for tile in ("31UET", "32UMV", "33UUP"):
+            assert sum(1 for lo, hi, _ in groups if lo <= tile <= hi) <= 2
+        # _month and _hilbert are still columns, just not the order.
+        assert con.execute(f"SELECT count(DISTINCT _month), count(_hilbert) "
+                           f"FROM read_parquet('{f}')").fetchone() == (12, 15_000)
         chk = subprocess.run(["gpio", "check", "all", str(f)],
                              capture_output=True, text=True)
         assert chk.returncode == 0, chk.stdout + chk.stderr
@@ -1493,9 +1509,9 @@ def test_c1_refuses_split_zones():
 
 
 def test_build_year_in_process_takes_the_row_group_size_from_the_config():
-    """build_year(config=C1) without a CLI aligns at the collection's
-    20,000 (6,000 rows of one month: one group, not two of 5,000), and an
-    explicit row_group_size wins over it."""
+    """build_year(config=C1) without a CLI groups at the collection's
+    6,000 (6,000 rows: one group, not two of 5,000), and an explicit
+    row_group_size wins over it (2,000 -> DuckDB's 2,048-row steps)."""
     from s2_build import build_year, connect
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
@@ -1506,19 +1522,22 @@ def test_build_year_in_process_takes_the_row_group_size_from_the_config():
         bcon = connect("1GB", Path(td))
         files = [str(chunks / "a.parquet")]
         build_year(bcon, files, 2026, Path(td) / "default", config=C1)
-        assert _month_groups(con, Path(td) / "default/year=2026/items.parquet") \
-            == [(1, 1, 6_000)]
+        assert [n for _, _, n in _tile_groups(
+            con, Path(td) / "default/year=2026/items.parquet")] == [6_000]
         build_year(bcon, files, 2026, Path(td) / "small", config=C1,
                    row_group_size=2_000)
-        assert _month_groups(con, Path(td) / "small/year=2026/items.parquet") \
-            == [(1, 1, 2_000)] * 3
+        assert [n for _, _, n in _tile_groups(
+            con, Path(td) / "small/year=2026/items.parquet")] == \
+            [2_048, 2_048, 1_904]
 
 
 def test_month_aligned_row_groups_never_span_a_month():
     """3 months x 45,000 rows at a 20,000 target: 20k, 20k, 5k per month,
     nine groups, every group's _month statistics a single value -- so a
-    month filter prunes to exactly that month's groups. The uniform mode
-    on the same rows straddles the month boundaries (the control)."""
+    month filter prunes to exactly that month's groups. The mode puts
+    _month in front of the collection's tile-major key, because groups
+    cut on months need a month-major order. The uniform mode on the same
+    rows straddles the month boundaries (the control)."""
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
     with tempfile.TemporaryDirectory() as td:
@@ -1541,8 +1560,9 @@ def test_month_aligned_row_groups_never_span_a_month():
                           for n in (20_000, 20_000, 5_000)]
         assert "9 month-aligned row groups (<= 20,000 rows, 3 month(s))" \
             in proc.stdout
+        assert "sorted (_month,_tile,datetime)" in proc.stdout
         keys = con.execute(
-            f"SELECT _month, _tile, _hilbert FROM read_parquet('{f}')").fetchall()
+            f"SELECT _month, _tile, datetime FROM read_parquet('{f}')").fetchall()
         assert keys == sorted(keys) and len(keys) == 135_000
         # The staging file gpio wrote is gone; only the part remains.
         assert [p.name for p in f.parent.iterdir()] == ["items.parquet"]
@@ -1580,9 +1600,10 @@ def test_month_aligned_keeps_geoparquet_2():
     """The month-aligned part is the gpio-written GeoParquet 2.0 part,
     regrouped: same `geo` metadata (version 2.0.0), same native GEOMETRY
     logical type with the same CRS, same DuckDB types for every column
-    (nested ones included), same rows in the same order, and geo
-    statistics on every row group -- measured against a uniform build of
-    the same rows, which gpio wrote directly."""
+    (nested ones included), the same rows (in month-major order, since
+    that mode leads with _month; the uniform build is tile-major), and
+    geo statistics on every row group -- measured against a uniform build
+    of the same rows, which gpio wrote directly."""
     import pyarrow.parquet as pq
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
@@ -1629,7 +1650,13 @@ def test_month_aligned_keeps_geoparquet_2():
             return con.execute(f"""
                 SELECT * EXCLUDE (geometry), ST_AsText(geometry)
                 FROM read_parquet('{p}', hive_partitioning=false)""").fetchall()
-        assert rows(aligned) == rows(gpio)
+        assert sorted(map(str, rows(aligned))) == sorted(map(str, rows(gpio)))
+        assert len(rows(aligned)) == 3_000
+        for part, columns in ((aligned, "_month, _tile, datetime"),
+                              (gpio, "_tile, datetime")):
+            keys = con.execute(
+                f"SELECT {columns} FROM read_parquet('{part}')").fetchall()
+            assert keys == sorted(keys), part
 
         meta = pq.ParquetFile(aligned).metadata
         rg0 = meta.row_group(0)
@@ -1681,8 +1708,9 @@ def test_month_align_returns_the_groups_and_refuses_a_non_2_0_source():
 
 def test_live_zstd_level_flag_reaches_the_file():
     """--zstd-level is what the published part is written with, on both
-    row-group modes: the C1 live build passes 3 (config.live_zstd_level)
-    and gets a bigger file than the same rows at 18, still ZSTD."""
+    row-group modes: the C1 live build (uniform, the config's mode) passes
+    3 (config.live_zstd_level) and gets a bigger file than the same rows
+    at 18, still ZSTD; the month-aligned mode takes the flag too."""
     con = duckdb.connect()
     con.execute("INSTALL spatial; LOAD spatial;")
     assert C1.live_zstd_level == 3
@@ -1703,13 +1731,15 @@ def test_live_zstd_level_flag_reaches_the_file():
             assert con.execute(
                 "SELECT DISTINCT compression FROM parquet_metadata(?)",
                 [str(part)]).fetchall() == [("ZSTD",)]
-            assert all(lo == hi for lo, hi, _ in _month_groups(con, part))
+            assert "month-aligned" not in proc.stdout
         assert sizes[18] < sizes[3], sizes
-        # Uniform mode takes the flag too (the first collection's live).
-        out = Path(td) / "uniform3"
+        # The month-aligned mode takes the flag too.
+        out = Path(td) / "aligned3"
         proc = _build_c1(out, chunks, ["--name", "live.parquet", "--zstd-level",
-                                       "3", "--row-group-mode", "uniform"],
+                                       "3", "--row-group-mode", "month_aligned"],
                          level=LEVEL_HIGH)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "written zstd-3" in proc.stdout
-        assert "month-aligned" not in proc.stdout
+        assert "month-aligned row groups" in proc.stdout
+        assert all(lo == hi for lo, hi, _ in _month_groups(
+            con, out / "year=2026" / "live.parquet"))

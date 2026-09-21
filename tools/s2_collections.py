@@ -35,6 +35,7 @@ class CollectionConfig:
     catalog_dir: str
     stats_dir: str
     zone_split: bool
+    sort_key: str               # gpio sort columns of a year's parts (s2_build.sort_key)
     row_group_mode: str         # "uniform" | "month_aligned"
     row_group_size: int | None  # None: s2_build falls back to its ROW_GROUP
     live_zstd_level: int
@@ -56,7 +57,10 @@ _FIRST = CollectionConfig(
     inventory_bucket="sentinel-cogs-inventory",
     inventory_prefix="sentinel-cogs/sentinel-cogs/hive/",
     catalog_dir="sentinel-2-l2a", stats_dir="stats",
-    zone_split=True, row_group_mode="uniform",
+    zone_split=True,
+    # The key of parts from s2_build.TILE_SORT_FROM; earlier vintages keep
+    # (_month, _hilbert) -- sort_key() applies that rule for this one.
+    sort_key="_month,s2:mgrs_tile,_hilbert", row_group_mode="uniform",
     # s2_build.ROW_GROUP is the single source; None means "use it".
     row_group_size=None,
     live_zstd_level=18, lookback_field="datetime")
@@ -74,7 +78,12 @@ _C1 = CollectionConfig(
     # daily since 2024-04-02, pointing at Parquet data files (not CSV).
     inventory_prefix="e84-earth-search-sentinel-data/primary/hive/",
     catalog_dir="sentinel-2-c1-l2a", stats_dir="stats-c1",
-    zone_split=False, row_group_mode="month_aligned", row_group_size=20_000,
+    zone_split=False,
+    # Spec Amendment 1 (issue #9): tile-major, so one tile's year is one
+    # contiguous run and any tile window is one or two row groups; uniform
+    # groups near 6,000 rows (DuckDB fills them in 2,048-row steps, so
+    # 6,144). The month-aligned writer stays behind --row-group-mode.
+    sort_key="_tile,datetime", row_group_mode="uniform", row_group_size=6_000,
     live_zstd_level=3, lookback_field="created")
 
 _ALL = {c.id: c for c in (_FIRST, _C1)}

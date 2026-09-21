@@ -64,11 +64,14 @@ read names the file (below).
 Filter in this order. Each step removes more data than the next one can.
 
 1. `year IN (…)` — partition pruning, skips whole files.
-2. `_tile = '31UFU'` — the spatial join key, and the cheapest spatial
-   filter there is. A tile id is stable for the life of the mission.
-3. `_month = 8` or a `datetime` range — rows are sorted by month first and
-   row groups never span a month, so a month filter reads only that month's
-   groups.
+2. `_tile = '31UFU'` — the spatial join key, the first sort key, and the
+   cheapest spatial filter there is: a tile's year is one contiguous run,
+   so this filter prunes to the one or two row groups that hold it. A tile
+   id is stable for the life of the mission.
+3. A `datetime` range — the second sort key, so it trims the tile's run;
+   on its own (no tile) it prunes nothing, because every month is in
+   nearly every row group. `_month` still works as a filter, with the same
+   caveat.
 4. `"eo:cloud_cover" < 10` — the usual last cut.
 
 ```sql
@@ -79,7 +82,7 @@ SELECT id, datetime, "eo:cloud_cover",
        json_extract_string(assets, '$.visual.href') AS visual_cog
 FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=2021/items.parquet')
 WHERE _tile = '31UFU'
-  AND _month BETWEEN 8 AND 10
+  AND datetime BETWEEN '2021-08-01' AND '2021-10-31 23:59:59'
   AND "eo:cloud_cover" < 10
 ORDER BY "eo:cloud_cover", id
 LIMIT 20;
@@ -88,13 +91,18 @@ LIMIT 20;
 Column names with a colon are not identifiers. Quote them: `"eo:cloud_cover"`,
 not `eo:cloud_cover`. `_tile`, `_month` and `_hilbert` need no quotes.
 
-**Row groups.** Every file is sorted `(_month, _tile, _hilbert)` and its row
-groups are cut on `_month` boundaries at 20,000 rows or fewer (a month of
-45,000 rows is groups of 20,000 / 20,000 / 5,000), so a month filter touches
-exactly that month's groups and a tile-month lands in one or two of them:
-one range request each. A whole-year query for one tile reads at most about
-a dozen groups. `_hilbert` is the tiebreak inside a tile, so a bbox filter
-inside a tile keeps its locality too.
+**Row groups.** Every file is sorted `(_tile, datetime)` — tile-major — in
+uniform row groups at a target of 6,000 rows (6,144 as DuckDB writes them).
+One tile's year is a single contiguous run in acquisition order, so any
+tile-and-window query admits the one or two groups that hold the run: one
+range request each, a few hundred KB, whatever the window. This is the
+layout the search-latency experiments behind issue #9 measured as fastest
+for tile-window searches; the month-major order of the older
+`sentinel-2-l2a` parts scatters a tile's year across its twelve month
+sections and admits a group per month instead. A month filter alone does
+not prune here (every month is in nearly every group), and a bbox filter
+inside a tile has no Hilbert locality to lean on; both are correct, just
+not cheap. Lead with the tile.
 
 Use an `ST_Intersects` filter on `geometry` when you have a real polygon and no
 tile id. It works, and it is slower than the tile filter, because it has to
@@ -169,9 +177,9 @@ say on its own.
 | `processing:software` | string | The upstream processing:software object (name -> version), verbatim, as a compact JSON string. |
 | `earthsearch:payload_id` | string | Earth Search ingest payload id. |
 | `assets` | string | The upstream STAC assets object, verbatim, as a compact JSON string. Parse with json_extract or JSON.parse. |
-| `_month` | int8 | month(datetime); first sort key. Query helper, not STAC. |
-| `_hilbert` | uint32 | ST_Hilbert(geometry, world bounds); second sort key. Query helper, not STAC. |
-| `_tile` | string | MGRS tile id from grid:code, e.g. 31UET. THE spatial join key. |
+| `_month` | int8 | month(datetime). Query helper, not STAC; not a sort key here (rows are ordered (_tile, datetime)). |
+| `_hilbert` | uint32 | ST_Hilbert(geometry, world bounds). Query helper, not STAC; not a sort key here. |
+| `_tile` | string | MGRS tile id from grid:code, e.g. 31UET. THE spatial join key and the first sort key; datetime is the second. |
 | `geometry` | geometry | Scene footprint, CRS84. |
 
 **Spatial.** `geometry` is the scene footprint in CRS84. `bbox` is the same
@@ -192,10 +200,13 @@ scenes arrive with an old `datetime` and a new `created`.
 **Three added columns, and they are helpers, not STAC.** They exist so that
 readers can prune and join:
 
-- `_month` — `month(datetime)`, 1 to 12. The first sort key, and the row
-  group boundary.
-- `_tile` — the MGRS tile id, above. The second sort key.
-- `_hilbert` — `ST_Hilbert(geometry, world bounds)`. The last sort key.
+- `_tile` — the MGRS tile id, above. The first sort key; `datetime` (an
+  upstream column) is the second, and together they are the whole order.
+- `_month` — `month(datetime)`, 1 to 12. A filter convenience only; not a
+  sort key in this collection (it is the first sort key in
+  `sentinel-2-l2a`, which is why the column is kept with the same meaning).
+- `_hilbert` — `ST_Hilbert(geometry, world bounds)`. Kept for parity with
+  `sentinel-2-l2a`; not a sort key here.
 
 Nothing upstream publishes these three columns. Do not pass them on as STAC
 properties, and do not treat `_hilbert` as meaningful on its own — it is a
