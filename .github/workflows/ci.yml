@@ -22,13 +22,16 @@ jobs:
       # is created and every repo made from it inherits the stale version. A
       # floor takes each new 0.1.x release and still refuses a rashid that does
       # not carry the rules tests/test_conformance.py asserts. The gate checks
-      # the same range at run time, so a local rashid cannot be older.
+      # the same range at run time, so a local rashid cannot be older. The
+      # floor is the one the publishing workflows install (refresh-daily,
+      # consolidate-month, publish-backfill, publish-stats), so CI and a
+      # publish validate with the same rashid.
       #
       # stac-check stays unpinned on purpose. The stac-check exemption in
       # docs/conformance.md expires when the upstream crash stops. That only
       # happens if CI takes each new release.
       - name: Install the validators
-        run: python -m pip install 'rashid>=0.1.5,<0.2.0' stac-check
+        run: python -m pip install 'rashid>=0.1.8,<0.2.0' stac-check
 
       - name: Lint the tooling
         run: |

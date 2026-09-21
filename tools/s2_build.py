@@ -111,8 +111,11 @@ The part lands through a temporary name plus os.replace(): gpio writes
 `.parquet`, because `gpio check` sniffs the extension), `gpio check all`
 gates it there, and only then does the rename put it on `items.parquet` in
 one atomic step. So a killed build, or a part that failed its check, never
-leaves anything at a final name that a resume's exists() check downstream
-would trust -- the same protection copy_ndjson_to_parquet() gives chunk
+leaves a file at a final name: nothing under year=YYYY/*.parquet is ever a
+half-written or unchecked part, which is what --on-part-done, the safety
+upload in publish-backfill.yml and consolidate-month's `test -f` rely on.
+(A resume does not look at local files at all: --skip-existing-url asks
+the bucket.) The same protection copy_ndjson_to_parquet() gives chunk
 files.
 
 Every phase prints a timestamped line with rows, bytes and seconds. The 2017
@@ -138,13 +141,13 @@ from pathlib import Path
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from s2_fetch import UA as _FETCH_UA, with_retries
-from s2_schema import COLUMNS
+from s2_fetch import with_retries
+from s2_schema import COLUMNS, USER_AGENT
 
 # The same client name every other tool here sends (Source Cooperative's CDN
 # answers 403 to Python-urllib's default); s2_fetch's copy carries a POST
 # Content-Type that a HEAD has no use for.
-UA = {"User-Agent": _FETCH_UA["User-Agent"]}
+UA = {"User-Agent": USER_AGENT}
 
 # Row-group size is the unit of read amplification for a remote lookup: a
 # tile-and-month query fetches every row group that might hold a match,
@@ -346,8 +349,10 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
     gpio writes `.<stem>.tmp.parquet`, `gpio check all` runs on that, and
     only a part that passed is os.replace()d onto `<name>` in one atomic
     rename -- so neither a killed build nor a part that failed its check
-    leaves anything at the final name that a resume's exists() check
-    downstream would trust. --write-memory needs gpio >= 1.4; on 1.3.0 it
+    leaves a file at the final name, and every `*.parquet` a caller finds
+    under the year directory (the --on-part-done upload, the safety
+    upload, consolidate-month's `test -f`) is a checked part; the dotfile
+    is what upload_data's dotfile rule skips. --write-memory needs gpio >= 1.4; on 1.3.0 it
     was silently dropped and the write self-picked 50% of available RAM.
     The DuckDB limit drops to GPIO_HANDOFF for the duration so the two
     processes are not bidding for the same RAM.

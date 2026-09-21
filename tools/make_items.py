@@ -64,6 +64,7 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from s2_build import ZONE_PARTS, ZONE_PARTS_8  # noqa: E402
+from s2_schema import USER_AGENT  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -72,8 +73,7 @@ PUBLIC = "https://data.source.coop/portolan-mirrors/sentinel-2-catalog"
 # Source Cooperative's CDN answers 403 to the default Python-urllib agent, so
 # every request here names itself. Without this a HEAD looks like a missing
 # file rather than a rejected client.
-UA = {"User-Agent": "sentinel-2-catalog-tools/1.0 "
-                    "(+https://github.com/portolan-mirrors/sentinel-2-catalog)"}
+UA = {"User-Agent": USER_AGENT}
 
 # Every part name a year can hold, in the order they are advertised:
 # (asset key, file name, title template, roles). `items.parquet` is the

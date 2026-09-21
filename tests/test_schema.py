@@ -7,7 +7,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
-from s2_schema import COLUMNS, SELECT_LIST
+from s2_schema import COLUMNS, USER_AGENT
 
 
 def test_schema_shape():
@@ -16,7 +16,7 @@ def test_schema_shape():
     assert ("_hilbert", "UINTEGER") == COLUMNS[-2][:2]
     assert ("_month", "TINYINT") == COLUMNS[-3][:2]
     assert COLUMNS[-4][0] == "assets"
-    assert SELECT_LIST.split(", ")[0] == '"thumbnail_url"'
+    assert USER_AGENT.startswith("sentinel-2-catalog-tools/")
 
 
 def test_live_assets_resolve():

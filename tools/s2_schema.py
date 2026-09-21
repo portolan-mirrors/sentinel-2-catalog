@@ -70,4 +70,10 @@ COLUMNS = [
     ("geometry", "GEOMETRY", "Scene footprint, CRS84."),
 ]
 
-SELECT_LIST = ", ".join(f'"{name}"' for name, _, _ in COLUMNS)
+# The client name every tool here sends. Source Cooperative's CDN answers
+# 403 to Python-urllib's default agent, so a request without this looks like
+# a missing file rather than a rejected client. One constant, imported by
+# s2_fetch, s2_build, make_items and upload_part; this module has no
+# dependencies, so upload_part can import it without pulling duckdb in.
+USER_AGENT = ("sentinel-2-catalog-tools/1.0 "
+              "(+https://github.com/portolan-mirrors/sentinel-2-catalog)")

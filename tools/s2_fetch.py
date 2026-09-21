@@ -33,13 +33,11 @@ from pathlib import Path
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from s2_schema import COLUMNS
+from s2_schema import COLUMNS, USER_AGENT
 
 API = "https://earth-search.aws.element84.com/v1/search"
 PAGE = 200
-UA = {"User-Agent": "sentinel-2-catalog-tools/1.0 "
-      "(+https://github.com/portolan-mirrors/sentinel-2-catalog)",
-      "Content-Type": "application/json"}
+UA = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
 DATA_COLUMNS = [c for c in COLUMNS if c[0] not in ("_month", "_hilbert")]
 _REL_ORBIT = re.compile(r"_R(\d{3})_")
 
