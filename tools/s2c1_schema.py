@@ -32,9 +32,11 @@ from __future__ import annotations
 import collections
 import json
 
-from s2_schema import USER_AGENT  # noqa: F401  re-exported: one client name
+import s2_schema
 
-_LINKS = 'STRUCT(href VARCHAR, rel VARCHAR, title VARCHAR, "type" VARCHAR)[]'
+USER_AGENT = s2_schema.USER_AGENT   # re-exported: one client name for every tool
+
+_LINKS ='STRUCT(href VARCHAR, rel VARCHAR, title VARCHAR, "type" VARCHAR)[]'
 _TS = "TIMESTAMP WITH TIME ZONE"
 _PCT = "Scene classification percentage."
 

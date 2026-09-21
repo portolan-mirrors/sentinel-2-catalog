@@ -38,7 +38,7 @@ def _one_feature():
 
 
 def test_normalize_covers_every_column():
-    from s2_fetch import normalize
+    from s2_schema import normalize
     row = normalize(_one_feature())
     want = {c[0] for c in DATA_COLUMNS if c[0] != "geometry"} | {"_geometry_json"}
     assert set(row) == want
@@ -203,10 +203,14 @@ def test_search_body_rejects_an_unknown_field():
         s2_fetch.search_body(cols.get(cols.DEFAULT), "2026-09-20", "2026-09-21", "updated")
 
 
-def test_data_columns_follows_the_schema_module():
-    assert s2_fetch.data_columns(s2_schema) == s2_fetch.DATA_COLUMNS == DATA_COLUMNS
-    c1 = s2_fetch.data_columns(s2c1_schema)
-    assert c1 == s2c1_schema.DATA_COLUMNS
+def test_data_columns_come_from_the_schema_module():
+    """Each schema module owns its DATA_COLUMNS; s2_fetch's module-level
+    list is the first collection's (the writers' default), not a second
+    derivation."""
+    assert s2_fetch.DATA_COLUMNS is s2_schema.DATA_COLUMNS
+    assert s2_fetch.DATA_COLUMNS == DATA_COLUMNS
+    assert not hasattr(s2_fetch, "data_columns")
+    c1 = s2c1_schema.DATA_COLUMNS
     assert [c[0] for c in c1][-2:] == ["_tile", "geometry"]
     assert not any(c[0] in ("_month", "_hilbert") for c in c1)
 

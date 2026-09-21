@@ -29,10 +29,11 @@ A `query` on a property the API does not index silently matches nothing
 rather than erroring, which is why the CLI test asserts on `created`
 bounds and not just on row count.
 
-Each collection's normalize() lives with its schema (s2_schema.py,
-s2c1_schema.py; the first collection's is re-exported here for
-s2_repair.py). A run ends with one warning line if the schema module saw
-upstream properties it does not know (Collection 1's drift guard).
+Each collection's normalize() and DATA_COLUMNS live with its schema
+(s2_schema.py, s2c1_schema.py); this tool and s2_repair.py both reach them
+through config.schema. A run ends with one warning line if the schema
+module saw upstream properties it does not know (Collection 1's drift
+guard).
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ import duckdb
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import s2_collections as cols  # noqa: E402
 import s2_schema  # noqa: E402
-from s2_schema import USER_AGENT, normalize  # noqa: E402,F401  normalize: s2_repair's import
+from s2_schema import USER_AGENT  # noqa: E402
 
 API = "https://earth-search.aws.element84.com/v1/search"
 PAGE = 200
@@ -62,17 +63,11 @@ DEFAULT_CONFIG = cols.get(cols.DEFAULT)
 FIELDS = ("datetime", "created")
 
 
-def data_columns(schema) -> list[tuple]:
-    """The columns a chunk parquet carries for `schema` (a module with
-    COLUMNS and normalize()): everything normalize() emits. The two sort
-    helpers are computed at build time, so they are the only ones left
-    out."""
-    return [c for c in schema.COLUMNS if c[0] not in ("_month", "_hilbert")]
-
-
-# The first collection's chunk columns: the default for the writers below,
-# which is what s2_repair.py (first collection only) relies on.
-DATA_COLUMNS = data_columns(s2_schema)
+# The first collection's chunk columns (everything normalize() emits; the
+# two build-time sort helpers are left out): the default for the writers
+# below. Every schema module exports its own DATA_COLUMNS, and callers that
+# know their collection pass config.schema.DATA_COLUMNS explicitly.
+DATA_COLUMNS = s2_schema.DATA_COLUMNS
 
 
 def with_retries(fn, tries: int = 8):
@@ -174,7 +169,7 @@ def fetch_window(start: str, end: str, out_dir: Path,
     if not rows:
         dest.touch()          # sentinel: fetched, zero matches
         return 0
-    write_rows(rows, dest, data_columns(config.schema))
+    write_rows(rows, dest, config.schema.DATA_COLUMNS)
     print(f"  {dest.name}: {len(rows):,} rows in {pages} page(s)", flush=True)
     return len(rows)
 
@@ -204,7 +199,7 @@ def copy_ndjson_to_parquet(nd_path: str, dest: Path,
     streaming writer: turn an NDJSON file of normalize()d rows (one JSON
     object per line, `_geometry_json` instead of `geometry`) into a
     canonical-schema chunk parquet. `columns` is the collection's
-    data_columns(); the default is the first collection's.
+    schema.DATA_COLUMNS; the default is the first collection's.
 
     COPYs to a same-directory temp name first, then os.replace()s it onto
     `dest` -- a same-filesystem rename, atomic on POSIX and Windows alike.

@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
-"""Fetch one month of sentinel-2-l2a items straight from the sentinel-cogs
-bucket, bypassing the Earth Search API entirely.
+"""Fetch one month of items straight from a collection's source bucket,
+bypassing the Earth Search API entirely.
 
 Why: the API backfill (s2_fetch.py) lost several month-slices to sustained
-Earth Search 502 windows. The sentinel-cogs bucket carries a static STAC
-item JSON per scene at
-    s3://sentinel-cogs/sentinel-s2-l2a-cogs/{zone}/{band}/{square}/{yyyy}/{m}/{id}/{id}.json
-(verified shape-identical to API features -- 43 properties incl. mgrs:*, 38
-assets with absolute https hrefs, links self/canonical/license/derived_from)
-served over plain, unauthenticated HTTPS with no outage windows. {m} in the
-bucket path is NOT zero-padded (".../2018/1/...", never ".../2018/01/...")
-even though this tool's --month argument and output filenames are.
+Earth Search 502 windows. Each source bucket carries a static STAC item
+JSON per scene at
+    s3://{config.bucket}/{config.key_root}{zone}/{band}/{square}/{yyyy}/{m}/{id}/{id}.json
+served over plain, unauthenticated HTTPS with no outage windows. The
+collection (--collection, default sentinel-2-l2a) picks the bucket, key
+root, HTTPS base, scene-id regex, prefix cache and schema from
+s2_collections; nothing bucket-specific lives in this file.
+  * sentinel-2-l2a: s3://sentinel-cogs/sentinel-s2-l2a-cogs/... (verified
+    shape-identical to API features -- 43 properties incl. mgrs:*, 38
+    assets with absolute https hrefs, links self/canonical/license/
+    derived_from).
+  * sentinel-2-c1-l2a: s3://e84-earth-search-sentinel-data/sentinel-2-c1-l2a/...
+    (anonymous LIST and GET verified 2026-09-21; the item JSON normalizes
+    onto s2c1_schema exactly like an API feature -- tests/test_repair.py's
+    live C1 test).
+{m} in the bucket path is NOT zero-padded (".../2018/1/...", never
+".../2018/01/...") in either bucket, even though this tool's --month
+argument and output filenames are.
 
 Discovery is two-level:
-  1. A ONE-TIME cache of every MGRS tile prefix under sentinel-s2-l2a-cogs/
-     (zone -> band -> square, ~3 levels), committed as
-     tools/mgrs_prefixes.txt. Rebuild with --refresh-prefixes. A real run
-     (2026-09-16) took ~1,050 anonymous LISTs / ~16s and found 35,433 tile
-     prefixes across 60 real UTM zones -- see build_prefix_cache()'s
+  1. A ONE-TIME cache of every MGRS tile prefix under the key root
+     (zone -> band -> square, ~3 levels), committed per collection as
+     tools/mgrs_prefixes.txt (sentinel-2-l2a) and tools/mgrs_prefixes_c1.txt
+     (sentinel-2-c1-l2a) -- see prefix_cache_path(). Rebuild with
+     --refresh-prefixes. A real run for the first collection (2026-09-16)
+     took ~1,050 anonymous LISTs / ~16s and found 35,433 tile prefixes
+     across 60 real UTM zones -- see build_prefix_cache()'s
      _is_valid_zone() note for one bucket-root anomaly excluded along the
-     way.
+     way. The C1 run (2026-09-21, --workers 32) took ~1,030 LISTs / ~9s
+     and found 32,811 tile prefixes across 60 zones; that bucket root has
+     no stray prefix (its only sibling, sentinel-2-pre-c1-l2a/, is another
+     collection and sits outside the key root).
   2. Per month: for each cached tile prefix (threaded, --workers), LIST
      "{prefix}{yyyy}/{m}/" for scene directories, then GET "{id}.json" for
      each (also threaded) -- both anonymous: boto3 UNSIGNED for LIST, plain
@@ -61,7 +76,6 @@ import argparse
 import calendar
 import json
 import os
-import re
 import sys
 import tempfile
 import urllib.error
@@ -71,12 +85,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from s2_fetch import UA, copy_ndjson_to_parquet, normalize, with_retries  # noqa: E402
+import s2_collections as cols  # noqa: E402
+from s2_collections import CollectionConfig  # noqa: E402
+from s2_fetch import UA, copy_ndjson_to_parquet, with_retries  # noqa: E402
 
-BUCKET = "sentinel-cogs"
-PREFIX_ROOT = "sentinel-s2-l2a-cogs/"
-HTTPS_BASE = f"https://{BUCKET}.s3.us-west-2.amazonaws.com"
-DEFAULT_PREFIX_CACHE = Path(__file__).resolve().parent / "mgrs_prefixes.txt"
+DEFAULT_CONFIG = cols.get(cols.DEFAULT)
+
+# One committed prefix cache per collection, next to this file. The first
+# collection keeps the name it has always had (repair-slices.yml and the
+# README refer to it); later collections get a suffix.
+_PREFIX_CACHE_NAMES = {
+    "sentinel-2-l2a": "mgrs_prefixes.txt",
+    "sentinel-2-c1-l2a": "mgrs_prefixes_c1.txt",
+}
+
+
+def prefix_cache_path(config: CollectionConfig = DEFAULT_CONFIG) -> Path:
+    try:
+        name = _PREFIX_CACHE_NAMES[config.id]
+    except KeyError:
+        raise SystemExit(f"no prefix cache name registered for collection {config.id!r}")
+    return Path(__file__).resolve().parent / name
 
 
 def _s3_client():
@@ -87,13 +116,15 @@ def _s3_client():
         "s3", config=Config(signature_version=UNSIGNED), region_name="us-west-2")
 
 
-def _list_common_prefixes(s3, prefix: str) -> list[str]:
-    """Every CommonPrefix directly under `prefix` (one path segment down),
-    anonymous ListObjectsV2 with Delimiter='/', paginated."""
+def _list_common_prefixes(s3, prefix: str,
+                          config: CollectionConfig = DEFAULT_CONFIG) -> list[str]:
+    """Every CommonPrefix directly under `prefix` (one path segment down)
+    in the collection's bucket, anonymous ListObjectsV2 with Delimiter='/',
+    paginated."""
     prefixes: list[str] = []
     token = None
     while True:
-        kwargs = dict(Bucket=BUCKET, Prefix=prefix, Delimiter="/", MaxKeys=1000)
+        kwargs = dict(Bucket=config.bucket, Prefix=prefix, Delimiter="/", MaxKeys=1000)
         if token:
             kwargs["ContinuationToken"] = token
         resp = s3.list_objects_v2(**kwargs)
@@ -116,20 +147,23 @@ def _is_valid_zone(prefix: str) -> bool:
     return seg.isdigit() and 1 <= int(seg) <= 60
 
 
-def build_prefix_cache(out_path: Path = DEFAULT_PREFIX_CACHE,
-                       workers: int = 16) -> list[str]:
-    """Traverse zone -> band -> square once and cache every MGRS tile
-    prefix. Band and square levels are parallelized (zone level is a single
-    call). See the task report for a real run's numbers."""
+def build_prefix_cache(out_path: Path | None = None, workers: int = 16,
+                       config: CollectionConfig = DEFAULT_CONFIG) -> list[str]:
+    """Traverse zone -> band -> square once under config.key_root and cache
+    every MGRS tile prefix. Band and square levels are parallelized (zone
+    level is a single call). See the task report for a real run's numbers."""
+    if out_path is None:
+        out_path = prefix_cache_path(config)
     s3 = _s3_client()
-    zones = [z for z in _list_common_prefixes(s3, PREFIX_ROOT) if _is_valid_zone(z)]
+    zones = [z for z in _list_common_prefixes(s3, config.key_root, config)
+             if _is_valid_zone(z)]
     print(f"  {len(zones)} zone prefixes", file=sys.stderr)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        bands = [b for bl in pool.map(lambda z: _list_common_prefixes(s3, z), zones)
+        bands = [b for bl in pool.map(lambda z: _list_common_prefixes(s3, z, config), zones)
                  for b in bl]
     print(f"  {len(bands)} zone/band prefixes", file=sys.stderr)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        squares = [sq for sl in pool.map(lambda b: _list_common_prefixes(s3, b), bands)
+        squares = [sq for sl in pool.map(lambda b: _list_common_prefixes(s3, b, config), bands)
                    for sq in sl]
     squares.sort()
     out_path.write_text("\n".join(squares) + ("\n" if squares else ""))
@@ -137,7 +171,7 @@ def build_prefix_cache(out_path: Path = DEFAULT_PREFIX_CACHE,
     return squares
 
 
-def load_prefixes(path: Path = DEFAULT_PREFIX_CACHE) -> list[str]:
+def load_prefixes(path: Path) -> list[str]:
     if not path.exists():
         raise SystemExit(
             f"{path} not found; run with --refresh-prefixes first")
@@ -145,7 +179,8 @@ def load_prefixes(path: Path = DEFAULT_PREFIX_CACHE) -> list[str]:
 
 
 def discover_scenes(prefixes: list[str], yyyy: str, m: str, list_fn,
-                    workers: int = 16) -> list[tuple[str, str]]:
+                    workers: int = 16,
+                    config: CollectionConfig = DEFAULT_CONFIG) -> list[tuple[str, str]]:
     """[(scene_id, item_json_url), ...] for one month across every cached
     tile prefix (~35k of them -- threaded across `workers`, matching
     build_prefix_cache's pattern; a serial loop over that many LISTs would
@@ -161,25 +196,27 @@ def discover_scenes(prefixes: list[str], yyyy: str, m: str, list_fn,
     for scene_prefixes in results:
         for scene_prefix in scene_prefixes:
             scene_id = scene_prefix.rstrip("/").rsplit("/", 1)[-1]
-            out.append((scene_id, f"{HTTPS_BASE}/{scene_prefix}{scene_id}.json"))
+            out.append((scene_id, f"{config.https_base}/{scene_prefix}{scene_id}.json"))
     return out
 
 
-_SCENE_ID_RE = re.compile(r'^[A-Z0-9]+_[A-Z0-9]+_(\d{4})(\d{2})(\d{2})_\d+_[A-Z0-9]+$')
-
-
-def scene_day(scene_id: str) -> str:
+def scene_day(scene_id: str, config: CollectionConfig = DEFAULT_CONFIG) -> str:
     """The ISO acquisition date (YYYY-MM-DD) embedded in a scene id, e.g.
-    S2A_31UFU_20180905_0_L2A -> "2018-09-05". Grouping by this avoids a
-    second, per-day LIST pass: one month-level discover_scenes() call
-    already names every scene, and the date is right there in its id."""
-    m = _SCENE_ID_RE.match(scene_id)
+    S2A_31UFU_20180905_0_L2A -> "2018-09-05" (first collection) or
+    S2B_T31UET_20260921T105030_L2A -> "2026-09-21" (Collection 1), parsed
+    with config.id_re's `day` group. Grouping by this avoids a second,
+    per-day LIST pass: one month-level discover_scenes() call already names
+    every scene, and the date is right there in its id."""
+    m = config.id_re.match(scene_id)
     if not m:
         raise ValueError(f"cannot parse acquisition date from scene id: {scene_id!r}")
-    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    d = m.group("day")
+    return f"{d[:4]}-{d[4:6]}-{d[6:]}"
 
 
-def group_scenes_by_day(scenes: list[tuple[str, str]]) -> dict[str, list[tuple[str, str]]]:
+def group_scenes_by_day(scenes: list[tuple[str, str]],
+                        config: CollectionConfig = DEFAULT_CONFIG,
+                        ) -> dict[str, list[tuple[str, str]]]:
     """scenes -> {"YYYY-MM-DD": [(scene_id, url), ...]}.
 
     A scene id that doesn't parse is logged and SKIPPED, not raised: this
@@ -192,7 +229,7 @@ def group_scenes_by_day(scenes: list[tuple[str, str]]) -> dict[str, list[tuple[s
     by_day: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for scene_id, url in scenes:
         try:
-            day = scene_day(scene_id)
+            day = scene_day(scene_id, config)
         except ValueError:
             print(f"  skipping unparsable scene id: {scene_id!r}", file=sys.stderr)
             continue
@@ -226,9 +263,10 @@ def _get_json(url: str, tries: int = 8) -> dict:
 
 
 def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
-                    workers: int = 16) -> tuple[int, int]:
-    """GET + normalize() every scene's item JSON, writing each row straight
-    to the NDJSON file at `nd_path` as its future completes -- never holds
+                    workers: int = 16,
+                    config: CollectionConfig = DEFAULT_CONFIG) -> tuple[int, int]:
+    """GET + config.schema.normalize() every scene's item JSON, writing each
+    row straight to the NDJSON file at `nd_path` as its future completes -- never holds
     more than one month's worth of in-flight requests in memory, unlike
     accumulating a Python list of ~450k rows. The writes happen in THIS
     thread as as_completed() yields (fetching is threaded, consuming is
@@ -266,7 +304,7 @@ def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
                 skipped += 1
                 continue
             try:
-                row = normalize(item)
+                row = config.schema.normalize(item)
             except ValueError as e:
                 print(f"  skipping unnormalizable item: {e}", file=sys.stderr)
                 skipped += 1
@@ -277,7 +315,8 @@ def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
 
 
 def _fetch_one_day(day: str, day_scenes: list[tuple[str, str]], dest_dir: Path,
-                   get_fn, workers: int) -> tuple[int, int]:
+                   get_fn, workers: int,
+                   config: CollectionConfig = DEFAULT_CONFIG) -> tuple[int, int]:
     """Fetch+write one day's chunk (or a zero-byte sentinel), skipping if
     its destination already exists -- the unit of eviction resilience: this
     is the piece of work that either fully lands on disk or never starts,
@@ -294,9 +333,9 @@ def _fetch_one_day(day: str, day_scenes: list[tuple[str, str]], dest_dir: Path,
     fd, nd = tempfile.mkstemp(suffix=".ndjson")
     os.close(fd)
     try:
-        n, skipped = fetch_and_write(day_scenes, get_fn, nd, workers)
+        n, skipped = fetch_and_write(day_scenes, get_fn, nd, workers, config)
         if n:
-            copy_ndjson_to_parquet(nd, dest)
+            copy_ndjson_to_parquet(nd, dest, config.schema.DATA_COLUMNS)
         else:
             dest.touch()      # every scene that day was skipped
     finally:
@@ -307,7 +346,8 @@ def _fetch_one_day(day: str, day_scenes: list[tuple[str, str]], dest_dir: Path,
 
 
 def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 16,
-                 list_fn=None, get_fn=None) -> int:
+                 list_fn=None, get_fn=None,
+                 config: CollectionConfig = DEFAULT_CONFIG) -> int:
     """Discover one month's scenes with a single month-level LIST pass, then
     fetch and write ONE PARQUET CHUNK PER DAY (skip-if-exists per day, same
     resumability contract as s2_fetch.py) -- see the module docstring for
@@ -316,7 +356,8 @@ def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 
     normalize()'s field checks, is skipped and counted rather than
     crashing the month (see fetch_and_write()); the running total is
     printed as a month-end summary so the shortfall is visible in the run
-    log and comparable against the inventory audit."""
+    log and comparable against the inventory audit. `prefixes` must be the
+    cache built for the same `config` (prefix_cache_path(config))."""
     y, m_pad = month.split("-")
     m = str(int(m_pad))          # bucket path segment is not zero-padded
     last_day = calendar.monthrange(int(y), int(m_pad))[1]
@@ -326,18 +367,19 @@ def repair_month(month: str, out_dir: Path, prefixes: list[str], workers: int = 
     if list_fn is None or get_fn is None:
         s3 = _s3_client()
         if list_fn is None:
-            list_fn = lambda p: _list_common_prefixes(s3, p)  # noqa: E731
+            list_fn = lambda p: _list_common_prefixes(s3, p, config)  # noqa: E731
         if get_fn is None:
             get_fn = _get_json
 
-    scenes = discover_scenes(prefixes, y, m, list_fn, workers)
-    by_day = group_scenes_by_day(scenes)
+    scenes = discover_scenes(prefixes, y, m, list_fn, workers, config)
+    by_day = group_scenes_by_day(scenes, config)
 
     total = 0
     total_skipped = 0
     for day_num in range(1, last_day + 1):
         day = f"{y}-{m_pad}-{day_num:02d}"
-        n, skipped = _fetch_one_day(day, by_day.get(day, []), dest_dir, get_fn, workers)
+        n, skipped = _fetch_one_day(day, by_day.get(day, []), dest_dir, get_fn,
+                                    workers, config)
         total += n
         total_skipped += skipped
     print(f"month {month}: {total:,} scenes fetched, "
@@ -351,21 +393,25 @@ def main() -> int:
     ap.add_argument("--out", help="output DIR; writes DIR/repair/<day>_<day>.parquet"
                                   " per day, one per day in the month")
     ap.add_argument("--workers", type=int, default=16)
+    cols.add_collection_arg(ap)
     ap.add_argument("--refresh-prefixes", action="store_true",
-                    help="rebuild tools/mgrs_prefixes.txt (~1k anonymous LISTs)")
-    ap.add_argument("--prefix-cache", default=str(DEFAULT_PREFIX_CACHE))
+                    help="rebuild the collection's prefix cache (~1k anonymous LISTs)")
+    ap.add_argument("--prefix-cache",
+                    help="default: tools/mgrs_prefixes.txt (sentinel-2-l2a) or "
+                         "tools/mgrs_prefixes_c1.txt (sentinel-2-c1-l2a)")
     a = ap.parse_args()
+    config = cols.get(a.collection)
 
-    cache_path = Path(a.prefix_cache)
+    cache_path = Path(a.prefix_cache) if a.prefix_cache else prefix_cache_path(config)
     if a.refresh_prefixes:
-        build_prefix_cache(cache_path, a.workers)
+        build_prefix_cache(cache_path, a.workers, config)
 
     if not a.month:
         return 0
     if not a.out:
         raise SystemExit("--month requires --out")
     prefixes = load_prefixes(cache_path)
-    n = repair_month(a.month, Path(a.out), prefixes, a.workers)
+    n = repair_month(a.month, Path(a.out), prefixes, a.workers, config=config)
     print(f"TOTAL {n:,} rows fetched")
     return 0
 

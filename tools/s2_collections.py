@@ -67,7 +67,9 @@ _C1 = CollectionConfig(
     https_base="https://e84-earth-search-sentinel-data.s3.us-west-2.amazonaws.com",
     item_key="{zone}/{band}/{sq}/{year}/{month}/{id}/{id}.json",
     inventory_bucket="e84-earth-search-sentinel-data-inventory",
-    inventory_prefix="",        # Task 3 discovers and pins the real prefix
+    # Listed live 2026-09-21: hive/dt=YYYY-MM-DD-HH-MM/symlink.txt manifests,
+    # daily since 2024-04-02, pointing at Parquet data files (not CSV).
+    inventory_prefix="e84-earth-search-sentinel-data/primary/hive/",
     catalog_dir="sentinel-2-c1-l2a", stats_dir="stats-c1",
     zone_split=False, row_group_mode="month_aligned", row_group_size=20_000,
     live_zstd_level=3, lookback_field="created")
