@@ -1492,6 +1492,28 @@ def test_c1_refuses_split_zones():
         assert not (Path(td) / "out").exists()
 
 
+def test_build_year_in_process_takes_the_row_group_size_from_the_config():
+    """build_year(config=C1) without a CLI aligns at the collection's
+    20,000 (6,000 rows of one month: one group, not two of 5,000), and an
+    explicit row_group_size wins over it."""
+    from s2_build import build_year, connect
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks"
+        chunks.mkdir()
+        _mk_c1_chunk(con, chunks / "a.parquet", rows=6_000, months=1)
+        bcon = connect("1GB", Path(td))
+        files = [str(chunks / "a.parquet")]
+        build_year(bcon, files, 2026, Path(td) / "default", config=C1)
+        assert _month_groups(con, Path(td) / "default/year=2026/items.parquet") \
+            == [(1, 1, 6_000)]
+        build_year(bcon, files, 2026, Path(td) / "small", config=C1,
+                   row_group_size=2_000)
+        assert _month_groups(con, Path(td) / "small/year=2026/items.parquet") \
+            == [(1, 1, 2_000)] * 3
+
+
 def test_month_aligned_row_groups_never_span_a_month():
     """3 months x 45,000 rows at a 20,000 target: 20k, 20k, 5k per month,
     nine groups, every group's _month statistics a single value -- so a

@@ -180,10 +180,10 @@ UA = {"User-Agent": USER_AGENT}
 # identically to every client, only the bytes-per-hit differ. gpio rounds
 # the request to a power of two: 5,000 writes 6,144-row groups.
 ROW_GROUP = 5_000
-# What the published part is written with; main() overrides it from
-# --row-group-size. Staging COPYs keep ROW_GROUP: they are deleted after
-# the sort, so their group size only affects the build, never a reader.
-_row_group_size = ROW_GROUP
+# What the published part is written with is _sort_and_check's
+# row_group_size: --row-group-size, else the collection's, else ROW_GROUP.
+# Staging COPYs keep ROW_GROUP: they are deleted after the sort, so their
+# group size only affects the build, never a reader.
 # The one knob. zstd decompression cost is flat across levels, so a reader
 # pays nothing for a high one -- but the writer pays, and on this row shape
 # (geometry + array + JSON-heavy columns) the ultra tiers fall off a cliff.
@@ -466,7 +466,9 @@ def month_align(src: Path, dst: Path, target: int,
     must carry geo statistics (rashid PTL-DAT-007 and the spatial pruning
     depend on them), or the build stops.
 
-    Memory: one source row group plus at most `target` pending rows.
+    Memory: one source row group plus at most `target` pending rows (the
+    remainder after each drain is copied out with take(), so it does not
+    pin the group it was sliced from).
     Speed: pyarrow encodes one column at a time on one core, so at zstd 18
     this is ~2.6 ms/row on real rows (STAGE_ZSTD_LEVEL's comment) -- which
     is why the gpio sort that feeds it runs at STAGE_ZSTD_LEVEL rather
@@ -522,6 +524,11 @@ def month_align(src: Path, dst: Path, target: int,
         if everything and len(table):
             emit(table)
             table = table.slice(len(table))
+        # A slice pins its source buffers (the whole previous group);
+        # take() materialises just the remainder, so the pending rows
+        # cost their own size and no more.
+        if len(table):
+            table = table.take(pa.array(range(len(table))))
         pending = [table] if len(table) else []
         pending_rows = len(table)
 
@@ -577,7 +584,8 @@ def month_align(src: Path, dst: Path, target: int,
 def _sort_and_check(con, staged: Path, final: Path, year: int,
                     memory: str, config: CollectionConfig = DEFAULT_CONFIG,
                     zstd_level: int = ZSTD_LEVEL,
-                    row_group_mode: str = "uniform") -> None:
+                    row_group_mode: str = "uniform",
+                    row_group_size: int | None = None) -> None:
     """The ordered GeoParquet 2.0 write of one part, its gate, then its name.
 
     gpio writes `.<stem>.tmp.parquet`, `gpio check all` runs on that, and
@@ -592,8 +600,12 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
     processes are not bidding for the same RAM.
 
     With row_group_mode "month_aligned" gpio sorts into a staging file next
-    to `staged` at STAGE_ZSTD_LEVEL, month_align() rewrites that as the
-    dotfile at `zstd_level`, and the same check and rename follow.
+    to `staged` at STAGE_ZSTD_LEVEL, `staged` is removed the moment that
+    file exists (the disk then holds two copies of the part, not three:
+    the sorted staging file and the dotfile month_align() writes),
+    month_align() rewrites it as the dotfile at `zstd_level`, and the same
+    check and rename follow. `row_group_size` None means the collection's,
+    then ROW_GROUP.
     """
     name = final.name
     aligned = row_group_mode == "month_aligned"
@@ -603,6 +615,7 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
     tmp.unlink(missing_ok=True)
     sorted_path = staged.with_name(f".{final.stem}.sorted.parquet") if aligned else tmp
     gpio_level = STAGE_ZSTD_LEVEL if aligned else zstd_level
+    groups_of = row_group_size or config.row_group_size or ROW_GROUP
     key = sort_key(year, config)
     t0 = time.monotonic()
     try:
@@ -612,7 +625,7 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
              key, "--geoparquet-version", "2.0",
              "--compression", "zstd",
              "--compression-level", str(gpio_level),
-             "--row-group-size", str(_row_group_size),
+             "--row-group-size", str(groups_of),
              "--write-memory", memory],
             capture_output=True, text=True)
         if r.returncode != 0:
@@ -622,11 +635,14 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
             f"zstd-{gpio_level}, {sorted_path.stat().st_size / 1e6:,.0f} MB, "
             f"{time.monotonic() - t0:,.1f}s")
         if aligned:
+            # The staged input has served its purpose; drop it before the
+            # rewrite so the peak on disk is sorted + aligned, not three.
+            staged.unlink()
             t0 = time.monotonic()
-            groups = month_align(sorted_path, tmp, _row_group_size, zstd_level)
+            groups = month_align(sorted_path, tmp, groups_of, zstd_level)
             sorted_path.unlink()
             say(f"year={year}/{name}: {len(groups)} month-aligned row groups "
-                f"(<= {_row_group_size:,} rows, "
+                f"(<= {groups_of:,} rows, "
                 f"{len({m for m, _ in groups})} month(s)) written "
                 f"zstd-{zstd_level}, {tmp.stat().st_size / 1e6:,.0f} MB, "
                 f"{time.monotonic() - t0:,.1f}s")
@@ -991,7 +1007,8 @@ def build_year(con, files: list[str], year: int, outdir: Path,
                probe_url=published_url,
                config: CollectionConfig = DEFAULT_CONFIG,
                zstd_level: int = ZSTD_LEVEL,
-               row_group_mode: str | None = None) -> tuple[int, int, int]:
+               row_group_mode: str | None = None,
+               row_group_size: int | None = None) -> tuple[int, int, int]:
     """Build one year. Returns (rows written, parts skipped as already
     published, part files written -- which counts a zero-row live written
     because --exclude-ids-from dropped every staged row). With --split zones the parts are zone_parts_for(year); a
@@ -1006,9 +1023,10 @@ def build_year(con, files: list[str], year: int, outdir: Path,
     published is skipped before staging, on the HEADs alone: the point of
     the flag is that re-dispatching a finished year costs nothing.
     `config` is the collection (schema, tile column, split, row-group
-    mode); `zstd_level` (--zstd-level) and `row_group_mode`
-    (--row-group-mode, default config.row_group_mode) are what the
-    published part is written with."""
+    mode); `zstd_level` (--zstd-level), `row_group_mode`
+    (--row-group-mode, default config.row_group_mode) and `row_group_size`
+    (--row-group-size, default the collection's then ROW_GROUP) are what
+    the published part is written with."""
     lst = ",".join(f"'{f}'" for f in files)
     label = "zones" if split == "zones" else name
     if row_group_mode is None:
@@ -1086,7 +1104,7 @@ def build_year(con, files: list[str], year: int, outdir: Path,
             return 0, 0, 0
         if split != "zones":
             _sort_and_check(con, staged, final, year, memory, config,
-                            zstd_level, row_group_mode)
+                            zstd_level, row_group_mode, row_group_size)
             print(f"  year={year}/{name}: {n:,} rows, "
                   f"{final.stat().st_size / 1e6:,.0f} MB", flush=True)
             if on_part_done:
@@ -1106,8 +1124,8 @@ def build_year(con, files: list[str], year: int, outdir: Path,
                 continue
             part_final = dest / f"{part_label}.parquet"
             _sort_and_check(con, part_staged, part_final, year, memory,
-                            config, zstd_level, row_group_mode)
-            part_staged.unlink()
+                            config, zstd_level, row_group_mode, row_group_size)
+            part_staged.unlink(missing_ok=True)  # aligned mode removed it
             print(f"  year={year}/{part_final.name}: {part_rows:,} rows, "
                   f"{part_final.stat().st_size / 1e6:,.0f} MB", flush=True)
             if on_part_done:
@@ -1169,8 +1187,6 @@ def main() -> int:
                          "the build")
     a = ap.parse_args()
     config = cols.get(a.collection)
-    global _row_group_size
-    _row_group_size = a.row_group_size or config.row_group_size or ROW_GROUP
     if a.split and not config.zone_split:
         ap.error(f"--split zones: {config.id} has zone_split=False; every "
                  "year is one items.parquet")
@@ -1210,7 +1226,8 @@ def main() -> int:
             con, files, y, outdir, a.name, a.memory, a.split,
             a.skip_existing_url, hook, only_parts=only_parts,
             exclude_ids_from=a.exclude_ids_from, config=config,
-            zstd_level=a.zstd_level, row_group_mode=a.row_group_mode)
+            zstd_level=a.zstd_level, row_group_mode=a.row_group_mode,
+            row_group_size=a.row_group_size)
         total += rows
         skipped += skips
         written += parts_written
