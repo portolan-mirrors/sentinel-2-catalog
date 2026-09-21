@@ -13,27 +13,54 @@ the table.
 
 ```sql
 -- Cloud-free scenes over a field during harvest, no API, no rate limits.
-INSTALL spatial; LOAD spatial;
+INSTALL httpfs; LOAD httpfs;
+SET TimeZone = 'UTC';
+
 SELECT id, datetime, "eo:cloud_cover", thumbnail_url,
        json_extract_string(assets, '$.visual.href') AS visual_cog
-FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet', hive_partitioning=true)
-WHERE year IN (2021)
-  AND "s2:mgrs_tile" = '31UFU'
-  AND datetime BETWEEN '2021-08-01' AND '2021-10-15'
+FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=2021/z21-31.parquet')
+WHERE "s2:mgrs_tile" = '31UFU'
+  AND _month BETWEEN 8 AND 10
+  AND datetime BETWEEN '2021-08-01' AND '2021-10-15 23:59:59'
   AND "eo:cloud_cover" < 10
-ORDER BY "eo:cloud_cover" LIMIT 20;
+ORDER BY "eo:cloud_cover", id LIMIT 20;
 ```
 
 Every asset href is in the `assets` JSON-string column — no URL templates, no
 API. Swap `$.visual.href` for `$.red.href`, `$.scl.href` or any other key; the
 [agent guide](AGENTS.md) lists them all.
 
-Three things make that query cheap. `year=*` is a Hive partition, so DuckDB
-opens only the years you name. Rows inside each part are sorted by
-`(_month, _hilbert)`, so a month filter and a spatial filter both prune row
+Three things make that query cheap. A tile id and a year name the part
+(`31UFU` is zone 31, so 2021 is `z21-31.parquet`; the Layout section has
+every range), so it opens one file. Rows inside each part are sorted by
+`(_month, _hilbert)`, so the month filter and a spatial filter both prune row
 groups. And the whole answer comes from HTTP range requests against the
 Parquet files: there is no API in front of this, so there is nothing to rate
 limit.
+
+The collection's partition glob, `year=*/*.parquet`, is a Hive layout:
+`hive_partitioning = true` exposes `year` as a column that is not stored in
+the files, and a filter on it skips whole files. DuckDB expands the glob
+when it can list the store, which it can through the anonymous `s3://` door;
+over plain `https://` it does not ("Globs (`*`) for generic HTTP file are not
+supported"), so name the part as above. A year-pruned count through the glob:
+
+```sql
+INSTALL httpfs; LOAD httpfs;
+SET s3_region = 'us-west-2';
+SET s3_url_style = 'path';
+SET TimeZone = 'UTC';
+
+SELECT year, count(*) AS scenes, min(datetime) AS first, max(datetime) AS last
+FROM read_parquet('s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
+                  hive_partitioning = true)
+WHERE year IN (2016, 2017)
+GROUP BY year ORDER BY year;
+```
+
+Two parts out of sixty are opened, and only their footers are read. A scan
+of every part is minutes, not seconds; the collection's `table:row_count`
+and temporal extent give the whole-archive answer without one.
 
 ## Layout
 

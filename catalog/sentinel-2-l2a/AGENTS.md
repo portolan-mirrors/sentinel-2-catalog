@@ -61,13 +61,26 @@ each scene once, whichever shape the year has, and a client can always
 dedupe on `id` anyway; it is safe and removes nothing:
 
 ```sql
-read_parquet('.../sentinel-2-l2a/year=*/*.parquet', hive_partitioning=true)
+INSTALL httpfs; LOAD httpfs;
+SET s3_region = 'us-west-2';
+SET s3_url_style = 'path';
+SET TimeZone = 'UTC';
+
+SELECT year, count(*) AS scenes, min(datetime) AS first, max(datetime) AS last
+FROM read_parquet('s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
+                  hive_partitioning = true)
+WHERE year IN (2016, 2017)
+GROUP BY year ORDER BY year;
 ```
 
-`hive_partitioning=true` exposes `year` as an INTEGER column that is not stored
-in the files. Filter on it first; it is the only filter that skips whole files.
-There is no `zone=` directory and no zone column: the zone split is a file
-name inside the year, and you use it by choosing the file.
+`hive_partitioning = true` exposes `year` as an INTEGER column that is not
+stored in the files. Filter on it first; it is the only filter that skips
+whole files. The glob goes through the anonymous `s3://` door because DuckDB
+expands `*` only where it can list the store: over plain `https://` it stops
+with "Globs (`*`) for generic HTTP file are not supported", so an `https://`
+read names one part (below). There is no `zone=` directory and no zone
+column: the zone split is a file name inside the year, and you use it by
+choosing the file.
 
 ## Query pattern
 
@@ -81,16 +94,20 @@ Filter in this order. Each step removes more data than the next one can.
 4. `"eo:cloud_cover" < 10` — the usual last cut.
 
 ```sql
-INSTALL spatial; LOAD spatial;
+INSTALL httpfs; LOAD httpfs;
+SET s3_region = 'us-west-2';
+SET s3_url_style = 'path';
+SET TimeZone = 'UTC';
+
 SELECT id, datetime, "eo:cloud_cover",
        json_extract_string(assets, '$.visual.href') AS visual_cog
-FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
-                  hive_partitioning=true)
+FROM read_parquet('s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
+                  hive_partitioning = true)
 WHERE year = 2021
   AND "s2:mgrs_tile" = '31UFU'
   AND _month BETWEEN 8 AND 10
   AND "eo:cloud_cover" < 10
-ORDER BY "eo:cloud_cover"
+ORDER BY "eo:cloud_cover", id
 LIMIT 20;
 ```
 
@@ -99,7 +116,8 @@ not `eo:cloud_cover`.
 
 **Read only the part containing your tile's zone.** The glob above opens every
 part of the year and lets the `s2:mgrs_tile` filter discard the rest of it by
-row-group statistics. Row-group size differs by vintage: parts published
+row-group statistics: seven footers read for nothing (measured 2026-09-21,
+11.9 s against 11.5 s for the single-part form below, same eight rows). Row-group size differs by vintage: parts published
 through 2023 carry ~100k-row groups (a tile lookup reads ~14 MB per group it
 touches); parts from 2024 on carry ~6k-row groups (~0.85 MB per hit). Sort order also
 differs by vintage: through 2025 rows are ordered (_month, _hilbert); from 2026
@@ -111,13 +129,16 @@ file by zone and year. Zone 31 in 2021 is in `z21-31.parquet`, so the same
 query touches one file:
 
 ```sql
+INSTALL httpfs; LOAD httpfs;
+SET TimeZone = 'UTC';
+
 SELECT id, datetime, "eo:cloud_cover",
        json_extract_string(assets, '$.visual.href') AS visual_cog
 FROM read_parquet('https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=2021/z21-31.parquet')
 WHERE "s2:mgrs_tile" = '31UFU'
   AND _month BETWEEN 8 AND 10
   AND "eo:cloud_cover" < 10
-ORDER BY "eo:cloud_cover"
+ORDER BY "eo:cloud_cover", id
 LIMIT 20;
 ```
 

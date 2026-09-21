@@ -69,16 +69,26 @@ range requests, straight from the bucket.
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
+SET s3_region = 'us-west-2';
+SET s3_url_style = 'path';
+SET TimeZone = 'UTC';
 
-SELECT count(*) AS scenes, min(datetime) AS earliest, max(datetime) AS latest
-FROM read_parquet(
-  'https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
-  hive_partitioning=true);
+SELECT year, count(*) AS scenes, min(datetime) AS earliest, max(datetime) AS latest
+FROM read_parquet('s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=*/*.parquet',
+                  hive_partitioning = true)
+WHERE year IN (2016, 2017)
+GROUP BY year ORDER BY year;
 ```
 
-That measures the published files. The collection's `table:row_count` and
-temporal extent say the same thing without opening one.
+That measures two of the published files, from their footers. The
+collection's `table:row_count` and temporal extent say the same thing for
+the whole archive without opening one; a scan of every part is minutes,
+not seconds.
 
 Filter on `year` first: it is a Hive partition key, so it skips whole files.
+The glob is read through the anonymous `s3://` door because DuckDB lists a
+bucket but cannot list a plain `https://` prefix ("Globs (`*`) for generic
+HTTP file are not supported"). Over `https://` name the part instead:
+`https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a/year=2021/z21-31.parquet`.
 The [collection README](sentinel-2-l2a/README.md) has the query that finds
 cloud-free scenes over one field, and the COG URL for each of them.
