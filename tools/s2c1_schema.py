@@ -36,7 +36,7 @@ import s2_schema
 
 USER_AGENT = s2_schema.USER_AGENT   # re-exported: one client name for every tool
 
-_LINKS ='STRUCT(href VARCHAR, rel VARCHAR, title VARCHAR, "type" VARCHAR)[]'
+_LINKS = 'STRUCT(href VARCHAR, rel VARCHAR, title VARCHAR, "type" VARCHAR)[]'
 _TS = "TIMESTAMP WITH TIME ZONE"
 _PCT = "Scene classification percentage."
 

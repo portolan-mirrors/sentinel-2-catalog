@@ -121,11 +121,23 @@ files.
 Every phase prints a timestamped line with rows, bytes and seconds. The 2017
 job burned six hours with no output at all; a stall should be visible in the
 log, not inferred from a timeout.
+
+`--collection` picks the collection (s2_collections; default the first one,
+so every existing call is unchanged). The tile column, the sort key, the
+zone split, the row-group size and mode all come from the config. For
+`sentinel-2-c1-l2a` that means: the tile is `_tile`, every year sorts
+(_month, _tile, _hilbert), `--split zones` is refused (zone_split=False:
+a year is one items.parquet), row groups are month-aligned at 20,000 rows
+(see month_align), and the daily live build passes `--zstd-level 3`
+(config.live_zstd_level) because a live.parquet is rewritten every day and
+folded into the year within weeks, so nobody downloads it enough to earn
+the zstd-18 encode.
 """
 from __future__ import annotations
 
 import argparse
 import http.client
+import json
 import os
 import shlex
 import shutil
@@ -139,10 +151,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from s2_fetch import with_retries
-from s2_schema import COLUMNS, USER_AGENT
+import s2_collections as cols  # noqa: E402
+from s2_collections import CollectionConfig  # noqa: E402
+from s2_fetch import with_retries  # noqa: E402
+from s2_schema import USER_AGENT  # noqa: E402
+
+DEFAULT_CONFIG = cols.get(cols.DEFAULT)
 
 # The same client name every other tool here sends (Source Cooperative's CDN
 # answers 403 to Python-urllib's default); s2_fetch's copy carries a POST
@@ -187,6 +206,15 @@ _row_group_size = ROW_GROUP
 # is a test hook (tests/test_build.py builds one fixture at two levels);
 # nothing in CI sets it, and no year part should ever be built with it set.
 ZSTD_LEVEL = int(os.environ.get("S2_ZSTD_LEVEL", "18"))
+# The level gpio writes the sorted staging file at when the row groups are
+# month-aligned afterwards: that file lives for one rewrite, so the only
+# expensive encode is month_align()'s, at the build's level. Measured on
+# 61,342 real 2026 rows (assets ~17 KB each, 12 cores, 2026-09-21): gpio
+# at 3 = 0.05 ms/row, gpio at 18 = 1.0 ms/row, the pyarrow rewrite 3->18 =
+# 2.64 ms/row on one core (pyarrow's writer does not parallelise column
+# encoding). A 7M-row year is therefore ~5 h of one core at 18 in the
+# rewrite, against ~30 min for gpio's row-group-parallel write on 12.
+STAGE_ZSTD_LEVEL = 3
 # What this process's DuckDB keeps while the gpio subprocess writes. Small
 # enough to hand the runner's RAM over, big enough that the connection
 # survives to stage the next year.
@@ -237,18 +265,26 @@ ZONE_SPLIT_8_FROM = 2021
 TILE_SORT_FROM = 2026
 
 
-def sort_key(year: int) -> str:
-    """The gpio --sort column list for a year's parts."""
-    return ("_month,s2:mgrs_tile,_hilbert" if year >= TILE_SORT_FROM
-            else "_month,_hilbert")
+def sort_key(year: int, config: CollectionConfig = DEFAULT_CONFIG) -> str:
+    """The gpio --sort column list for a year's parts. The first
+    collection's years before TILE_SORT_FROM keep the key they were
+    published with; a collection built after that lesson (Collection 1)
+    has no such history and sorts every year by tile."""
+    if config.id == cols.DEFAULT and year < TILE_SORT_FROM:
+        return "_month,_hilbert"
+    return f"_month,{config.tile_column},_hilbert"
 
 
-def zone_parts_for(year: int) -> tuple[tuple[str, int, int], ...]:
+def zone_parts_for(year: int, config: CollectionConfig = DEFAULT_CONFIG,
+                   ) -> tuple[tuple[str, int, int], ...]:
     """The zone parts a year is published as: () for a single items.parquet
-    (before ZONE_SPLIT_FROM), ZONE_PARTS for 2019-2020, ZONE_PARTS_8 from
+    (before ZONE_SPLIT_FROM, and every year of a collection with
+    zone_split=False), ZONE_PARTS for 2019-2020, ZONE_PARTS_8 from
     ZONE_SPLIT_8_FROM. Every caller that needs a year's part list -- the
     build, the generators, the workflows -- asks here, so no caller can pick
     a tier by hand."""
+    if not config.zone_split:
+        return ()
     if year >= ZONE_SPLIT_8_FROM:
         return ZONE_PARTS_8
     if year >= ZONE_SPLIT_FROM:
@@ -256,13 +292,16 @@ def zone_parts_for(year: int) -> tuple[tuple[str, int, int], ...]:
     return ()
 
 
-def archive_part_names() -> tuple[str, ...]:
+def archive_part_names(config: CollectionConfig = DEFAULT_CONFIG,
+                       ) -> tuple[str, ...]:
     """Every file stem an archive part can have, across all tiers and in
-    advertised order: items, then the quartiles, then the octants. A year
-    holds exactly one tier of these (never live.parquet, which is the
-    current year's tail and not an archive part). The probing workflows
-    enumerate this list because a HEAD is cheap and a hand-typed list would
-    drift."""
+    advertised order: items, then the quartiles, then the octants -- just
+    ("items",) for a collection that never splits. A year holds exactly one
+    tier of these (never live.parquet, which is the current year's tail and
+    not an archive part). The probing workflows enumerate this list because
+    a HEAD is cheap and a hand-typed list would drift."""
+    if not config.zone_split:
+        return ("items",)
     return ("items",
             *(label for label, _, _ in ZONE_PARTS),
             *(label for label, _, _ in ZONE_PARTS_8))
@@ -283,9 +322,15 @@ def only_zone_parts(year: int, parts: tuple[tuple[str, int, int], ...],
     return tuple(part for part in parts if part[0] in only)
 
 
-# The UTM zone of a scene, from the leading one or two digits of its MGRS
-# tile id ('1VCJ', '31UFU'). NULL when the id does not start with a digit.
-ZONE_SQL = """TRY_CAST(regexp_extract("s2:mgrs_tile", '^(\\d{1,2})', 1) AS INTEGER)"""
+def zone_sql(config: CollectionConfig = DEFAULT_CONFIG) -> str:
+    """The UTM zone of a scene, from the leading one or two digits of its
+    MGRS tile id ('1VCJ', '31UFU') in the collection's tile column. NULL
+    when the id does not start with a digit."""
+    return (f"""TRY_CAST(regexp_extract("{config.tile_column}", """
+            """'^(\\d{1,2})', 1) AS INTEGER)""")
+
+
+ZONE_SQL = zone_sql()
 
 
 def say(msg: str) -> None:
@@ -324,26 +369,215 @@ def gather(sources: list[str]) -> list[str]:
     return files
 
 
-def _select(con, lst: str) -> str:
-    """Canonical select list. A column absent from EVERY source cannot be
-    referenced even with union_by_name, so it becomes a typed NULL — this is
-    what lets partial fixtures and differently-shaped chunks build."""
+# The columns the build computes rather than reads, at the position the
+# schema declares them: _month is the first sort key, _hilbert the last, and
+# the geometry goes through untouched. Both schemas end (..., _month,
+# _hilbert, [_tile,] geometry): a reader's `SELECT * EXCLUDE (geometry),
+# geometry` round-trips, and the published column order is the schema's.
+_COMPUTED = {
+    "_month": "month(datetime)::TINYINT AS _month",
+    "_hilbert": f"ST_Hilbert(geometry, {WORLD}) AS _hilbert",
+    "geometry": "geometry",
+}
+
+
+def _select(con, lst: str, config: CollectionConfig = DEFAULT_CONFIG) -> str:
+    """Canonical select list: every column of config.schema.COLUMNS, in
+    the schema's order, the computed ones (_COMPUTED) as their expressions.
+    A column absent from EVERY source cannot be referenced even with
+    union_by_name, so it becomes a typed NULL — this is what lets partial
+    fixtures and differently-shaped chunks build."""
     have = {r[0] for r in con.execute(
         f"DESCRIBE SELECT * FROM read_parquet([{lst}], union_by_name=true)"
     ).fetchall()}
     parts = []
-    for name, typ, _ in COLUMNS:
-        if name in ("_month", "_hilbert", "geometry"):
-            continue
-        if name in have:
+    for name, typ, _ in config.schema.COLUMNS:
+        if name in _COMPUTED:
+            parts.append(_COMPUTED[name])
+        elif name in have:
             parts.append(f'CAST("{name}" AS {typ}) AS "{name}"')
         else:
             parts.append(f'NULL::{typ} AS "{name}"')
     return ", ".join(parts)
 
 
+class _Wkb(pa.ExtensionType):
+    """`geoarrow.wkb` as a pass-through: pyarrow only maps a Parquet
+    GEOMETRY column to an Arrow extension type if one is registered under
+    this name, and only writes a GEOMETRY logical type back for a column of
+    such a type. The serialized metadata is carried verbatim -- see
+    _writable_wkb() for the one edit the writer needs."""
+
+    def __init__(self, meta: bytes = b"{}", storage=pa.binary()):
+        self.meta = meta
+        super().__init__(storage, "geoarrow.wkb")
+
+    def __arrow_ext_serialize__(self) -> bytes:
+        return self.meta
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls(serialized, storage_type)
+
+
+def _writable_wkb(ext_type) -> _Wkb:
+    """The extension type month_align() writes the geometry column with.
+    pyarrow 24's reader hands the CRS over as a JSON object
+    (`{"crs": {...}}`), but its writer keeps a CRS only when it is a
+    PROJJSON *string* with `crs_type`; given the object form it writes
+    GEOMETRY with no CRS at all (measured 2026-09-21). Re-serializing it
+    compactly reproduces DuckDB's own spelling byte for byte, so the aligned
+    file's logical type equals the gpio-written one's."""
+    md = json.loads(ext_type.__arrow_ext_serialize__())
+    crs = md.get("crs")
+    if isinstance(crs, dict):
+        md["crs"] = json.dumps(crs, separators=(",", ":"))
+        md["crs_type"] = "projjson"
+    return _Wkb(json.dumps(md).encode(), ext_type.storage_type)
+
+
+def _register_wkb() -> None:
+    """Make sure some `geoarrow.wkb` extension type is registered before a
+    GeoParquet 2.0 file is read. geoarrow-pyarrow (a gpio dependency) may
+    have registered its own already; that one reads fine too, and the
+    writer-side type is built by _writable_wkb() either way."""
+    try:
+        pa.register_extension_type(_Wkb())
+    except pa.ArrowKeyError:
+        pass
+
+
+def month_align(src: Path, dst: Path, target: int,
+                level: int = ZSTD_LEVEL) -> list[tuple[int, int]]:
+    """Rewrite the gpio-sorted `src` (sorted `_month` first) as `dst` with
+    row groups that never span a change of `_month` and never exceed
+    `target` rows: a month of 45,000 rows at target 20,000 becomes groups
+    of 20,000, 20,000 and 5,000, and a month filter prunes on `_month`'s
+    row-group statistics to exactly that month's groups, never a
+    neighbour's. Returns (month, rows) per written group, in file order.
+
+    Everything else is carried over from `src` so the result is the same
+    GeoParquet 2.0 file gpio wrote, regrouped: the Arrow schema (the
+    geometry column keeps its native GEOMETRY logical type with the same
+    CRS -- _writable_wkb), the `geo` key-value metadata, zstd at `level`
+    with statistics, per-row-group geo statistics on the geometry column,
+    and per-column dictionary encoding wherever the source used it. The
+    write is verified before returning: every row group's geometry column
+    must carry geo statistics (rashid PTL-DAT-007 and the spatial pruning
+    depend on them), or the build stops.
+
+    Memory: one source row group plus at most `target` pending rows.
+    Speed: pyarrow encodes one column at a time on one core, so at zstd 18
+    this is ~2.6 ms/row on real rows (STAGE_ZSTD_LEVEL's comment) -- which
+    is why the gpio sort that feeds it runs at STAGE_ZSTD_LEVEL rather
+    than paying the level twice."""
+    _register_wkb()
+    pf = pq.ParquetFile(src, arrow_extensions_enabled=True)
+    schema = pf.schema_arrow
+    gi = schema.get_field_index("geometry")
+    geo = schema.field(gi)
+    if not (isinstance(geo.type, pa.ExtensionType)
+            and geo.type.extension_name == "geoarrow.wkb"):
+        raise SystemExit(
+            f"{src.name}: geometry is {geo.type}, not a native Parquet "
+            f"GEOMETRY column; refusing to month-align a file that is not "
+            f"GeoParquet 2.0")
+    wkb = _writable_wkb(geo.type)
+    out_schema = schema.set(gi, geo.with_type(wkb)).remove_metadata()
+    # Dictionary-encode exactly the leaves DuckDB did (any source group).
+    dict_cols: list[str] = []
+    for r in range(pf.num_row_groups):
+        rg = pf.metadata.row_group(r)
+        for c in range(rg.num_columns):
+            col = rg.column(c)
+            if col.has_dictionary_page and col.path_in_schema not in dict_cols:
+                dict_cols.append(col.path_in_schema)
+    kv = {k.decode(): v.decode()
+          for k, v in (pf.metadata.metadata or {}).items()
+          if k != b"ARROW:schema"}
+    if "geo" not in kv:
+        raise SystemExit(f"{src.name}: no `geo` metadata; not GeoParquet")
+
+    written: list[tuple[int, int]] = []
+    pending: list[pa.Table] = []
+    pending_rows = 0
+    pending_month: int | None = None
+    dst.unlink(missing_ok=True)
+    writer = pq.ParquetWriter(
+        dst, schema=out_schema, compression="zstd", compression_level=level,
+        write_statistics=True, use_dictionary=dict_cols, store_schema=False)
+
+    def emit(table: pa.Table) -> None:
+        writer.write_table(table, row_group_size=len(table))
+        written.append((pending_month, len(table)))
+
+    def drain(everything: bool) -> None:
+        nonlocal pending, pending_rows
+        if not pending:
+            return
+        table = pa.concat_tables(pending)
+        while len(table) >= target:
+            emit(table.slice(0, target))
+            table = table.slice(target)
+        if everything and len(table):
+            emit(table)
+            table = table.slice(len(table))
+        pending = [table] if len(table) else []
+        pending_rows = len(table)
+
+    try:
+        for r in range(pf.num_row_groups):
+            table = pf.read_row_group(r)
+            chunks = table.column(gi).chunks
+            table = table.set_column(gi, out_schema.field(gi), pa.chunked_array(
+                [pa.ExtensionArray.from_storage(wkb, c.storage) for c in chunks],
+                type=wkb))
+            months = table.column("_month").combine_chunks()
+            if months.null_count:
+                raise SystemExit(f"{src.name}: NULL _month in row group {r}")
+            start = 0
+            for m in pc.unique(months).to_pylist():
+                # The file is sorted _month-first, so each month is one run.
+                n = pc.sum(pc.equal(months, m)).as_py()
+                run = months.slice(start, n)
+                if pc.min(run).as_py() != m or pc.max(run).as_py() != m:
+                    raise SystemExit(
+                        f"{src.name}: row group {r} is not sorted by _month; "
+                        f"cannot month-align it")
+                if pending_month is not None and m < pending_month:
+                    raise SystemExit(
+                        f"{src.name}: _month goes back from {pending_month} "
+                        f"to {m} at row group {r}; not sorted")
+                if pending_month is not None and m != pending_month:
+                    drain(everything=True)
+                pending_month = m
+                pending.append(table.slice(start, n))
+                pending_rows += n
+                if pending_rows >= target:
+                    drain(everything=False)
+                start += n
+        drain(everything=True)
+        writer.add_key_value_metadata(kv)
+    finally:
+        writer.close()
+
+    # The artifact, not the intent: every group's geometry column carries
+    # the geo statistics a 2.0 reader prunes on.
+    meta = pq.ParquetFile(dst).metadata
+    leaf = next(i for i in range(meta.row_group(0).num_columns)
+                if meta.row_group(0).column(i).path_in_schema == "geometry")
+    for r in range(meta.num_row_groups):
+        if meta.row_group(r).column(leaf).geo_statistics is None:
+            raise SystemExit(
+                f"{dst.name}: row group {r} has no geo statistics on "
+                f"geometry after month alignment; refusing to publish it")
+    return written
+
+
 def _sort_and_check(con, staged: Path, final: Path, year: int,
-                    memory: str) -> None:
+                    memory: str, config: CollectionConfig = DEFAULT_CONFIG,
+                    zstd_level: int = ZSTD_LEVEL,
+                    row_group_mode: str = "uniform") -> None:
     """The ordered GeoParquet 2.0 write of one part, its gate, then its name.
 
     gpio writes `.<stem>.tmp.parquet`, `gpio check all` runs on that, and
@@ -356,27 +590,46 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
     was silently dropped and the write self-picked 50% of available RAM.
     The DuckDB limit drops to GPIO_HANDOFF for the duration so the two
     processes are not bidding for the same RAM.
+
+    With row_group_mode "month_aligned" gpio sorts into a staging file next
+    to `staged` at STAGE_ZSTD_LEVEL, month_align() rewrites that as the
+    dotfile at `zstd_level`, and the same check and rename follow.
     """
     name = final.name
+    aligned = row_group_mode == "month_aligned"
+    if row_group_mode not in ("uniform", "month_aligned"):
+        raise SystemExit(f"unknown row group mode {row_group_mode!r}")
     tmp = final.with_name(f".{final.stem}.tmp.parquet")
     tmp.unlink(missing_ok=True)
+    sorted_path = staged.with_name(f".{final.stem}.sorted.parquet") if aligned else tmp
+    gpio_level = STAGE_ZSTD_LEVEL if aligned else zstd_level
+    key = sort_key(year, config)
     t0 = time.monotonic()
     try:
         con.execute(f"SET memory_limit='{GPIO_HANDOFF}';")
         r = subprocess.run(
-            ["gpio", "sort", "column", str(staged), str(tmp),
-             sort_key(year), "--geoparquet-version", "2.0",
+            ["gpio", "sort", "column", str(staged), str(sorted_path),
+             key, "--geoparquet-version", "2.0",
              "--compression", "zstd",
-             "--compression-level", str(ZSTD_LEVEL),
+             "--compression-level", str(gpio_level),
              "--row-group-size", str(_row_group_size),
              "--write-memory", memory],
             capture_output=True, text=True)
         if r.returncode != 0:
             print(r.stdout[-1500:], r.stderr[-1500:], file=sys.stderr)
             raise SystemExit(f"gpio sort failed for {year}")
-        say(f"year={year}/{name}: sorted ({sort_key(year)}) and written "
-            f"zstd-{ZSTD_LEVEL}, {tmp.stat().st_size / 1e6:,.0f} MB, "
+        say(f"year={year}/{name}: sorted ({key}) and written "
+            f"zstd-{gpio_level}, {sorted_path.stat().st_size / 1e6:,.0f} MB, "
             f"{time.monotonic() - t0:,.1f}s")
+        if aligned:
+            t0 = time.monotonic()
+            groups = month_align(sorted_path, tmp, _row_group_size, zstd_level)
+            sorted_path.unlink()
+            say(f"year={year}/{name}: {len(groups)} month-aligned row groups "
+                f"(<= {_row_group_size:,} rows, "
+                f"{len({m for m, _ in groups})} month(s)) written "
+                f"zstd-{zstd_level}, {tmp.stat().st_size / 1e6:,.0f} MB, "
+                f"{time.monotonic() - t0:,.1f}s")
         # Best-practices gate on the artifact itself: compression, row
         # groups, spatial order, bbox metadata. Fails the build only on
         # gpio's error-level violations (non-zero exit); WARNING-level
@@ -394,6 +647,8 @@ def _sort_and_check(con, staged: Path, final: Path, year: int,
     finally:
         con.execute(f"SET memory_limit='{memory}';")
         tmp.unlink(missing_ok=True)
+        if aligned:
+            sorted_path.unlink(missing_ok=True)
 
 
 def published_url(url: str, tries: int = 8, what: str = "") -> bool:
@@ -464,7 +719,8 @@ def live_row_count(url: str) -> int:
 
 
 def consolidation_plan(base: str, year: int, probe=published_part,
-                       live_rows=live_row_count) -> dict:
+                       live_rows=live_row_count,
+                       config: CollectionConfig = DEFAULT_CONFIG) -> dict:
     """What consolidate-month.yml's plan job needs to know about a year,
     from one round of HEADs: whether live.parquet is published, how many
     rows it holds, and for each archive part of the year's tier ("items"
@@ -489,7 +745,7 @@ def consolidation_plan(base: str, year: int, probe=published_part,
              "parts": [label, ...],
              "include": [{"year": year, "part": label, "exists": bool}, ...]}.
     """
-    labels = [label for label, _, _ in zone_parts_for(year)] or ["items"]
+    labels = [label for label, _, _ in zone_parts_for(year, config)] or ["items"]
     live = probe(base, year, "live.parquet")
     rows = live_rows(f"{base.rstrip('/')}/year={year}/live.parquet") if live else None
     include = [{"year": year, "part": label,
@@ -500,7 +756,8 @@ def consolidation_plan(base: str, year: int, probe=published_part,
 
 
 def consolidation_plans(base: str, years: list[int], probe=published_part,
-                        live_rows=live_row_count) -> dict:
+                        live_rows=live_row_count,
+                        config: CollectionConfig = DEFAULT_CONFIG) -> dict:
     """consolidation_plan() over several years, merged into the shape the
     plan job writes to its outputs: the years to fold (those whose live is
     published with rows), each folded year's part labels, and one matrix
@@ -513,7 +770,8 @@ def consolidation_plans(base: str, years: list[int], probe=published_part,
              "include": [{"year", "part", "exists"}, ...],
              "plans": {year: consolidation_plan(...)}}.
     """
-    plans = {y: consolidation_plan(base, y, probe, live_rows) for y in years}
+    plans = {y: consolidation_plan(base, y, probe, live_rows, config)
+             for y in years}
     folded = [y for y in years if plans[y]["fold"]]
     return {"years": folded,
             "parts": {str(y): plans[y]["parts"] for y in folded},
@@ -546,6 +804,7 @@ def _stage_zone_parts(con, staged: Path, year: int,
                       skip: dict[str, str],
                       remote_rows=published_rows,
                       partial: bool = False,
+                      config: CollectionConfig = DEFAULT_CONFIG,
                       ) -> tuple[list[tuple[str, Path | None, int]], int]:
     """Copy each range of `parts` out of the staged year into its own staged
     file. Returns ((label, path, rows) for the ranges that have rows, rows
@@ -563,18 +822,19 @@ def _stage_zone_parts(con, staged: Path, year: int,
     rows of every other range are dropped on purpose, and their count is
     logged and returned so the caller's row accounting still closes. Without
     it the tier covers zones 1-60 and nothing is dropped."""
+    zone = zone_sql(config)
     lost = con.execute(
         f"SELECT count(*) FROM read_parquet('{staged}') "
-        f"WHERE {ZONE_SQL} IS NULL OR {ZONE_SQL} NOT BETWEEN 1 AND 60"
+        f"WHERE {zone} IS NULL OR {zone} NOT BETWEEN 1 AND 60"
     ).fetchone()[0]
     if lost:
         raise SystemExit(
             f"year={year}: {lost:,} row(s) with no UTM zone in "
-            f"s2:mgrs_tile fall outside every zone part; refusing to "
+            f"{config.tile_column} fall outside every zone part; refusing to "
             f"drop them")
     dropped = 0
     if partial:
-        kept = " OR ".join(f"{ZONE_SQL} BETWEEN {lo} AND {hi}"
+        kept = " OR ".join(f"{zone} BETWEEN {lo} AND {hi}"
                            for _, lo, hi in parts)
         dropped = con.execute(
             f"SELECT count(*) FROM read_parquet('{staged}') "
@@ -588,7 +848,7 @@ def _stage_zone_parts(con, staged: Path, year: int,
         if label in skip:
             n = con.execute(
                 f"SELECT count(*) FROM read_parquet('{staged}') "
-                f"WHERE {ZONE_SQL} BETWEEN {lo} AND {hi}").fetchone()[0]
+                f"WHERE {zone} BETWEEN {lo} AND {hi}").fetchone()[0]
             have = remote_rows(con, skip[label])
             if have != n:
                 raise SystemExit(
@@ -605,7 +865,7 @@ def _stage_zone_parts(con, staged: Path, year: int,
         t0 = time.monotonic()
         con.execute(f"""
             COPY (SELECT * FROM read_parquet('{staged}')
-                  WHERE {ZONE_SQL} BETWEEN {lo} AND {hi})
+                  WHERE {zone} BETWEEN {lo} AND {hi})
             TO '{part_staged}'
               (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {ROW_GROUP})
         """)
@@ -728,26 +988,40 @@ def build_year(con, files: list[str], year: int, outdir: Path,
                probe=published_part, remote_rows=published_rows,
                only_parts: tuple[str, ...] | None = None,
                exclude_ids_from: list[str] | None = None,
-               probe_url=published_url) -> tuple[int, int, int]:
+               probe_url=published_url,
+               config: CollectionConfig = DEFAULT_CONFIG,
+               zstd_level: int = ZSTD_LEVEL,
+               row_group_mode: str | None = None) -> tuple[int, int, int]:
     """Build one year. Returns (rows written, parts skipped as already
     published, part files written -- which counts a zero-row live written
     because --exclude-ids-from dropped every staged row). With --split zones the parts are zone_parts_for(year); a
     year below ZONE_SPLIT_FROM has none and the split is refused rather
-    than silently written whole. `only_parts` narrows those to the named
+    than silently written whole, as it is for a collection whose
+    zone_split is False. `only_parts` narrows those to the named
     labels (only_zone_parts) and the other ranges' rows are dropped.
     `exclude_ids_from` (--exclude-ids-from) drops staged rows whose id a
     listed published part holds, see exclude_published_ids(). `probe`
     (published_part), `remote_rows` (published_rows) and `probe_url`
     (published_url) are injectable for tests. A year whose every part is
     published is skipped before staging, on the HEADs alone: the point of
-    the flag is that re-dispatching a finished year costs nothing."""
+    the flag is that re-dispatching a finished year costs nothing.
+    `config` is the collection (schema, tile column, split, row-group
+    mode); `zstd_level` (--zstd-level) and `row_group_mode`
+    (--row-group-mode, default config.row_group_mode) are what the
+    published part is written with."""
     lst = ",".join(f"'{f}'" for f in files)
     label = "zones" if split == "zones" else name
+    if row_group_mode is None:
+        row_group_mode = config.row_group_mode
     # Every refusal comes before the year directory exists, so a refused
     # build leaves no empty year=YYYY/ behind.
     parts = ()
     if split == "zones":
-        parts = zone_parts_for(year)
+        if not config.zone_split:
+            raise SystemExit(
+                f"--split zones: {config.id} has zone_split=False; every "
+                f"year is one items.parquet")
+        parts = zone_parts_for(year, config)
         if not parts:
             raise SystemExit(
                 f"--split zones: {year} is before {ZONE_SPLIT_FROM} and has "
@@ -777,10 +1051,7 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         t0 = time.monotonic()
         con.execute(f"""
             COPY (
-              SELECT {_select(con, lst)},
-                     month(datetime)::TINYINT AS _month,
-                     ST_Hilbert(geometry, {WORLD}) AS _hilbert,
-                     geometry
+              SELECT {_select(con, lst, config)}
               FROM read_parquet([{lst}], union_by_name=true)
               WHERE year(datetime) = {year}
               QUALIFY row_number() OVER (
@@ -814,7 +1085,8 @@ def build_year(con, files: list[str], year: int, outdir: Path,
                 shutil.rmtree(dest, ignore_errors=True)
             return 0, 0, 0
         if split != "zones":
-            _sort_and_check(con, staged, final, year, memory)
+            _sort_and_check(con, staged, final, year, memory, config,
+                            zstd_level, row_group_mode)
             print(f"  year={year}/{name}: {n:,} rows, "
                   f"{final.stat().st_size / 1e6:,.0f} MB", flush=True)
             if on_part_done:
@@ -827,13 +1099,14 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         written = skipped = parts_written = 0
         staged_parts, dropped = _stage_zone_parts(
             con, staged, year, parts, skip, remote_rows,
-            partial=bool(only_parts))
+            partial=bool(only_parts), config=config)
         for part_label, part_staged, part_rows in staged_parts:
             if part_staged is None:
                 skipped += part_rows
                 continue
             part_final = dest / f"{part_label}.parquet"
-            _sort_and_check(con, part_staged, part_final, year, memory)
+            _sort_and_check(con, part_staged, part_final, year, memory,
+                            config, zstd_level, row_group_mode)
             part_staged.unlink()
             print(f"  year={year}/{part_final.name}: {part_rows:,} rows, "
                   f"{part_final.stat().st_size / 1e6:,.0f} MB", flush=True)
@@ -857,9 +1130,21 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", default="items.parquet")
     ap.add_argument("--memory", default="8GB")
-    ap.add_argument("--row-group-size", type=int, default=ROW_GROUP,
-                    help=f"rows per Parquet row group (default {ROW_GROUP}; the "
+    cols.add_collection_arg(ap)
+    ap.add_argument("--row-group-size", type=int,
+                    help="rows per Parquet row group (default: the "
+                         f"collection's, {ROW_GROUP} for {cols.DEFAULT}; the "
                          "read-amplification knob for remote lookups)")
+    ap.add_argument("--row-group-mode", choices=["uniform", "month_aligned"],
+                    help="uniform: gpio's fixed-size groups; month_aligned: "
+                         "groups of at most --row-group-size rows that never "
+                         "span a change of _month (month_align). Default: "
+                         "the collection's")
+    ap.add_argument("--zstd-level", type=int, choices=range(1, 23),
+                    metavar="1-22", default=ZSTD_LEVEL,
+                    help=f"zstd level of the published part (default "
+                         f"{ZSTD_LEVEL}; a live.parquet that is rewritten "
+                         "daily may pass the collection's live_zstd_level)")
     ap.add_argument("--split", choices=["zones"],
                     help="write the year as zone parts by UTM zone instead "
                          f"of one --name file: {len(ZONE_PARTS)} parts from "
@@ -883,8 +1168,12 @@ def main() -> int:
                          "the sort. 404 skips a URL, anything else stops "
                          "the build")
     a = ap.parse_args()
+    config = cols.get(a.collection)
     global _row_group_size
-    _row_group_size = a.row_group_size
+    _row_group_size = a.row_group_size or config.row_group_size or ROW_GROUP
+    if a.split and not config.zone_split:
+        ap.error(f"--split zones: {config.id} has zone_split=False; every "
+                 "year is one items.parquet")
     if a.split and a.name != "items.parquet":
         ap.error("--split zones names its own parts; --name does not apply")
     only_parts = None
@@ -920,7 +1209,8 @@ def main() -> int:
         rows, skips, parts_written = build_year(
             con, files, y, outdir, a.name, a.memory, a.split,
             a.skip_existing_url, hook, only_parts=only_parts,
-            exclude_ids_from=a.exclude_ids_from)
+            exclude_ids_from=a.exclude_ids_from, config=config,
+            zstd_level=a.zstd_level, row_group_mode=a.row_group_mode)
         total += rows
         skipped += skips
         written += parts_written

@@ -265,15 +265,15 @@ def _get_json(url: str, tries: int = 8) -> dict:
 def fetch_and_write(scenes: list[tuple[str, str]], get_fn, nd_path: str,
                     workers: int = 16,
                     config: CollectionConfig = DEFAULT_CONFIG) -> tuple[int, int]:
-    """GET + config.schema.normalize() every scene's item JSON, writing each
-    row straight to the NDJSON file at `nd_path` as its future completes -- never holds
-    more than one month's worth of in-flight requests in memory, unlike
-    accumulating a Python list of ~450k rows. The writes happen in THIS
-    thread as as_completed() yields (fetching is threaded, consuming is
-    not), so no lock is needed even though GETs run in worker threads.
-    `get_fn(url)` returns the parsed item dict -- injected so this is
-    testable without S3, and swapped for a real HTTPS GET (with retry) in
-    production.
+    """GET + config.schema.normalize() every scene's item JSON, writing
+    each row straight to the NDJSON file at `nd_path` as its future
+    completes -- never holds more than one month's worth of in-flight
+    requests in memory, unlike accumulating a Python list of ~450k rows.
+    The writes happen in THIS thread as as_completed() yields (fetching is
+    threaded, consuming is not), so no lock is needed even though GETs run
+    in worker threads. `get_fn(url)` returns the parsed item dict --
+    injected so this is testable without S3, and swapped for a real HTTPS
+    GET (with retry) in production.
 
     Two kinds of per-scene skip, both logged and counted rather than
     raised (a single bad scene must never crash the whole day's, let alone

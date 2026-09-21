@@ -162,7 +162,7 @@ def inventory_source(data_paths: list[str]) -> str:
     if all(p.endswith((".csv", ".csv.gz")) for p in data_paths):
         columns = ", ".join(f"'{k}': '{v}'" for k, v in CSV_COLUMNS.items())
         return f"read_csv([{files}], columns={{{columns}}}, header=false)"
-    kinds = sorted({p.rsplit("/", 1)[-1].split(".", 1)[-1] for p in data_paths})
+    kinds = sorted({Path(p).suffix or "(none)" for p in data_paths})
     raise SystemExit(f"inventory data files must all be .parquet or .csv[.gz]; "
                      f"got suffixes {kinds}")
 
