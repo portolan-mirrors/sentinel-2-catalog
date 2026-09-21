@@ -452,25 +452,68 @@ def published_rows(con, url: str) -> int:
             f"refusing to guess whether the published part is current")
 
 
-def consolidation_plan(base: str, year: int, probe=published_part) -> dict:
-    """What consolidate-month.yml's plan job needs to know about a year,
-    from one round of HEADs: whether live.parquet is published, and for
-    each archive part of the year's tier ("items" when it has none)
-    whether it is. Every HEAD goes through `probe` (published_part, with
-    its retries), so a transient failure is retried here, once, instead of
-    in each of eight part jobs -- one part job that took a passing 404 for
-    "never published" would rebuild its part from live alone and drop the
-    rest of the year's scenes on upload. A probe that cannot answer stops
-    the plan (published_part raises), and nothing is built.
+def live_row_count(url: str) -> int:
+    """published_rows() on its own connection: the row count of a published
+    live.parquet from its footer, for a plan that has no build connection."""
+    return published_rows(duckdb.connect(), url)
 
-    Returns {"live": bool, "parts": [label, ...],
-             "include": [{"part": label, "exists": bool}, ...]}.
+
+def consolidation_plan(base: str, year: int, probe=published_part,
+                       live_rows=live_row_count) -> dict:
+    """What consolidate-month.yml's plan job needs to know about a year,
+    from one round of HEADs: whether live.parquet is published, how many
+    rows it holds, and for each archive part of the year's tier ("items"
+    when it has none) whether it is published. Every HEAD goes through
+    `probe` (published_part, with its retries), so a transient failure is
+    retried here, once, instead of in each of eight part jobs -- one part
+    job that took a passing 404 for "never published" would rebuild its
+    part from live alone and drop the rest of the year's scenes on upload.
+    A probe that cannot answer stops the plan (published_part raises), and
+    nothing is built.
+
+    The row count comes from the footer through `live_rows` (published_rows
+    over HTTP) and decides `fold`: a year is folded only when its live is
+    published AND holds rows. An emptied live (what the last consolidation
+    left, zero rows) has nothing to fold, and folding it would rewrite every
+    part of the year from the part alone -- hours of runner time for a
+    byte-identical result. This is what lets the plan look at the previous
+    year every month: in January it folds December's tail, and from
+    February on the previous year's live is empty and is skipped.
+
+    Returns {"live": bool, "rows": int | None, "fold": bool,
+             "parts": [label, ...],
+             "include": [{"year": year, "part": label, "exists": bool}, ...]}.
     """
     labels = [label for label, _, _ in zone_parts_for(year)] or ["items"]
     live = probe(base, year, "live.parquet")
-    include = [{"part": label, "exists": probe(base, year, f"{label}.parquet")}
+    rows = live_rows(f"{base.rstrip('/')}/year={year}/live.parquet") if live else None
+    include = [{"year": year, "part": label,
+                "exists": probe(base, year, f"{label}.parquet")}
                for label in labels]
-    return {"live": live, "parts": labels, "include": include}
+    return {"live": live, "rows": rows, "fold": bool(live and rows),
+            "parts": labels, "include": include}
+
+
+def consolidation_plans(base: str, years: list[int], probe=published_part,
+                        live_rows=live_row_count) -> dict:
+    """consolidation_plan() over several years, merged into the shape the
+    plan job writes to its outputs: the years to fold (those whose live is
+    published with rows), each folded year's part labels, and one matrix
+    entry per (year, part). consolidate-month.yml asks for the current
+    year and the previous one every month, so the year's last tail (the
+    scenes of late December, fetched in the new year's first days) is
+    folded on January 3rd instead of never.
+
+    Returns {"years": [year, ...], "parts": {"YYYY": [label, ...]},
+             "include": [{"year", "part", "exists"}, ...],
+             "plans": {year: consolidation_plan(...)}}.
+    """
+    plans = {y: consolidation_plan(base, y, probe, live_rows) for y in years}
+    folded = [y for y in years if plans[y]["fold"]]
+    return {"years": folded,
+            "parts": {str(y): plans[y]["parts"] for y in folded},
+            "include": [e for y in folded for e in plans[y]["include"]],
+            "plans": plans}
 
 
 def run_part_hook(cmd: list[str], part: Path, year: int) -> None:
@@ -656,19 +699,21 @@ def exclude_published_ids(con, staged: Path, urls: list[str], year: int,
 
 
 def write_empty_part(con, staged: Path, final: Path, year: int) -> None:
-    """A zero-row part with the staged schema, the shape
-    consolidate-month.yml publishes for an emptied live.parquet: a plain
-    DuckDB COPY, not the gpio sort/check pipeline, which has nothing to
-    sort or check in an empty file. Written through the same dotfile
-    temporary and os.replace() as a real part."""
+    """A zero-row part with the schema of `staged` (a staged year, or a
+    finished archive part): a plain DuckDB COPY, not the gpio
+    sort/check pipeline, which has nothing to sort or check in an empty
+    file. Written through the same dotfile temporary and os.replace() as
+    a real part. Two callers: build_year() when --exclude-ids-from drops
+    every staged row, and consolidate-month.yml's finalize job for the
+    emptied live.parquet of each year it folded."""
     tmp = final.with_name(f".{final.stem}.tmp.parquet")
     con.execute(f"""
         COPY (SELECT * FROM read_parquet('{staged}') LIMIT 0)
         TO '{tmp}' (FORMAT PARQUET, COMPRESSION zstd)
     """)
     os.replace(tmp, final)
-    say(f"year={year}/{final.name}: every staged row is already in the "
-        f"published archive; wrote it with zero rows")
+    say(f"year={year}/{final.name}: wrote it with zero rows "
+        f"(schema of {staged.name})")
 
 
 def build_year(con, files: list[str], year: int, outdir: Path,
@@ -754,6 +799,8 @@ def build_year(con, files: list[str], year: int, outdir: Path,
                 # the part is current and empty, which is a result to
                 # publish (the stats splice and the restamps still run),
                 # not a failed build.
+                say(f"year={year}/{name}: every staged row is already in "
+                    f"the published archive")
                 write_empty_part(con, staged, final, year)
                 if on_part_done:
                     run_part_hook(on_part_done, final, year)

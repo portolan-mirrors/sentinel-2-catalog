@@ -1,9 +1,9 @@
 name: refresh-daily
 
-# Pull the last few days of Earth Search items into the current year's
-# live.parquet, splice the current year into the stats table, restamp
-# extents/counts, upload. Nothing is committed: the repository keeps only
-# the stable catalog definition (firms-catalog model).
+# Pull the last few days of Earth Search items into live.parquet, splice
+# the years they touch into the stats table, restamp extents/counts,
+# upload. Nothing is committed: the repository keeps only the stable
+# catalog definition (firms-catalog model).
 #
 # The 5-day lookback covers Sentinel-2's hours-to-days publication latency;
 # the dedupe rule in s2_build makes re-fetched days harmless within live,
@@ -12,6 +12,19 @@ name: refresh-daily
 # hold, and without the exclusion those scenes were published twice for up
 # to five days (49,942 of live's 84,675 rows on 2026-09-19), which broke the
 # "a glob reads each scene once" promise and inflated the month's stats.
+#
+# Years come from the slice, not the calendar. From December 27th to
+# January 2nd the lookback spans two years, and each year in it gets its
+# own live.parquet (previous live + slice, minus that year's archive ids)
+# and its own place in the stats splice. The old rule, `--years $(date
+# +%Y)`, dropped the late-December scenes of the first January runs and,
+# with the splice refusing a year that had no archive part, failed every
+# run of the new year before anything was uploaded -- so the new year's
+# live never existed and consolidate-month never had anything to fold.
+# The splice now reads a year from live alone when it has no archive
+# part yet, but only for the current calendar year: that is the new
+# year's first days, before its first consolidation. Any other year
+# with no archive part is a broken catalog and still fails.
 #
 # Bootstrap guard: on a fresh repo nothing is published yet (the backfill
 # and publish-backfill pipeline runs once, separately, to seed the catalog).
@@ -68,118 +81,136 @@ jobs:
           END=$(date -u +%F)
           python3 tools/s2_fetch.py --start "$START" --end "$END" \
             --out ./staging/chunks
-      # The current year's published archive parts, probed once and used
-      # twice: the live build excludes their ids, and the stats splice
-      # reads them alongside live. The archive is items.parquet for a year
-      # published whole (2015-2018), the four z*.parquet UTM-zone quartiles
-      # for 2019-2020, or the eight octants from 2021 (spec Amendment 3);
-      # the names come from tools/s2_build.py archive_part_names() so this
-      # cannot drift from the builder. Every name is probed: 404 means that
-      # shape is not this year's, any other non-200 is a part this run
-      # cannot see and fails the job. An empty list (a year with no
-      # consolidation yet) is allowed here; the stats step decides what it
-      # means for the splice.
-      - name: Enumerate the current year's archive parts
-        id: archive
-        if: steps.guard.outputs.published == 'true'
-        run: |
-          set -euo pipefail
-          Y=$(date -u +%Y)
-          BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog
-          ARCHIVE_NAMES=$(python3 -c '
-          import sys; sys.path.insert(0, "tools")
-          from s2_build import archive_part_names
-          print(" ".join(archive_part_names()))')
-          URLS=()
-          for NAME in $ARCHIVE_NAMES; do
-            URL="$BASE/sentinel-2-l2a/year=$Y/$NAME.parquet"
-            CODE=$(curl -sS -o /dev/null -w '%{http_code}' -I "$URL")
-            case "$CODE" in
-              200) URLS+=("$URL") ;;
-              404) ;;
-              *) echo "::error::$URL: HEAD answered $CODE, not 200 or 404"; exit 1 ;;
-            esac
-          done
-          echo "archive part(s) for $Y: ${#URLS[@]}"
-          echo "urls<<PARTS_EOF" >> "$GITHUB_OUTPUT"
-          if [ "${#URLS[@]}" -gt 0 ]; then
-            printf '  %s\n' "${URLS[@]}"
-            printf '%s\n' "${URLS[@]}" >> "$GITHUB_OUTPUT"
-          fi
-          echo "PARTS_EOF" >> "$GITHUB_OUTPUT"
-      - name: Rebuild the live part
+      # One round of probes for every year in the slice, through
+      # s2_build.published_part (retried; a code that is not 200 or 404
+      # stops the run): is that year's live.parquet published, and which
+      # of its archive parts are. The archive is items.parquet for a year
+      # published whole (2015-2018), the four z*.parquet UTM-zone
+      # quartiles for 2019-2020, or the eight octants from 2021 (spec
+      # Amendment 3); the names come from tools/s2_build.py
+      # archive_part_names() so this cannot drift from the builder. An
+      # empty part list (a year with no consolidation yet) is allowed
+      # here; the stats step decides what it means for the splice. The
+      # answers land under staging/plan/ as plain files for the bash
+      # steps below.
+      - name: Plan every year in the slice
         if: steps.guard.outputs.published == 'true'
         env:
-          ARCHIVE_URLS: ${{ steps.archive.outputs.urls }}
+          BASE: https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
         run: |
           set -euo pipefail
-          Y=$(date -u +%Y)
+          python3 - << 'EOF'
+          import os, sys
+          from pathlib import Path
+          import duckdb
+          sys.path.insert(0, "tools")
+          from s2_build import archive_part_names, gather, published_part
+          base = os.environ["BASE"]
+          files = gather(["staging/chunks"])
+          lst = ",".join(f"'{f}'" for f in files)
+          con = duckdb.connect()
+          con.execute("SET TimeZone='UTC';")   # the build's year() zone
+          years = [r[0] for r in con.execute(
+              f"SELECT DISTINCT year(datetime) AS y "
+              f"FROM read_parquet([{lst}], union_by_name=true) ORDER BY y"
+          ).fetchall()]
+          if not years:
+              raise SystemExit("the lookback slice holds no rows")
+          plan = Path("staging/plan")
+          plan.mkdir(parents=True)
+          (plan / "years").write_text("".join(f"{y}\n" for y in years))
+          for y in years:
+              live = published_part(base, y, "live.parquet")
+              urls = [f"{base}/year={y}/{n}.parquet" for n in archive_part_names()
+                      if published_part(base, y, f"{n}.parquet")]
+              (plan / str(y)).mkdir()
+              (plan / str(y) / "live").write_text("true" if live else "false")
+              (plan / str(y) / "archive.urls").write_text(
+                  "".join(f"{u}\n" for u in urls))
+              print(f"year={y}: live {'published' if live else 'not published'}; "
+                    f"{len(urls)} archive part(s)")
+              for u in urls:
+                  print(f"  {u}")
+          EOF
+      # One live.parquet per year in the slice, each merged with that
+      # year's existing live so a fetch gap never truncates it. The plan
+      # saw whether the previous live is published: 404 means the year's
+      # first live and the build starts from the slice alone; 200 means
+      # the GET must succeed, and any failure -- a 5xx, a timeout, a body
+      # cut short -- stops the run. A live rebuilt from the five-day
+      # slice alone would upload without complaint (its size differs),
+      # and the next consolidation would fold it: every scene between the
+      # last consolidation and today-5d gone from the archive for good,
+      # with no signal. The dedupe rule resolves duplicates within live;
+      # the year's archive parts are the floor: every id they hold is
+      # dropped from live before the sort (--exclude-ids-from), so live
+      # and archive never overlap and a glob over the year reads each
+      # scene once.
+      - name: Rebuild the live part of every year in the slice
+        if: steps.guard.outputs.published == 'true'
+        run: |
+          set -euo pipefail
           BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
-          # Merge with the existing live part so a fetch gap never truncates
-          # it. The dedupe rule resolves duplicates within live; the year's
-          # archive parts are the floor: every id they hold is dropped from
-          # live before the sort (--exclude-ids-from), so live and archive
-          # never overlap and a glob over the year reads each scene once.
-          #
-          # HEAD first, and only a 404 means "no previous live". A 200 makes
-          # the GET mandatory, and any failure -- a 5xx, a timeout, a body
-          # cut short -- stops the run; so does any HEAD answer that is not
-          # 200 or 404. The old `curl ... || rm -f` treated every failure
-          # as "no previous live": live was then rebuilt from the five-day
-          # slice alone, uploaded without complaint (its size differs), and
-          # the next consolidation folded it -- every scene between the last
-          # consolidation and today-5d gone from the archive for good, with
-          # no signal. Same pattern as consolidate-month.yml's fetch().
-          SRC="./staging/chunks"
-          CODE=$(curl -sS -o /dev/null -w '%{http_code}' -I "$BASE/year=$Y/live.parquet")
-          case "$CODE" in
-            200)
-              curl -fSL -o staging/live-prev.parquet "$BASE/year=$Y/live.parquet" || {
-                rm -f staging/live-prev.parquet
-                echo "::error::year=$Y/live.parquet: GET failed after HEAD 200; a live rebuilt without it would lose every scene since the last consolidation"
+          while read -r Y; do
+            [ -n "$Y" ] || continue
+            SRC="./staging/chunks"
+            if [ "$(cat "staging/plan/$Y/live")" = "true" ]; then
+              curl -fSL -o "staging/live-prev-$Y.parquet" "$BASE/year=$Y/live.parquet" || {
+                rm -f "staging/live-prev-$Y.parquet"
+                echo "::error::year=$Y/live.parquet: GET failed after the plan saw it published; a live rebuilt without it would lose every scene since the last consolidation"
                 exit 1
               }
-              SRC="$SRC staging/live-prev.parquet"
-              ;;
-            404)
+              SRC="$SRC staging/live-prev-$Y.parquet"
+            else
               echo "year=$Y/live.parquet: not published (404); building the year's first live from the slice alone"
-              ;;
-            *)
-              echo "::error::year=$Y/live.parquet: HEAD answered $CODE, not 200 or 404"
-              exit 1
-              ;;
-          esac
-          EXCLUDE=()
-          if [ -n "$ARCHIVE_URLS" ]; then
-            mapfile -t URLS <<< "$ARCHIVE_URLS"
-            EXCLUDE=(--exclude-ids-from "${URLS[@]}")
-          fi
-          python3 tools/s2_build.py --sources $SRC --years "$Y" \
-            --out ./staging/publish/sentinel-2-l2a --name live.parquet \
-            "${EXCLUDE[@]}"
-      # The current year's sources are its published archive parts (the
-      # list enumerated above) plus the live.parquet just built. A current
-      # year with no archive part at all is a broken catalog, not a smaller
-      # splice -- it fails.
-      - name: Splice current year into stats
+            fi
+            EXCLUDE=()
+            if [ -s "staging/plan/$Y/archive.urls" ]; then
+              mapfile -t URLS < "staging/plan/$Y/archive.urls"
+              EXCLUDE=(--exclude-ids-from "${URLS[@]}")
+            fi
+            # $SRC is unquoted on purpose: a word list. EXCLUDE expands to
+            # nothing when the year has no archive part yet (the ${a[@]+...}
+            # form, so an empty array is not an unbound variable under -u).
+            python3 tools/s2_build.py --sources $SRC --years "$Y" \
+              --out ./staging/publish/sentinel-2-l2a --name live.parquet \
+              ${EXCLUDE[@]+"${EXCLUDE[@]}"}
+          done < staging/plan/years
+      # Each year's sources are its published archive parts (the list the
+      # plan wrote) plus the live.parquet just built, and every year in
+      # the slice is recomputed in one --merge-years call. A year with no
+      # archive part at all is allowed only when it is the current
+      # calendar year: those are the new year's first days, before its
+      # first consolidation, and live IS the whole year. Any other year
+      # with no archive part is a broken catalog, not a smaller splice --
+      # it fails.
+      - name: Splice every year in the slice into stats
         if: steps.guard.outputs.published == 'true'
-        env:
-          ARCHIVE_URLS: ${{ steps.archive.outputs.urls }}
         run: |
           set -euo pipefail
-          Y=$(date -u +%Y)
           BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog
-          if [ -z "$ARCHIVE_URLS" ]; then
-            echo "::error::no archive part published under year=$Y; refusing to splice stats from live alone"
-            exit 1
-          fi
-          mapfile -t SRC <<< "$ARCHIVE_URLS"
-          echo "archive part(s) for $Y:"; printf '  %s\n' "${SRC[@]}"
+          NOW=$(date -u +%Y)
+          SRC=()
+          YEARS=""
+          while read -r Y; do
+            [ -n "$Y" ] || continue
+            if [ -s "staging/plan/$Y/archive.urls" ]; then
+              mapfile -t URLS < "staging/plan/$Y/archive.urls"
+              SRC+=("${URLS[@]}")
+            elif [ "$Y" = "$NOW" ]; then
+              echo "::notice::year=$Y: no archive part published yet (the year's first consolidation has not run); splicing it from live alone"
+            else
+              echo "::error::no archive part published under year=$Y, and $Y is not the current year; refusing to splice stats from live alone"
+              exit 1
+            fi
+            SRC+=("./staging/publish/sentinel-2-l2a/year=$Y/live.parquet")
+            YEARS="${YEARS:+$YEARS,}$Y"
+          done < staging/plan/years
+          echo "splicing year(s) $YEARS from:"; printf '  %s\n' "${SRC[@]}"
           python3 tools/s2_stats.py \
             --sources "${SRC[@]}" \
-                      "./staging/publish/sentinel-2-l2a/year=$Y/live.parquet" \
             --out ./staging/publish/stats \
-            --merge-years "$Y" --existing "$BASE/stats/mgrs-monthly.parquet"
+            --merge-years "$YEARS" --existing "$BASE/stats/mgrs-monthly.parquet"
       # Both collections: the item index from its published parts plus the
       # live part just built, and the stats collection's extent, row count
       # and `updated` from the timeline the splice just wrote.

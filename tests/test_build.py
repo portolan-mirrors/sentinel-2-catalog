@@ -631,38 +631,98 @@ def test_only_parts_needs_split_zones():
 
 def test_consolidation_plan_probes_live_and_every_part_once():
     """The plan job's one round of HEADs: live and each part of the year's
-    tier, through the injected probe, in a shape the workflow turns into
-    outputs and a matrix. A probe that raises (published_part on a code
-    that is not 200 or 404) propagates and plans nothing."""
+    tier, through the injected probe, plus one footer read of live's row
+    count, in a shape the workflow turns into outputs and a matrix. A
+    probe that raises (published_part on a code that is not 200 or 404)
+    propagates and plans nothing."""
     from s2_build import consolidation_plan
     up = {"live.parquet", "z01-15.parquet", "z53-60.parquet"}
-    asked = []
+    asked, counted = [], []
 
     def probe(base, year, name):
         asked.append((base, year, name))
         return name in up
 
-    plan = consolidation_plan("https://x/sentinel-2-l2a", 2021, probe)
+    def rows(url):
+        counted.append(url)
+        return 1234
+
+    plan = consolidation_plan("https://x/sentinel-2-l2a", 2021, probe, rows)
     assert plan["live"] is True
+    assert plan["rows"] == 1234
+    assert plan["fold"] is True
     assert plan["parts"] == OCTANT_LABELS
     assert plan["include"] == [
-        {"part": label, "exists": label in ("z01-15", "z53-60")}
+        {"year": 2021, "part": label, "exists": label in ("z01-15", "z53-60")}
         for label in OCTANT_LABELS]
     assert [name for _, _, name in asked] == \
         ["live.parquet", *(f"{label}.parquet" for label in OCTANT_LABELS)]
     assert {base for base, _, _ in asked} == {"https://x/sentinel-2-l2a"}
     assert {year for _, year, _ in asked} == {2021}
+    assert counted == ["https://x/sentinel-2-l2a/year=2021/live.parquet"]
 
-    # A single-file year plans one "items" part, and no live means no work.
+    # A single-file year plans one "items" part; no live means no work and
+    # no footer read.
     plan = consolidation_plan("https://x/sentinel-2-l2a", 2017,
-                              lambda base, year, name: name == "items.parquet")
-    assert plan == {"live": False, "parts": ["items"],
-                    "include": [{"part": "items", "exists": True}]}
+                              lambda base, year, name: name == "items.parquet",
+                              rows)
+    assert plan == {"live": False, "rows": None, "fold": False,
+                    "parts": ["items"],
+                    "include": [{"year": 2017, "part": "items", "exists": True}]}
+    assert len(counted) == 1
+
+    # An emptied live (what the last consolidation left) has nothing to
+    # fold: the year is skipped instead of rewriting every part for a
+    # byte-identical result.
+    plan = consolidation_plan("https://x/sentinel-2-l2a", 2021, probe,
+                              lambda url: 0)
+    assert plan["live"] is True and plan["rows"] == 0 and plan["fold"] is False
 
     def broken(base, year, name):
         raise SystemExit(f"{name}: HEAD answered 403")
     with pytest.raises(SystemExit, match="403"):
-        consolidation_plan("https://x/sentinel-2-l2a", 2021, broken)
+        consolidation_plan("https://x/sentinel-2-l2a", 2021, broken, rows)
+
+
+def test_consolidation_plans_folds_the_previous_year_only_while_it_has_a_tail():
+    """The two-year probe consolidate-month.yml runs every month. January:
+    the previous year's live holds December's tail and the new year's live
+    holds its first days, so both years are in the matrix -- the old one
+    against its published octants, the new one with exists=false for every
+    part (its first consolidation, built from live alone). February on:
+    the previous year's live is empty and only the current year is
+    planned. A previous year with no live at all (published whole by the
+    backfill) is skipped the same way."""
+    from s2_build import consolidation_plans
+    base = "https://x/sentinel-2-l2a"
+
+    def january(base, year, name):
+        if year == 2026:
+            return True                       # live and all eight octants
+        return name == "live.parquet"        # 2027: live only
+    rows = {2026: 50_000, 2027: 8_000}
+    plan = consolidation_plans(base, [2026, 2027], january,
+                               lambda url: rows[int(url.split("year=")[1][:4])])
+    assert plan["years"] == [2026, 2027]
+    assert plan["parts"] == {"2026": OCTANT_LABELS, "2027": OCTANT_LABELS}
+    assert len(plan["include"]) == 16
+    assert all(e["exists"] for e in plan["include"] if e["year"] == 2026)
+    assert not any(e["exists"] for e in plan["include"] if e["year"] == 2027)
+    assert [e["part"] for e in plan["include"]] == OCTANT_LABELS * 2
+
+    rows[2026] = 0                            # February: 2026 was emptied
+    plan = consolidation_plans(base, [2026, 2027], january,
+                               lambda url: rows[int(url.split("year=")[1][:4])])
+    assert plan["years"] == [2027]
+    assert plan["parts"] == {"2027": OCTANT_LABELS}
+    assert {e["year"] for e in plan["include"]} == {2027}
+    assert plan["plans"][2026]["fold"] is False
+
+    # No live anywhere: nothing to fold, and the matrix is empty.
+    plan = consolidation_plans(base, [2025, 2026],
+                               lambda base, year, name: name != "live.parquet",
+                               lambda url: 1)
+    assert plan["years"] == [] and plan["include"] == [] and plan["parts"] == {}
 
 
 class _Bucket:
@@ -1200,3 +1260,94 @@ def test_exclude_ids_writes_a_zero_row_live_when_everything_is_archived():
             capture_output=True, text=True)
         assert proc.returncode == 1
         assert "no rows matched" in proc.stderr
+
+
+def test_years_across_a_rollover_write_one_live_per_year_from_one_slice():
+    """refresh-daily.yml's year rollover: the lookback slice of the first
+    days of January holds late-December and early-January scenes, and the
+    build is asked for both years. Each year gets its own live.parquet
+    holding only its rows, from the one slice, so December's tail is
+    never dropped and January's first days are never filed under the old
+    year."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks"
+        chunks.mkdir()
+        _mk_chunk(con, chunks / "2026-12-28_2027-01-02.parquet", [
+            ("D1", "2026-12-29 10:00:00+00", "2026-12-29T12:00:00Z", 4.0, 52.0),
+            ("D2", "2026-12-31 23:30:00+00", "2026-12-31T23:59:00Z", 5.0, 52.0),
+            ("J1", "2027-01-01 00:10:00+00", "2027-01-01T01:00:00Z", 6.0, 52.0),
+        ])
+        out = Path(td) / "publish"
+        proc = subprocess.run(
+            [sys.executable, "tools/s2_build.py", "--sources", str(chunks),
+             "--years", "2026,2027", "--out", str(out), "--name", "live.parquet"],
+            cwd=ROOT, env=dict(os.environ, S2_ZSTD_LEVEL=str(LEVEL_LOW)),
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert sorted(p.name for p in out.iterdir()) == ["year=2026", "year=2027"]
+        for year, ids in ((2026, ["D1", "D2"]), (2027, ["J1"])):
+            live = out / f"year={year}" / "live.parquet"
+            assert [p.name for p in live.parent.iterdir()] == ["live.parquet"]
+            got = [r[0] for r in con.execute(
+                f"SELECT id FROM read_parquet('{live}') ORDER BY id").fetchall()]
+            assert got == ids, year
+        assert "TOTAL 3 rows across 2 year(s)" in proc.stdout
+
+
+def test_first_consolidation_builds_a_part_from_live_alone():
+    """consolidate-month.yml's exists=false case, the first consolidation
+    of a year (every January from now on): the only source is the
+    published live.parquet, itself a build output with the helper columns
+    already in it, and --split zones --only-parts writes the named octant
+    from it, sorted and passing gpio check, with the other ranges dropped.
+    A range that has no rows in live writes nothing and the build exits 1,
+    which the part job reports as a failure rather than an empty part."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_zone_chunk(con, chunks / "a.parquet", [1, 5, 16, 20, 31],
+                       per_zone=2, year=2027)
+        live_out = Path(td) / "bucket"
+        proc = _build_split(live_out, chunks, ["--name", "live.parquet"],
+                            year=2027)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        live = live_out / "year=2027" / "live.parquet"
+        assert {"_month", "_hilbert"} <= {r[0] for r in con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{live}')").fetchall()}
+
+        out = Path(td) / "publish"
+        proc = subprocess.run(
+            [sys.executable, "tools/s2_build.py", "--sources", str(live),
+             "--years", "2027", "--out", str(out),
+             "--split", "zones", "--only-parts", "z16-20"],
+            cwd=ROOT, env=dict(os.environ, S2_ZSTD_LEVEL=str(LEVEL_LOW)),
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        part = out / "year=2027" / "z16-20.parquet"
+        assert [p.name for p in part.parent.iterdir()] == ["z16-20.parquet"]
+        rows = con.execute(
+            f'SELECT "s2:mgrs_tile", _month, _hilbert '
+            f"FROM read_parquet('{part}')").fetchall()
+        assert sorted(_zone(r[0]) for r in rows) == [16, 16, 20, 20]
+        # 2027 is past TILE_SORT_FROM: (_month, s2:mgrs_tile, _hilbert).
+        keys = [(r[1], r[0], r[2]) for r in rows]
+        assert keys == sorted(keys)
+        chk = subprocess.run(["gpio", "check", "all", str(part)],
+                             capture_output=True, text=True)
+        assert chk.returncode == 0, chk.stdout + chk.stderr
+        assert "--only-parts z16-20: 6 row(s) of other zone ranges dropped" \
+            in proc.stdout
+
+        proc = subprocess.run(
+            [sys.executable, "tools/s2_build.py", "--sources", str(live),
+             "--years", "2027", "--out", str(Path(td) / "empty"),
+             "--split", "zones", "--only-parts", "z41-46"],
+            cwd=ROOT, env=dict(os.environ, S2_ZSTD_LEVEL=str(LEVEL_LOW)),
+            capture_output=True, text=True)
+        assert proc.returncode == 1
+        assert "no rows matched" in proc.stderr
+        assert not (Path(td) / "empty" / "year=2027" / "z41-46.parquet").exists()
