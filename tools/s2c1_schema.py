@@ -3,10 +3,14 @@
 (Earth Search `sentinel-2-c1-l2a`).
 
 Same shape and conventions as s2_schema.py, the first collection's schema:
-`thumbnail_url` first, the upstream item's fields and properties as they
-were when the schema was frozen (from a live item on 2026-09-21,
-tests/fixtures/c1_item.json), `assets` as a verbatim JSON string, the
-query helpers next, `geometry` last. Differences that matter to a reader:
+`thumbnail_url` first, then the union of the upstream item's fields and
+properties, `assets` as a verbatim JSON string, the query helpers next,
+`geometry` last. Frozen on 2026-09-21 from one live item per year across
+2017-2026 (processing baselines 05.00, 05.09, 05.10, 05.11, 05.12, 05.13):
+baselines <= 05.10 carry `s2:dark_features_percentage`, 05.11+ do not, so
+it is a nullable column. tests/fixtures/c1_item.json (05.13) and
+c1_item_2019.json (05.00) pin both shapes. Differences that matter to a
+reader:
 
 * Collection 1 items carry no `s2:mgrs_tile`; the tile lives in
   `grid:code` as `MGRS-31UET`. The join key is therefore the derived
@@ -18,9 +22,14 @@ query helpers next, `geometry` last. Differences that matter to a reader:
 * Two upstream properties are objects. `proj:centroid` becomes a
   STRUCT(lat, lon); `processing:software` (a name -> version map whose keys
   can change) is a compact JSON string, like `assets`.
+
+A property the schema does not know is not an error: normalize() drops it
+from the row and counts it in UNKNOWN_PROPERTIES so a fetch can log what
+upstream added since the freeze.
 """
 from __future__ import annotations
 
+import collections
 import json
 
 from s2_schema import USER_AGENT  # noqa: F401  re-exported: one client name
@@ -56,6 +65,8 @@ COLUMNS = [
     ("s2:degraded_msi_data_percentage", "DOUBLE", _PCT),
     ("s2:nodata_pixel_percentage", "DOUBLE", "Nodata share; high values = partial scenes."),
     ("s2:saturated_defective_pixel_percentage", "DOUBLE", _PCT),
+    ("s2:dark_features_percentage", "DOUBLE",
+     _PCT + " Present on processing baselines <= 05.10; NULL on 05.11+."),
     ("s2:cloud_shadow_percentage", "DOUBLE", _PCT),
     ("s2:vegetation_percentage", "DOUBLE", _PCT),
     ("s2:not_vegetated_percentage", "DOUBLE", _PCT),
@@ -97,6 +108,11 @@ COLUMNS = [
 # Everything normalize() emits: the sort helpers are computed at build time.
 DATA_COLUMNS = [c for c in COLUMNS if c[0] not in ("_month", "_hilbert")]
 _ROW_KEYS = [c[0] for c in DATA_COLUMNS if c[0] != "geometry"] + ["_geometry_json"]
+_KNOWN_PROPERTIES = frozenset(c[0] for c in COLUMNS)
+
+# Drift guard: upstream property names normalize() has seen that are not
+# in COLUMNS, with counts. Never raises; a fetch reads and logs it.
+UNKNOWN_PROPERTIES: collections.Counter = collections.Counter()
 
 
 def normalize(f: dict) -> dict:
@@ -104,6 +120,7 @@ def normalize(f: dict) -> dict:
     geometry as `_geometry_json` for the NDJSON -> parquet COPY step
     (s2_fetch.copy_ndjson_to_parquet)."""
     p = f["properties"]
+    UNKNOWN_PROPERTIES.update(k for k in p if k not in _KNOWN_PROPERTIES)
     code = p.get("grid:code")
     tile = code.removeprefix("MGRS-") if code else None
     if not tile:
