@@ -462,6 +462,9 @@ def test_c1_year_item_links_items_and_live_only():
     assert [a["href"] for a in item["assets"].values()] == [
         "./items.parquet", "./live.parquet"]
     assert item["assets"]["data"]["title"] == "2026 scenes, GeoParquet 2.0"
+    # Collection 1's tail is merged by the fold on RAILS, not consolidated.
+    assert item["assets"]["live"]["title"] == "Rolling tail since the last fold, refreshed daily"
+    assert PARTS[-1][2] == "Rolling tail since the last consolidation, refreshed daily"
     assert item["assets"]["data"]["table:row_count"] == 300
     assert item["properties"]["table:row_count"] == 600
     assert item["properties"]["start_datetime"].startswith("2026-01-01T")

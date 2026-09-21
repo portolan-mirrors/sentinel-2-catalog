@@ -336,9 +336,6 @@ def zone_sql(config: CollectionConfig = DEFAULT_CONFIG) -> str:
             """'^(\\d{1,2})', 1) AS INTEGER)""")
 
 
-ZONE_SQL = zone_sql()
-
-
 def say(msg: str) -> None:
     """One timestamped phase line. The 2017 timeout burned six hours with no
     output at all, so every phase reports what it did and how long it took."""

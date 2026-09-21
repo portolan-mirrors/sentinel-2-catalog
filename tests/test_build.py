@@ -1454,9 +1454,9 @@ def test_c1_config_shapes_the_build_interfaces():
     assert zone_parts_for(2026, DEFAULT_CONFIG) == ZONE_PARTS_8
     assert archive_part_names(C1) == ("items",)
     assert archive_part_names(DEFAULT_CONFIG) == archive_part_names()
-    from s2_build import ZONE_SQL, zone_sql
-    assert zone_sql() == ZONE_SQL and '"s2:mgrs_tile"' in ZONE_SQL
-    assert zone_sql(C1) == ZONE_SQL.replace('"s2:mgrs_tile"', '"_tile"')
+    from s2_build import zone_sql
+    assert zone_sql() == zone_sql(DEFAULT_CONFIG) and '"s2:mgrs_tile"' in zone_sql()
+    assert zone_sql(C1) == zone_sql().replace('"s2:mgrs_tile"', '"_tile"')
     plan = consolidation_plan("https://x/sentinel-2-c1-l2a", 2026,
                               lambda base, year, name: name == "items.parquet",
                               lambda url: 0, config=C1)

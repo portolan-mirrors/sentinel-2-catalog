@@ -230,6 +230,10 @@ await mapReady;
 let mgrsUrl = `${BASE}/${COL.statsDir}/mgrs.pmtiles`;
 const mgrsFallback = Object.values(COLLECTIONS).map((c) => `${BASE}/${c.statsDir}/mgrs.pmtiles`)
   .find((url) => url !== mgrsUrl);
+// One report per failure: a HEAD that fails is said here and the header
+// read below is skipped, because it would fail the same way and say it
+// again.
+let mgrsReachable = true;
 try {
   const head = await fetch(mgrsUrl, { method: "HEAD" });
   await head.arrayBuffer().catch(() => {});
@@ -240,15 +244,18 @@ try {
     throw new Error(`HTTP ${head.status}`);
   }
 } catch (err) {
+  mgrsReachable = false;
   say(`Could not open ${mgrsUrl} — ${err.message}`, true);
 }
 const archive = new PMTiles(mgrsUrl);
 let tileZoom = { minZoom: 0, maxZoom: 0 };
-try {
-  const h = await archive.getHeader();
-  tileZoom = { minZoom: h.minZoom, maxZoom: h.maxZoom };
-} catch (err) {
-  say(`Could not open ${mgrsUrl} — ${err.message}`, true);
+if (mgrsReachable) {
+  try {
+    const h = await archive.getHeader();
+    tileZoom = { minZoom: h.minZoom, maxZoom: h.maxZoom };
+  } catch (err) {
+    say(`Could not open ${mgrsUrl} — ${err.message}`, true);
+  }
 }
 map.addSource("mgrs", { type: "vector", url: `pmtiles://${mgrsUrl}` });
 map.addLayer({ id: "mgrs-line", type: "line", source: "mgrs",

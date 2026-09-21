@@ -100,10 +100,12 @@ UA = {"User-Agent": USER_AGENT}
 # nine; a probe is one HEAD, so the misses cost nothing worth a table of
 # which year has which. A collection that never splits (Collection 1) has
 # just the first and the last: its archive is one items.parquet per year,
-# and its tail is folded back into that file the same way.
+# and its tail is folded back into that file by the periodic fold on
+# RAILS, not by the monthly consolidation; the live title says which.
 def parts_for(config: CollectionConfig = DEFAULT_CONFIG,
               ) -> tuple[tuple[str, str, str, list[str]], ...]:
     zones = (*ZONE_PARTS, *ZONE_PARTS_8) if config.zone_split else ()
+    merge = "consolidation" if config.zone_split else "fold"
     return (
         ("data", "items.parquet", "{year} scenes, GeoParquet 2.0",
          ["data"]),
@@ -111,7 +113,7 @@ def parts_for(config: CollectionConfig = DEFAULT_CONFIG,
            f"{{year}} scenes, UTM zones {lo}\u2013{hi}", ["data"])
           for label, lo, hi in zones),
         ("live", "live.parquet",
-         "Rolling tail since the last consolidation, refreshed daily", ["data"]),
+         f"Rolling tail since the last {merge}, refreshed daily", ["data"]),
     )
 
 

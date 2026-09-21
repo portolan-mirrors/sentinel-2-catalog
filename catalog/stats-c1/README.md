@@ -84,8 +84,8 @@ ORDER BY year DESC, month DESC LIMIT 1;
 Nothing is published yet (see above). Once it is, the table covers every
 month the `sentinel-2-c1-l2a` index holds, from 2015-10 on; the newest
 month is the `max(year, month)` row of `timeline.parquet`. The daily
-refresh recomputes the current year and rewrites the month slices and the
-timeline; `tools/make_stats_collection.py --collection sentinel-2-c1-l2a`
+refresh recomputes every year its `created` lookback touches and rewrites
+those months' slices and the timeline; `tools/make_stats_collection.py --collection sentinel-2-c1-l2a`
 measures this collection's temporal extent, row count and `updated` from
 the timeline at each publish, so the collection never has to be edited by
 hand to follow the table. Because ESA's Collection 1 reprocessing is still
