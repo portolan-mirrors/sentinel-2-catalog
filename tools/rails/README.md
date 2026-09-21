@@ -192,8 +192,12 @@ cancel with `scancel <jobid>`.
    with an empty `year=YYYY/` directory staged per published year, the
    same for `make_collection.py`, `CI_LIGHT=1 python3 tests/run_all.py`,
    commit, run `publish-catalog`.
-8. **Stats**: `publish-stats` for `sentinel-2-c1-l2a` (the `stats-c1`
-   collection).
+8. **Stats**: set the repository variable `C1_LIVE_ENABLED` to `true`
+   (GitHub, Settings, Variables), then dispatch `publish-stats`; its
+   `sentinel-2-c1-l2a` entry (the `stats-c1` collection) runs only with
+   the variable set. The same variable turns on the daily job, whose
+   stats splice reads the table this dispatch seeds, so dispatch it the
+   same day.
 9. **Explorer**: flip the default collection when the backfill and the
    stats are complete.
 10. **Folds** start only after step 5 has uploaded every year the daily
@@ -202,8 +206,9 @@ cancel with `scancel <jobid>`.
 
 ## The periodic duty: fold live
 
-The daily GitHub refresh (its Collection 1 job, added by the refresh-daily
-change) appends Collection 1's new and reprocessed items to
+The daily GitHub refresh (its `refresh-c1` job, on while the repository
+variable `C1_LIVE_ENABLED` is `true`) appends Collection 1's new and
+reprocessed items to
 `year=YYYY/live.parquet` at zstd 3 and never consolidates. A year is
 folded only after its backfill is uploaded: `fold_live` stops on a year
 that has slices under `$SLICES` but no published `items.parquet`, so a

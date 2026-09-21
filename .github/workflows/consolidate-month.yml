@@ -61,6 +61,15 @@ name: consolidate-month
 # published on a fresh repo until publish-backfill has run once, so the
 # first step probes for catalog.json and every other job is gated on that
 # succeeding. The monthly cron is a green no-op, not a red X, until then.
+#
+# First collection only. Collection 1 (sentinel-2-c1-l2a) is not
+# consolidated here: its archive is one items.parquet per year, up to 7
+# million rows in one file, past this runner's disk and the 6-hour ceiling.
+# Its live.parquet is folded on the TGI RAILS cluster by a person
+# (tools/rails/fold_live.sbatch, every month or two and at year end;
+# tools/README.md, "Sync & backfill"). refresh-daily's Collection 1 job
+# appends to live and restamps its metadata daily; the fold's laptop step
+# commits the folded year's item.
 
 on:
   schedule:

@@ -313,6 +313,30 @@ year (the `QUALIFY` in the glob snippet above). Across the whole table,
 treat `id` as unique and report it if you ever
 find otherwise.
 
+## Cadence
+
+Three clocks, from the workflows in the repository's `.github/workflows/`
+and the cluster scripts in `tools/rails/`:
+
+- **Daily, 03:42 UTC** (`refresh-daily`, its Collection 1 job): the last
+  five days of Earth Search by `created`, appended to the `live.parquet` of
+  every year the slice touches, with the ids the year's `items.parquet`
+  already holds dropped. The year items and the collection are restamped
+  from the published files on the same run, so `table:row_count` and the
+  extents describe the bucket, not the commit.
+- **Daily, on the same run**: the stats collection
+  ([`stats-c1`](../stats-c1/AGENTS.md)) has every touched year recomputed
+  and spliced into `mgrs-monthly.parquet`.
+- **Every month or two, and at year end**, by a person on the RAILS
+  cluster (`tools/rails/fold_live.sbatch`): each `live.parquet` is merged
+  into its year's `items.parquet` and emptied. There is no monthly
+  consolidation on GitHub for this collection. Between folds a year's two
+  files together are the year; the dedupe above makes the count exact.
+
+The daily job runs only once the repository variable `C1_LIVE_ENABLED` is
+set, after the backfill is published and the stats table is seeded. Until
+then this collection changes only when a person commits and publishes it.
+
 ## What this collection does not do
 
 It does not filter, reclassify or interpolate anything Earth Search publishes.

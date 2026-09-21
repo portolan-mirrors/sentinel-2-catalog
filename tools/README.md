@@ -21,7 +21,7 @@ cluster, and GitHub only appends its daily tail.
 | | `sentinel-2-l2a` | `sentinel-2-c1-l2a` |
 |---|---|---|
 | Backfill | `backfill` then `publish-backfill` (GitHub) | `tools/rails/` on RAILS |
-| Daily tail | `refresh-daily`: `live.parquet` per year, zstd 18 | `refresh-daily`'s Collection 1 job (added by the refresh-daily change): `live.parquet` per year, zstd 3, lookback on `created` |
+| Daily tail | `refresh-daily`: `live.parquet` per year, zstd 18 | `refresh-daily`'s `refresh-c1` job, on when the repository variable `C1_LIVE_ENABLED` is `true`: `live.parquet` per year, zstd 3, lookback on `created` |
 | Consolidation | `consolidate-month`, the 3rd of each month | `fold_live.sbatch` on RAILS, by hand, every 1 to 2 months |
 | Repair | `repair-slices` (bucket crawl) | `repair_month.sbatch` |
 | Audit | `s2_audit.py` by hand | `audit_year.sbatch` |
@@ -101,8 +101,8 @@ the new parts), and publishes.
    (`consolidation_plans(..., config)` takes the config; the `BASE` env
    and the staging path become per collection), so the monthly fold
    replaces the RAILS fold.
-5. `refresh-daily.yml`: drop the fold duty from the Collection 1 job's
-   description; nothing else changes, its live build already excludes the
+5. `refresh-daily.yml`: drop the fold duty from the `refresh-c1` job's
+   header; nothing else changes, its live build already excludes the
    archive's ids.
 
 ### RAILS technique (Collection 1)
@@ -128,15 +128,19 @@ The full instructions, the credentials setup and every script are in
    uploads → audit per year, repair and rebuild a short month → the
    metadata commit from a laptop (`make_items.py` and `make_collection.py`
    with `--collection sentinel-2-c1-l2a --remote-baseline`, the gates,
-   commit, `publish-catalog`) → `publish-stats` for the collection →
+   commit, `publish-catalog`) → set the repository variable
+   `C1_LIVE_ENABLED` to `true` → dispatch `publish-stats` (its Collection
+   1 entry runs only with the variable set; it seeds `stats-c1`) →
    flip the explorer's default.
-6. **Daily**: `refresh-daily`'s Collection 1 job (added by the
-   refresh-daily change, after the backfill) fetches the lookback by
+6. **Daily**: `refresh-daily`'s `refresh-c1` job, on while
+   `C1_LIVE_ENABLED` is `true`, fetches the lookback by
    `created` (so a scene ESA reprocessed last week, whatever its
    acquisition date, is caught), appends to `year=YYYY/live.parquet` at
-   zstd 3 with the year file's ids excluded, and restamps. It never
-   consolidates. It starts only once every year it appends to is
-   uploaded, and so does the fold below.
+   zstd 3 with the year file's ids excluded, splices the touched years
+   into `stats-c1`, and restamps both collections. It never
+   consolidates. Set the variable only once every year it appends to is
+   uploaded and `publish-stats` has seeded `stats-c1` (its splice reads
+   the published table); the fold below has the same condition.
 
 **The periodic duty.** Every one to two months, and at the end of each
 year, a person runs the fold:
