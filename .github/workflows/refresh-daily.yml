@@ -120,10 +120,35 @@ jobs:
           # archive parts are the floor: every id they hold is dropped from
           # live before the sort (--exclude-ids-from), so live and archive
           # never overlap and a glob over the year reads each scene once.
-          curl -fSL -o staging/live-prev.parquet "$BASE/year=$Y/live.parquet" \
-            || rm -f staging/live-prev.parquet
+          #
+          # HEAD first, and only a 404 means "no previous live". A 200 makes
+          # the GET mandatory, and any failure -- a 5xx, a timeout, a body
+          # cut short -- stops the run; so does any HEAD answer that is not
+          # 200 or 404. The old `curl ... || rm -f` treated every failure
+          # as "no previous live": live was then rebuilt from the five-day
+          # slice alone, uploaded without complaint (its size differs), and
+          # the next consolidation folded it -- every scene between the last
+          # consolidation and today-5d gone from the archive for good, with
+          # no signal. Same pattern as consolidate-month.yml's fetch().
           SRC="./staging/chunks"
-          [ -s staging/live-prev.parquet ] && SRC="$SRC staging/live-prev.parquet"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' -I "$BASE/year=$Y/live.parquet")
+          case "$CODE" in
+            200)
+              curl -fSL -o staging/live-prev.parquet "$BASE/year=$Y/live.parquet" || {
+                rm -f staging/live-prev.parquet
+                echo "::error::year=$Y/live.parquet: GET failed after HEAD 200; a live rebuilt without it would lose every scene since the last consolidation"
+                exit 1
+              }
+              SRC="$SRC staging/live-prev.parquet"
+              ;;
+            404)
+              echo "year=$Y/live.parquet: not published (404); building the year's first live from the slice alone"
+              ;;
+            *)
+              echo "::error::year=$Y/live.parquet: HEAD answered $CODE, not 200 or 404"
+              exit 1
+              ;;
+          esac
           EXCLUDE=()
           if [ -n "$ARCHIVE_URLS" ]; then
             mapfile -t URLS <<< "$ARCHIVE_URLS"
