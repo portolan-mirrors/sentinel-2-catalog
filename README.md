@@ -220,7 +220,7 @@ Search stopped publishing them. The
 | `repair-slices` | manual | Re-fetch given months from the static item JSON in the `sentinel-cogs` bucket instead of the API, as `slice-YYYY-MM` artifacts `publish-backfill` consumes unchanged. |
 | `upload-file-data` | manual | Publishes one locally built data file (for example `mgrs.pmtiles`) from an https URL into a catalog directory. |
 | `check-access` | manual | Writes and deletes a marker object with the Source Cooperative role: a smoke test of the credentials. |
-| `publish-catalog` | manual | Publishes the committed `catalog/` metadata as-is. |
+| `publish-catalog` | manual | Publishes the committed `catalog/` metadata, after restamping the measured fields (row counts, extents, part sizes, `updated`) of both item indexes and both stats collections from the bucket, so the daily restamp is kept. |
 | `pages` | on push to `apps/explorer/` | Deploys the explorer to GitHub Pages. |
 
 `tools/make_collection.py` regenerates the item index's `updated` stamp, row

@@ -23,7 +23,6 @@
 #SBATCH --mem=8g
 #SBATCH --output=logs/s2c1-upload-%j.out
 set -euo pipefail
-JOB_NAME=s2c1-upload
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$HOME/s2-catalog}}"
 [ -f "$REPO/tools/rails/env.sh" ] || { echo "no checkout at $REPO; set REPO"; exit 1; }
 source "$REPO/tools/rails/env.sh"
@@ -48,5 +47,7 @@ collection are regenerated from the published parts and committed):
   python3 tools/make_collection.py --collection $COLLECTION --data-dir staging/publish/$COLLECTION --remote-baseline
   CI_LIGHT=1 python3 tests/run_all.py
   git add catalog/$COLLECTION && git commit -m "catalog(c1): year=$YEAR published"
-then run the publish-catalog workflow.
+then run the publish-catalog workflow. It restamps every collection from
+the bucket before it uploads, so the first collection's daily restamp is
+kept.
 EOF

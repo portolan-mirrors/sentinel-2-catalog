@@ -1,9 +1,21 @@
 name: publish-catalog
 
-# Publish the committed catalog metadata as-is: no data, no regeneration.
-# For the case where the repository's baseline is the truth (a corrected
-# or hand-regenerated catalog/) and the bucket's copy is stale. The gates
-# run first, so a broken baseline never reaches the bucket.
+# Publish the committed catalog metadata: no data build, no regeneration
+# of anything typed by hand. For the case where the repository's baseline
+# is the truth (a corrected or hand-regenerated catalog/, or a Collection
+# 1 year or fold just uploaded from RAILS) and the bucket's copy is stale.
+#
+# One thing is not taken from the commit: the measured fields. The daily
+# refresh restamps both item indexes and both stats collections from the
+# published parts (row counts, extents, part sizes, `updated`) and never
+# commits them, and tools/publish.py uploads every file whose md5 differs.
+# A publish of the commit as-is would put the committed year items and
+# collections over those restamped copies, and the published record would
+# describe yesterday's live part until the next 03:42 UTC run. So the
+# restamp step below reads the bucket first, with the same recipe
+# publish-stats and refresh-daily use, and the gates run on the result.
+# The gates run first either way, so a broken baseline never reaches the
+# bucket.
 
 on:
   workflow_dispatch:
@@ -19,16 +31,90 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      C1_LIVE_ENABLED: ${{ vars.C1_LIVE_ENABLED }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install tooling
-        run: pip install --quiet boto3 'rashid>=0.1.8,<0.2.0' stac-check
+        # duckdb and pyarrow for the restamp (make_items reads Parquet
+        # footers; s2_build, which it imports, needs pyarrow).
+        run: pip install --quiet duckdb pyarrow boto3 'rashid>=0.1.8,<0.2.0' stac-check
 
-      - name: Validate the committed catalog
+      # Both item indexes and both stats collections from the bucket, the
+      # way publish-stats does it: an empty year marker for every mission
+      # year, then make_items and make_collection read the published parts
+      # (--remote-baseline; a year with nothing published is skipped, a
+      # part the committed item records but the bucket lost is fatal), and
+      # each stats collection reads its published timeline. The timelines
+      # are probed through s2_build.published_url (retried; exit 0
+      # published, 3 not, anything else could not answer). The first
+      # collection's stats are published, so for it anything but 0 is an
+      # outage or a wrong URL and stops the job: a publish that cannot see
+      # the bucket must not describe it. The Collection 1 pair runs only
+      # under C1_LIVE_ENABLED, because before that its committed metadata
+      # is the truth; its timeline exists only once publish-stats has run
+      # for Collection 1, so a 3 keeps the committed stats-c1 collection
+      # and says so, and an unanswered probe stops the job.
+      - name: Restamp collection metadata from the published parts
+        run: |
+          set -euo pipefail
+          STATS=https://data.source.coop/portolan-mirrors/sentinel-2-catalog
+          probe() {
+            # 0 published, 3 not published, anything else could not answer.
+            local code=0
+            python3 -c '
+          import sys; sys.path.insert(0, "tools")
+          from s2_build import published_url
+          sys.exit(0 if published_url(sys.argv[1], what=sys.argv[2]) else 3)' \
+              "$STATS/$1/timeline.parquet" "$1/timeline.parquet" || code=$?
+            return "$code"
+          }
+          for y in $(seq 2015 "$(date -u +%Y)"); do
+            mkdir -p "staging/baseline/sentinel-2-l2a/year=$y"
+            mkdir -p "staging/baseline/sentinel-2-c1-l2a/year=$y"
+          done
+          python3 tools/make_items.py \
+            --data-dir ./staging/baseline/sentinel-2-l2a --remote-baseline
+          python3 tools/make_collection.py \
+            --data-dir ./staging/baseline/sentinel-2-l2a --remote-baseline
+          CODE=0; probe stats || CODE=$?
+          case "$CODE" in
+            0)
+              python3 tools/make_stats_collection.py \
+                --data-dir ./staging/baseline/stats --remote-baseline ;;
+            3)
+              echo "::error::stats/timeline.parquet is not published; the first collection's stats are, so refusing to publish over them"
+              exit 1 ;;
+            *)
+              echo "::error::stats/timeline.parquet: the probe could not answer (exit $CODE; published_url said why above)"
+              exit 1 ;;
+          esac
+          if [ "$C1_LIVE_ENABLED" = true ]; then
+            python3 tools/make_items.py --collection sentinel-2-c1-l2a \
+              --data-dir ./staging/baseline/sentinel-2-c1-l2a --remote-baseline
+            python3 tools/make_collection.py --collection sentinel-2-c1-l2a \
+              --data-dir ./staging/baseline/sentinel-2-c1-l2a --remote-baseline
+            CODE=0; probe stats-c1 || CODE=$?
+            case "$CODE" in
+              0)
+                python3 tools/make_stats_collection.py --collection sentinel-2-c1-l2a \
+                  --data-dir ./staging/baseline/stats-c1 --remote-baseline ;;
+              3)
+                echo "::notice::stats-c1/timeline.parquet is not published yet (publish-stats has not run for Collection 1); keeping the committed stats-c1 collection" ;;
+              *)
+                echo "::error::stats-c1/timeline.parquet: the probe could not answer (exit $CODE; published_url said why above)"
+                exit 1 ;;
+            esac
+          else
+            echo "C1_LIVE_ENABLED is not 'true'; the committed Collection 1 metadata is published as-is"
+          fi
+          git status --short catalog/
+
+      - name: Validate the catalog
         env:
           CI_LIGHT: "1"
         run: python3 tests/run_all.py
