@@ -826,11 +826,11 @@ def test_skip_existing_row_check_with_an_injected_count():
 
         # In-process, so ZSTD_LEVEL is the import-time default; four rows
         # at level 18 cost nothing.
-        written, skipped = build_year(
+        written, skipped, parts_written = build_year(
             bcon, files, year, Path(td) / "ok", split="zones",
             skip_existing_url="http://bucket/sentinel-2-l2a",
             probe=probe, remote_rows=same)
-        assert (written, skipped) == (2, 1)
+        assert (written, skipped, parts_written) == (2, 1, 1)
         assert seen == [f"http://bucket/sentinel-2-l2a/year={year}/z01-15.parquet"]
         assert sorted(p.name for p in (Path(td) / "ok" / f"year={year}").iterdir()) \
             == ["z36-40.parquet"]
@@ -1060,8 +1060,9 @@ def test_exclude_ids_drops_archived_rows_and_consults_only_staged_months():
             # Only March was consulted: A and D, not May's B.
             assert ("2 id(s) read from 1 published part(s) for month(s) 3"
                     in proc.stdout), proc.stdout
-            assert ("year=2024/live.parquet: 1 row(s) dropped whose id the "
-                    "published archive already holds") in proc.stdout
+            assert ("year=2024/live.parquet: 1 row(s) dropped that the "
+                    "published archive already holds at the same or a newer "
+                    "generation") in proc.stdout
             assert "TOTAL 2 rows" in proc.stdout
             # One probe HEAD per URL with the catalog's client name; DuckDB's
             # own requests carry its agent.
@@ -1111,3 +1112,91 @@ def test_exclude_ids_stops_on_an_answer_that_is_not_200_or_404():
             assert not (out / "year=2024" / "live.parquet").exists()
         finally:
             bucket.close()
+
+
+def test_exclude_ids_keeps_a_reprocessed_product():
+    """The exclusion compares s2:generation_time, not ids alone: a staged
+    row that is a newer generation of an archived id is a reprocessed
+    product that never reached the archive and must stay in live; an equal
+    or older generation is the archived scene fetched again and is dropped.
+    Archive: R, S, T in March at generations 10, 12, 14 (day of month);
+    live: R at 11 (newer, kept), S at 12 (equal, dropped), T at 13 (older,
+    dropped)."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        archive = Path(td) / "archive" / "api"
+        archive.mkdir(parents=True)
+        _mk_chunk(con, archive / "a.parquet", [
+            ("R", "2024-03-05 10:00:00+00", "2024-03-10T12:00:00Z", 4.0, 52.0),
+            ("S", "2024-03-06 10:00:00+00", "2024-03-12T12:00:00Z", 5.0, 52.0),
+            ("T", "2024-03-07 10:00:00+00", "2024-03-14T12:00:00Z", 6.0, 52.0),
+        ])
+        proc = _build(Path(td) / "bucket", archive, LEVEL_LOW)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_chunk(con, chunks / "a.parquet", [
+            ("R", "2024-03-05 10:00:00+00", "2024-03-11T00:00:00Z", 4.0, 52.0),
+            ("S", "2024-03-06 10:00:00+00", "2024-03-12T12:00:00Z", 5.0, 52.0),
+            ("T", "2024-03-07 10:00:00+00", "2024-03-13T00:00:00Z", 6.0, 52.0),
+        ])
+        bucket = _Bucket(root=Path(td) / "bucket")
+        try:
+            out = Path(td) / "publish"
+            proc = _build_live(out, chunks, [f"{bucket.url}/year=2024/items.parquet"])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            rows = con.execute(
+                f"SELECT id, \"s2:generation_time\" FROM "
+                f"read_parquet('{out / 'year=2024' / 'live.parquet'}')").fetchall()
+            assert rows == [("R", "2024-03-11T00:00:00Z")]
+            assert "2 row(s) dropped that the published archive already holds" \
+                in proc.stdout
+        finally:
+            bucket.close()
+
+
+def test_exclude_ids_writes_a_zero_row_live_when_everything_is_archived():
+    """The archive already holds every staged row: the build succeeds and
+    writes live.parquet with zero rows and the staged schema (what
+    consolidate-month publishes for an emptied live), so the refresh's
+    stats splice and restamps still run. Without --exclude-ids-from, no
+    rows is still the failure it always was."""
+    con = duckdb.connect()
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks, bucket_dir = _archive_fixture(con, Path(td))
+        # Stage exactly the archive's March rows (A and D), nothing new.
+        for f in chunks.iterdir():
+            f.unlink()
+        _mk_chunk(con, chunks / "a.parquet", [
+            ("A", "2024-03-05 10:00:00+00", "2024-03-05T12:00:00Z", 4.0, 52.0),
+            ("D", "2024-03-20 10:00:00+00", "2024-03-20T12:00:00Z", 5.0, 52.0),
+        ])
+        bucket = _Bucket(root=bucket_dir)
+        try:
+            out = Path(td) / "publish"
+            proc = _build_live(out, chunks, [f"{bucket.url}/year=2024/items.parquet"])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            live = out / "year=2024" / "live.parquet"
+            assert [p.name for p in live.parent.iterdir()] == ["live.parquet"]
+            assert con.execute(
+                f"SELECT count(*) FROM read_parquet('{live}')").fetchone()[0] == 0
+            cols = [r[0] for r in con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{live}')").fetchall()]
+            assert {"id", "datetime", "_month", "_hilbert", "geometry"} <= set(cols)
+            assert "2 row(s) dropped" in proc.stdout
+            assert "wrote it with zero rows" in proc.stdout
+            assert "TOTAL 0 rows" in proc.stdout
+            assert "no rows matched" not in proc.stderr
+        finally:
+            bucket.close()
+        # No exclusion, no rows in the year: exit 1 as before.
+        proc = subprocess.run(
+            [sys.executable, "tools/s2_build.py", "--sources", str(chunks.parent),
+             "--years", "2019", "--out", str(Path(td) / "none"),
+             "--name", "live.parquet"],
+            cwd=ROOT, env=dict(os.environ, S2_ZSTD_LEVEL=str(LEVEL_LOW)),
+            capture_output=True, text=True)
+        assert proc.returncode == 1
+        assert "no rows matched" in proc.stderr

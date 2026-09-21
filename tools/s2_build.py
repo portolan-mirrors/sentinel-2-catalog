@@ -47,7 +47,10 @@ each job only ever has its own part's rows to sort. A label that is not in
 the year's tier stops the build naming the valid ones.
 
 `--exclude-ids-from URL [URL ...]` drops, before the sort, every staged row
-whose `id` a listed published part already holds. This is how
+whose `id` a listed published part already holds at the same or a newer
+`s2:generation_time`; a reprocessed product (same id, newer generation)
+that arrives after its predecessor was consolidated is kept, since it would
+otherwise never reach the archive. This is how
 refresh-daily.yml keeps `live.parquet` disjoint from the same year's archive
 parts: the five-day lookback re-fetches days the last consolidation already
 folded into the octants, and without this every one of those scenes was
@@ -59,7 +62,10 @@ staged rows span, so the read is a few range requests per part, not the
 part. A URL that answers 404 is skipped with a log line (a year whose
 archive is not published yet has nothing to exclude); any other answer
 stops the build, because a silently skipped archive part recreates the
-overlap it exists to remove.
+overlap it exists to remove. When the exclusion leaves no row at all, the
+part is still written, with zero rows -- the shape consolidate-month.yml
+publishes for an emptied live.parquet -- so the refresh's stats splice and
+restamps run against a live that is current rather than failing the job.
 
 Rows are deduped by id keeping the highest s2:generation_time, then sorted
 (_month, _hilbert): month-first keeps month pruning inside a year file,
@@ -572,18 +578,28 @@ def _stage_zone_parts(con, staged: Path, year: int,
 def exclude_published_ids(con, staged: Path, urls: list[str], year: int,
                           label: str, probe_url=published_url) -> int:
     """Drop from the staged year every row whose id one of `urls` (published
-    archive parts of the same year) already holds. Returns the number
-    dropped; the staged file is rewritten in place only when that is > 0.
+    archive parts of the same year) already holds at the same or a newer
+    s2:generation_time. Returns the number dropped; the staged file is
+    rewritten in place only when that is > 0.
 
     Each URL is HEADed first through `probe_url` (published_url: 200 reads,
-    404 skips with a log line, anything else stops the build). The ids are
-    read with DuckDB httpfs, projecting only `id` and filtering on `_month`
-    to the months the staged rows span: the parts are sorted (_month, ...)
-    so the filter prunes on row-group statistics and the read is a few
-    range requests per part rather than the part. `_month` is the same
-    session-UTC month(datetime) on both sides (see connect()). The join is
-    an ANTI JOIN, not NOT IN, so a NULL id in either file cannot empty the
-    result."""
+    404 skips with a log line, anything else stops the build). The archive
+    is read with DuckDB httpfs, projecting only `id` and
+    `s2:generation_time` and filtering on `_month` to the months the staged
+    rows span: the parts are sorted (_month, ...) so the filter prunes on
+    row-group statistics and the read is a few range requests per part
+    rather than the part. `_month` is the same session-UTC month(datetime)
+    on both sides (see connect()).
+
+    The generation comparison is the year build's own dedupe rule (highest
+    s2:generation_time wins, NULLS LAST) applied across the archive
+    boundary: a staged row is dropped unless its generation is strictly
+    newer than the archive's for that id. A reprocessed product that
+    arrives in the lookback after its predecessor was consolidated is
+    therefore kept in live, where the next consolidation's dedupe replaces
+    the archive copy; dropping it by id alone would lose it for good. The
+    rewrite is an ANTI JOIN against the ids to drop, not NOT IN, so a NULL
+    id cannot empty the result."""
     months = [r[0] for r in con.execute(
         f"SELECT DISTINCT _month FROM read_parquet('{staged}') ORDER BY 1"
     ).fetchall()]
@@ -600,32 +616,59 @@ def exclude_published_ids(con, staged: Path, urls: list[str], year: int,
     lst = ",".join(f"'{u}'" for u in present)
     month_list = ",".join(str(m) for m in months)
     t0 = time.monotonic()
-    con.execute("DROP TABLE IF EXISTS excluded_ids")
+    con.execute("DROP TABLE IF EXISTS archived; DROP TABLE IF EXISTS to_drop;")
     con.execute(f"""
-        CREATE TEMP TABLE excluded_ids AS
-        SELECT DISTINCT id FROM read_parquet([{lst}])
+        CREATE TEMP TABLE archived AS
+        SELECT id, max("s2:generation_time") AS gen
+        FROM read_parquet([{lst}])
         WHERE _month IN ({month_list})
+        GROUP BY id
     """)
-    held = con.execute("SELECT count(*) FROM excluded_ids").fetchone()[0]
+    held = con.execute("SELECT count(*) FROM archived").fetchone()[0]
     say(f"year={year}/{label}: {held:,} id(s) read from {len(present)} "
         f"published part(s) for month(s) {month_list}, "
         f"{time.monotonic() - t0:,.1f}s")
-    dropped = con.execute(f"""
-        SELECT count(*) FROM read_parquet('{staged}') s
-        SEMI JOIN excluded_ids e USING (id)""").fetchone()[0]
+    # Newer means strictly greater, with the build's NULLS LAST reading: a
+    # NULL staged generation is never newer, a NULL archive generation is
+    # beaten by any non-NULL one, and two NULLs are equal (dropped).
+    con.execute(f"""
+        CREATE TEMP TABLE to_drop AS
+        SELECT s.id FROM read_parquet('{staged}') s
+        JOIN archived a USING (id)
+        WHERE NOT coalesce(
+            s."s2:generation_time" > a.gen
+            OR (s."s2:generation_time" IS NOT NULL AND a.gen IS NULL), FALSE)
+    """)
+    dropped = con.execute("SELECT count(*) FROM to_drop").fetchone()[0]
     if dropped:
         kept = staged.with_name(".rows.kept.parquet")
         con.execute(f"""
             COPY (SELECT s.* FROM read_parquet('{staged}') s
-                  ANTI JOIN excluded_ids e USING (id))
+                  ANTI JOIN to_drop d USING (id))
             TO '{kept}'
               (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {ROW_GROUP})
         """)
         os.replace(kept, staged)
-    con.execute("DROP TABLE excluded_ids")
-    say(f"year={year}/{label}: {dropped:,} row(s) dropped whose id the "
-        f"published archive already holds")
+    con.execute("DROP TABLE archived; DROP TABLE to_drop;")
+    say(f"year={year}/{label}: {dropped:,} row(s) dropped that the published "
+        f"archive already holds at the same or a newer generation")
     return dropped
+
+
+def write_empty_part(con, staged: Path, final: Path, year: int) -> None:
+    """A zero-row part with the staged schema, the shape
+    consolidate-month.yml publishes for an emptied live.parquet: a plain
+    DuckDB COPY, not the gpio sort/check pipeline, which has nothing to
+    sort or check in an empty file. Written through the same dotfile
+    temporary and os.replace() as a real part."""
+    tmp = final.with_name(f".{final.stem}.tmp.parquet")
+    con.execute(f"""
+        COPY (SELECT * FROM read_parquet('{staged}') LIMIT 0)
+        TO '{tmp}' (FORMAT PARQUET, COMPRESSION zstd)
+    """)
+    os.replace(tmp, final)
+    say(f"year={year}/{final.name}: every staged row is already in the "
+        f"published archive; wrote it with zero rows")
 
 
 def build_year(con, files: list[str], year: int, outdir: Path,
@@ -635,9 +678,10 @@ def build_year(con, files: list[str], year: int, outdir: Path,
                probe=published_part, remote_rows=published_rows,
                only_parts: tuple[str, ...] | None = None,
                exclude_ids_from: list[str] | None = None,
-               probe_url=published_url) -> tuple[int, int]:
+               probe_url=published_url) -> tuple[int, int, int]:
     """Build one year. Returns (rows written, parts skipped as already
-    published). With --split zones the parts are zone_parts_for(year); a
+    published, part files written -- which counts a zero-row live written
+    because --exclude-ids-from dropped every staged row). With --split zones the parts are zone_parts_for(year); a
     year below ZONE_SPLIT_FROM has none and the split is refused rather
     than silently written whole. `only_parts` narrows those to the named
     labels (only_zone_parts) and the other ranges' rows are dropped.
@@ -677,7 +721,7 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         if len(skip) == len(wanted):
             say(f"year={year}/{label}: every part already published "
                 f"({', '.join(wanted)}); nothing to build")
-            return 0, len(skip)
+            return 0, len(skip), 0
     with tempfile.TemporaryDirectory() as td:
         staged = Path(td) / "rows.parquet"
         t0 = time.monotonic()
@@ -700,25 +744,35 @@ def build_year(con, files: list[str], year: int, outdir: Path,
         say(f"year={year}/{label}: staged {n:,} rows, "
             f"{staged.stat().st_size / 1e6:,.0f} MB, "
             f"{time.monotonic() - t0:,.1f}s")
+        staged_rows = n
         if n and exclude_ids_from:
             n -= exclude_published_ids(con, staged, exclude_ids_from, year,
                                        label, probe_url)
         if n == 0:
+            if staged_rows and split != "zones":
+                # Rows were staged and the archive already had every one:
+                # the part is current and empty, which is a result to
+                # publish (the stats splice and the restamps still run),
+                # not a failed build.
+                write_empty_part(con, staged, final, year)
+                if on_part_done:
+                    run_part_hook(on_part_done, final, year)
+                return 0, 0, 1
             if not any(dest.iterdir()):
                 shutil.rmtree(dest, ignore_errors=True)
-            return 0, 0
+            return 0, 0, 0
         if split != "zones":
             _sort_and_check(con, staged, final, year, memory)
             print(f"  year={year}/{name}: {n:,} rows, "
                   f"{final.stat().st_size / 1e6:,.0f} MB", flush=True)
             if on_part_done:
                 run_part_hook(on_part_done, final, year)
-            return n, 0
+            return n, 0, 1
         # The parts one at a time: each staged range is sorted, written,
         # checked, handed to --on-part-done and deleted before the next
         # one's sort starts, so the peak is one range's spill plus the other
         # ranges waiting on disk, never a whole year's sort.
-        written = skipped = 0
+        written = skipped = parts_written = 0
         staged_parts, dropped = _stage_zone_parts(
             con, staged, year, parts, skip, remote_rows,
             partial=bool(only_parts))
@@ -734,11 +788,12 @@ def build_year(con, files: list[str], year: int, outdir: Path,
             if on_part_done:
                 run_part_hook(on_part_done, part_final, year)
             written += part_rows
+            parts_written += 1
         if written + skipped + dropped != n:
             raise SystemExit(
                 f"year={year}: staged {n:,} rows but the zone parts hold "
                 f"{written + skipped:,} and {dropped:,} were dropped")
-    return written, len(skip)
+    return written, len(skip), parts_written
 
 
 def main() -> int:
@@ -807,17 +862,21 @@ def main() -> int:
             f"FROM read_parquet([{lst}], union_by_name=true) ORDER BY y"
         ).fetchall()]
 
-    total = skipped = 0
+    total = skipped = written = 0
     for y in years:
-        rows, skips = build_year(con, files, y, outdir, a.name, a.memory,
-                                 a.split, a.skip_existing_url, hook,
-                                 only_parts=only_parts,
-                                 exclude_ids_from=a.exclude_ids_from)
+        rows, skips, parts_written = build_year(
+            con, files, y, outdir, a.name, a.memory, a.split,
+            a.skip_existing_url, hook, only_parts=only_parts,
+            exclude_ids_from=a.exclude_ids_from)
         total += rows
         skipped += skips
+        written += parts_written
     print(f"TOTAL {total:,} rows across {len(years)} year(s)"
           + (f", {skipped} part(s) already published" if skipped else ""))
-    if total == 0 and not skipped:
+    # A zero-row part written because --exclude-ids-from dropped every
+    # staged row counts as written: the part is current. No rows and no
+    # part is the failure it always was.
+    if total == 0 and not skipped and not written:
         print("no rows matched: nothing was written", file=sys.stderr)
         return 1
     return 0

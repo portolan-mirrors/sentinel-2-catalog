@@ -117,16 +117,17 @@ not `eo:cloud_cover`.
 **Read only the part containing your tile's zone.** The glob above opens every
 part of the year and lets the `s2:mgrs_tile` filter discard the rest of it by
 row-group statistics: seven footers read for nothing (measured 2026-09-21,
-11.9 s against 11.5 s for the single-part form below, same eight rows). Row-group size differs by vintage: parts published
-through 2023 carry ~100k-row groups (a tile lookup reads ~14 MB per group it
-touches); parts from 2024 on carry ~6k-row groups (~0.85 MB per hit). Sort order also
-differs by vintage: through 2025 rows are ordered (_month, _hilbert); from 2026
-they are ordered (_month, s2:mgrs_tile, _hilbert), so one tile's scenes for a
-month sit in a single small row group and a tile lookup is one range request.
-All vintages read identically; only bytes and requests per hit differ, and the
-older years are rebuilt when a larger machine allows. When you know the tile, skip them entirely: pick the
-file by zone and year. Zone 31 in 2021 is in `z21-31.parquet`, so the same
-query touches one file:
+11.9 s against 11.5 s for the single-part form below, same eight rows).
+Row-group size differs by vintage: parts published through 2023 carry
+~100k-row groups (a tile lookup reads ~14 MB per group it touches); parts
+from 2024 on carry ~6k-row groups (~0.85 MB per hit). Sort order also
+differs by vintage: through 2025 rows are ordered (_month, _hilbert); from
+2026 they are ordered (_month, s2:mgrs_tile, _hilbert), so one tile's scenes
+for a month sit in a single small row group and a tile lookup is one range
+request. All vintages read identically; only bytes and requests per hit
+differ, and the older years are rebuilt when a larger machine allows. When
+you know the tile, skip them entirely: pick the file by zone and year. Zone
+31 in 2021 is in `z21-31.parquet`, so the same query touches one file:
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
@@ -258,7 +259,11 @@ window, and a reprocessed product keeps its id. Rows are deduped by `id`,
 keeping the highest `s2:generation_time` (`NULLS LAST`), when each year is
 built. So `id` is unique within a part. The parts of a year do not overlap:
 a scene has one tile, and a tile one zone, and the daily `live.parquet`
-rebuild drops every id the year's archive parts hold. So `id` is unique
+rebuild drops every id the year's archive parts hold. The one exception is
+a reprocessed product, which keeps its id with a newer `s2:generation_time`:
+live keeps it beside the archive's older copy until the next consolidation
+replaces that copy, so dedupe on `id` keeping the highest
+`s2:generation_time` when you glob the current year. Otherwise `id` is unique
 within a year. Across the whole table, treat `id` as unique and report it if
 you ever find otherwise.
 

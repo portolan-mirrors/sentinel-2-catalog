@@ -166,9 +166,22 @@ jobs:
           set -euo pipefail
           mv ./staging/publish/stats/mgrs-tiles.parquet ./staging/
 
-      - name: Restamp the stats collection from the timeline
+      # Both collections, because tools/publish.py below uploads all of
+      # catalog/: without the item index restamp it would put the committed
+      # sentinel-2-l2a/collection.json and year items over the bucket's
+      # copies that refresh-daily restamped from the live part. Same
+      # recipe as refresh-daily: an empty year marker for every mission
+      # year, then both generators from the published parts.
+      - name: Restamp collection metadata
         if: steps.guard.outputs.published == 'true'
-        run: python3 tools/make_stats_collection.py --data-dir ./staging/publish/stats
+        run: |
+          set -euo pipefail
+          for y in $(seq 2015 "$(date -u +%Y)"); do
+            mkdir -p "staging/publish/sentinel-2-l2a/year=$y"
+          done
+          python3 tools/make_items.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
+          python3 tools/make_collection.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
+          python3 tools/make_stats_collection.py --data-dir ./staging/publish/stats
 
       - name: Validate before upload
         if: steps.guard.outputs.published == 'true'
