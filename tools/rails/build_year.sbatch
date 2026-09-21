@@ -5,12 +5,15 @@
 #
 # Input: $SLICES/YEAR-MM.parquet for every month of the year (an empty file
 # is a month with no items; a missing file means the fetch is not done and
-# the job stops). Output: $PUBLISH/sentinel-2-c1-l2a/year=YEAR/items.parquet,
+# the job stops), plus every catch-up slice $SLICES/created-*.parquet
+# (catchup.sbatch; s2_build keeps the rows of this year and drops the
+# rest, and dedupes by id keeping the highest s2:generation_time).
+# Output: $PUBLISH/sentinel-2-c1-l2a/year=YEAR/items.parquet,
 # sorted (_tile, datetime), uniform 6,144-row groups, zstd 18, GeoParquet
 # 2.0, checked by `gpio check all` inside s2_build.py. The upload is a
 # separate job (upload_year.sbatch), so a build never needs AWS
 # credentials. A year whose file exists is not rebuilt: delete the file
-# first (after a repair, for example).
+# first (after a repair, or a catch-up that landed after the build).
 #
 # A large share of one node: DuckDB stages the year in memory and gpio
 # writes with the allocated cores. --memory is DuckDB's limit and gpio's
@@ -28,7 +31,6 @@
 #SBATCH --mem=300g
 #SBATCH --output=logs/s2c1-build-%j.out
 set -euo pipefail
-JOB_NAME=s2c1-build
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$HOME/s2-catalog}}"
 [ -f "$REPO/tools/rails/env.sh" ] || { echo "no checkout at $REPO; set REPO"; exit 1; }
 source "$REPO/tools/rails/env.sh"
@@ -50,6 +52,11 @@ for m in $(seq 1 "$LAST"); do
     MISSING+=("$f")
   fi
 done
+# Catch-up slices carry rows of any year; the build filters to YEAR.
+CATCHUP=()
+for f in "$SLICES"/created-*.parquet; do
+  [ -s "$f" ] && CATCHUP+=("$f")
+done
 if [ "${#MISSING[@]}" -gt 0 ]; then
   echo "year=$YEAR: ${#MISSING[@]} month(s) not fetched yet:"; printf '  %s\n' "${MISSING[@]}"
   if [ "$SMOKE" = 1 ]; then
@@ -61,9 +68,9 @@ if [ "${#MISSING[@]}" -gt 0 ]; then
   fi
 fi
 if [ "${#SRC[@]}" -eq 0 ] && [ "$DRY_RUN" != 1 ]; then echo "year=$YEAR: no rows in any month"; exit 0; fi
-echo "year=$YEAR: ${#SRC[@]} month slice(s), memory $MEMORY, out $OUT"
+echo "year=$YEAR: ${#SRC[@]} month slice(s), ${#CATCHUP[@]} catch-up slice(s), memory $MEMORY, out $OUT"
 run python3 "$REPO/tools/s2_build.py" --collection "$COLLECTION" \
-  --sources ${SRC[@]+"${SRC[@]}"} --years "$YEAR" --out "$OUT" --memory "$MEMORY"
+  --sources ${SRC[@]+"${SRC[@]}"} ${CATCHUP[@]+"${CATCHUP[@]}"} --years "$YEAR" --out "$OUT" --memory "$MEMORY"
 run ls -la "$OUT/year=$YEAR/"
 run python3 - "$DEST" <<'EOF'
 import sys, duckdb

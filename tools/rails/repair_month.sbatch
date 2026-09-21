@@ -30,7 +30,6 @@
 #SBATCH --mem=16g
 #SBATCH --output=logs/s2c1-repair-%j.out
 set -euo pipefail
-JOB_NAME=s2c1-repair
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$HOME/s2-catalog}}"
 [ -f "$REPO/tools/rails/env.sh" ] || { echo "no checkout at $REPO; set REPO"; exit 1; }
 source "$REPO/tools/rails/env.sh"

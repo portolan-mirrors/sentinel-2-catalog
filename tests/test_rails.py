@@ -26,8 +26,8 @@ import upload      # noqa: E402
 
 SBATCH = sorted(RAILS.glob("*.sbatch"))
 SCRIPTS = SBATCH + [RAILS / "build_ready_years.sh"]
-EXPECTED_SBATCH = {"audit_year", "build_year", "fetch_months", "fold_live",
-                   "repair_month", "upload_year"}
+EXPECTED_SBATCH = {"audit_year", "build_year", "catchup", "fetch_months",
+                   "fold_live", "repair_month", "upload_year"}
 BUCKET_ARN = "arn:aws:s3:::us-west-2.opendata.source.coop"
 OBJECTS_ARN = f"{BUCKET_ARN}/portolan-mirrors/sentinel-2-catalog/*"
 
@@ -41,7 +41,8 @@ def _dry_env(**extra: str) -> dict[str, str]:
     """A laptop dry run: no Slurm, the checkout named by REPO, nothing
     written (env.sh skips its mkdir under DRY_RUN=1)."""
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("SLURM_") and k not in ("YEAR", "YEARS", "MONTH")}
+           if not k.startswith("SLURM_")
+           and k not in ("YEAR", "YEARS", "MONTH", "START", "END")}
     env.update(REPO=str(ROOT), DRY_RUN="1", HOME=env.get("HOME", "/nonexistent"))
     env.update(extra)
     return env
@@ -81,16 +82,17 @@ def test_sbatch_conventions(script):
     ("fetch_months.sbatch", {"MONTH": "2019-03"}),
     ("upload_year.sbatch", {"YEAR": "2019"}),
     ("fold_live.sbatch", {"YEARS": "2025,2026"}),
+    ("fold_live.sbatch", {}),
     ("repair_month.sbatch", {"MONTH": "2019-03"}),
     ("audit_year.sbatch", {"YEAR": "2019"}),
+    ("catchup.sbatch", {"START": "2026-09-19"}),
 ], ids=lambda x: x if isinstance(x, str) else "")
 def test_dry_run_prints_the_tools_and_touches_nothing(script, extra):
     """DRY_RUN=1 on a laptop (no Slurm, no slices, no AWS) exits 0 and
     prints the s2_* command it would run, with --collection
     sentinel-2-c1-l2a, and writes nothing under $SLICES or $PUBLISH."""
     with tempfile.TemporaryDirectory() as td:
-        env = _dry_env(SLICES=f"{td}/slices", PUBLISH=f"{td}/publish",
-                       WORK=f"{td}/work", **extra)
+        env = _dry_env(SLICES=f"{td}/slices", PUBLISH=f"{td}/publish", **extra)
         proc = _bash(RAILS / script, env)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "dry-run: python3 " in proc.stdout
@@ -125,11 +127,89 @@ def test_build_year_refuses_a_short_year_outside_dry_run():
 def test_env_sh_creates_nothing_when_sourced():
     with tempfile.TemporaryDirectory() as td:
         proc = subprocess.run(
-            ["bash", "-c", f'source "{RAILS}/env.sh"; echo "$WORK"'], cwd=td,
-            env=dict(os.environ, WORK=f"{td}/work", DRY_RUN="0"),
+            ["bash", "-c", f'source "{RAILS}/env.sh"; echo "$SLICES $PUBLISH"'], cwd=td,
+            env=dict(os.environ, SLICES=f"{td}/slices", PUBLISH=f"{td}/publish", DRY_RUN="0"),
             capture_output=True, text=True)
-        assert proc.returncode == 0 and proc.stdout.strip() == f"{td}/work"
+        assert proc.returncode == 0 and proc.stdout.split() == [f"{td}/slices", f"{td}/publish"]
         assert os.listdir(td) == []
+
+
+def test_catchup_names_the_window_and_folds_on_created():
+    """START..END (END defaults to today, UTC) fetched on `created` into
+    $SLICES/created-START_END/ and folded to $SLICES/created-START_END.parquet;
+    a slice that exists is not fetched again; a malformed or reversed
+    window stops before anything runs."""
+    today = subprocess.run(["date", "-u", "+%F"], capture_output=True, text=True).stdout.strip()
+    with tempfile.TemporaryDirectory() as td:
+        env = _dry_env(SLICES=td, START="2026-09-19", END="2026-09-25")
+        out = _bash(RAILS / "catchup.sbatch", env).stdout
+        assert ("s2_fetch.py --collection sentinel-2-c1-l2a --field created "
+                "--start 2026-09-19 --end 2026-09-25 --days-per-chunk 1 "
+                f"--out {td}/created-2026-09-19_2026-09-25") in out
+        assert f"fold_month.py {td}/created-2026-09-19_2026-09-25 {td}/created-2026-09-19_2026-09-25.parquet" in out
+        out = _bash(RAILS / "catchup.sbatch", _dry_env(SLICES=td, START="2026-09-19")).stdout
+        assert f"--end {today} " in out and f"created-2026-09-19_{today}.parquet" in out
+        Path(td, f"created-2026-09-19_{today}.parquet").write_bytes(b"")
+        proc = _bash(RAILS / "catchup.sbatch", _dry_env(SLICES=td, START="2026-09-19"))
+        assert proc.returncode == 0 and "exists, nothing to do" in proc.stdout
+        assert "s2_fetch" not in proc.stdout
+        for start, end in (("2026-9-19", "2026-09-25"), ("2026-09-26", "2026-09-25")):
+            proc = _bash(RAILS / "catchup.sbatch", _dry_env(SLICES=td, START=start, END=end))
+            assert proc.returncode == 1 and "s2_fetch" not in proc.stdout
+
+
+def test_build_year_adds_every_catchup_slice_to_the_sources():
+    """The month slices first, then every non-empty $SLICES/created-*.parquet;
+    s2_build's --years keeps only the year being built."""
+    with tempfile.TemporaryDirectory() as td:
+        for m in range(1, 13):
+            Path(td, f"2019-{m:02d}.parquet").write_bytes(b"x")
+        Path(td, "created-2026-09-19_2026-09-25.parquet").write_bytes(b"x")
+        Path(td, "created-2026-09-26_2026-09-30.parquet").write_bytes(b"x")
+        Path(td, "created-2026-10-01_2026-10-01.parquet").write_bytes(b"")
+        out = _bash(RAILS / "build_year.sbatch", _dry_env(YEAR="2019", SLICES=td)).stdout
+    build = next(line for line in out.splitlines() if "s2_build.py" in line)
+    sources = build.split("--sources ")[1].split(" --years ")[0].split()
+    assert sources == [f"{td}/2019-{m:02d}.parquet" for m in range(1, 13)] + [
+        f"{td}/created-2026-09-19_2026-09-25.parquet",
+        f"{td}/created-2026-09-26_2026-09-30.parquet"]
+    assert "--years 2019 " in build
+    assert "12 month slice(s), 2 catch-up slice(s)" in out
+
+
+def test_fold_live_enumerates_years_with_rows_in_live_when_years_is_unset():
+    """YEARS unset: the year list comes from the bucket (a python3 probe
+    over s2_build.published_part and published_rows, shimmed here), and
+    a probe that cannot answer stops the job before any download."""
+    with tempfile.TemporaryDirectory() as td:
+        shim = Path(td) / "bin"; shim.mkdir()
+        (shim / "python3").write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = - ]; then echo \"$FAKE_YEARS\"; exit \"${FAKE_EXIT:-0}\"; fi\n"
+            "echo 5\n")
+        (shim / "python3").chmod(0o755)
+        (shim / "curl").write_text(
+            "#!/bin/bash\n"
+            "case \" $* \" in *\" -I \"*) echo -n 200; exit 0;; esac\n"
+            "for ((i=1;i<=$#;i++)); do if [[ ${!i} == -o ]]; then j=$((i+1)); echo x > \"${!j}\"; fi; done\n")
+        (shim / "curl").chmod(0o755)
+        env = _dry_env(SLICES=f"{td}/slices", PUBLISH=f"{td}/publish",
+                       PATH=f"{shim}:{os.environ['PATH']}", FAKE_YEARS="2022,2026")
+        env["DRY_RUN"] = "0"
+        proc = _bash(RAILS / "fold_live.sbatch", env)
+        assert "YEARS unset; folding every year with rows in live: 2022,2026" in proc.stdout
+        assert "year=2022: live.parquet holds 5 row(s)" in proc.stdout
+        assert Path(td, "publish/fold/in/year=2022/live.parquet").exists()
+        # No year with rows: a green no-op.
+        env["FAKE_YEARS"] = ""
+        proc = _bash(RAILS / "fold_live.sbatch", env)
+        assert proc.returncode == 0 and "nothing to fold" in proc.stdout
+        assert "year=" not in proc.stdout
+        # The probe could not answer: stop, download nothing.
+        env["FAKE_EXIT"] = "1"
+        proc = _bash(RAILS / "fold_live.sbatch", env)
+        assert proc.returncode == 1
+        assert not Path(td, "publish/fold/in/year=2026").exists()
 
 
 def test_fold_live_refuses_a_live_only_fold_of_a_fetched_year():
@@ -246,6 +326,51 @@ def test_fold_month_unions_api_and_repair_and_skips_empty_days():
         sentinel = Path(td) / "2019-04.parquet"
         assert fold_month.fold(str(empty), str(sentinel), ["api"]) == 0
         assert sentinel.exists() and sentinel.stat().st_size == 0
+
+
+def test_fold_month_pins_duckdb_memory_and_spill_dir(monkeypatch):
+    """FOLD_MEMORY and FOLD_TMP reach DuckDB as memory_limit and
+    temp_directory (the defaults let a month fold spill to the network
+    filesystem under an 8 GB cgroup and die). A spill dir the fold made
+    is removed afterwards; one the caller made is left alone."""
+    con = duckdb.connect()
+    seen = []
+    real_connect = duckdb.connect
+
+    class Spy:
+        """A connection whose execute() records the SQL it is given."""
+
+        def __init__(self):
+            self.con = real_connect()
+
+        def execute(self, sql, *args, **kwargs):
+            seen.append(sql)
+            return self.con.execute(sql, *args, **kwargs)
+
+        def close(self):
+            self.con.close()
+    monkeypatch.setattr(duckdb, "connect", lambda *a, **k: Spy())
+    with tempfile.TemporaryDirectory() as td:
+        month = Path(td) / "2019-03"; (month / "api").mkdir(parents=True)
+        _chunk(con, month / "api" / "2019-03-01_2019-03-01.parquet", ["a"], 1)
+        spill = Path(td) / "spill" / "fold"
+        monkeypatch.setenv("FOLD_MEMORY", "1GB")
+        monkeypatch.setenv("FOLD_TMP", str(spill))
+        assert fold_month.fold(str(month), str(Path(td) / "2019-03.parquet"), ["api"]) == 1
+        assert not spill.exists()  # made by the fold, removed by the fold
+        assert any("SET memory_limit='1GB'" in sql and f"SET temp_directory='{spill}'" in sql
+                   for sql in seen)
+        spill.mkdir(parents=True)
+        fold_month.fold(str(month), str(Path(td) / "2019-03.parquet"), ["api"])
+        assert spill.is_dir()  # the caller's directory stays
+        # The defaults: the job's 40GB and a node-local /tmp directory.
+        monkeypatch.delenv("FOLD_MEMORY"); monkeypatch.delenv("FOLD_TMP")
+        seen.clear()
+        fold_month.fold(str(month), str(Path(td) / "2019-03.parquet"), ["api"])
+        pin = next(sql for sql in seen if "memory_limit" in sql)
+        assert "SET memory_limit='40GB'" in pin
+        assert f"SET temp_directory='/tmp/s2c1-fold-{os.getpid()}'" in pin
+        assert not Path(f"/tmp/s2c1-fold-{os.getpid()}").exists()
 
 
 # --- upload.py --------------------------------------------------------------

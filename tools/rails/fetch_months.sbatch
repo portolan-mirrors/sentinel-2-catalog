@@ -21,11 +21,10 @@
 #SBATCH --account=bgtj-tgirails
 #SBATCH --time=12:00:00
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=8g
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48g
 #SBATCH --output=logs/s2c1-fetch-%A_%a.out
 set -euo pipefail
-JOB_NAME=s2c1-fetch
 # Slurm copies the script to a spool directory, so env.sh is found from
 # the submit directory, not from $BASH_SOURCE.
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$HOME/s2-catalog}}"

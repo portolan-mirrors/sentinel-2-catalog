@@ -124,14 +124,23 @@ The full instructions, the credentials setup and every script are in
    upload jobs use it.
 5. **Run order**: smoke (`SMOKE=1`, one month under `_smoke/`) → 2017 end
    to end → 2018 with the layout experiment → the array fetch of every
-   month → year builds smallest first (`build_ready_years.sh`) and
-   uploads → audit per year, repair and rebuild a short month → the
-   metadata commit from a laptop (`make_items.py` and `make_collection.py`
-   with `--collection sentinel-2-c1-l2a --remote-baseline`, the gates,
-   commit, `publish-catalog`) → set the repository variable
-   `C1_LIVE_ENABLED` to `true` → dispatch `publish-stats` (its Collection
-   1 entry runs only with the variable set; it seeds `stats-c1`) →
-   flip the explorer's default.
+   month (on `datetime`; note its start date) → the catch-up
+   (`catchup.sbatch --export=ALL,START=<that date>`: one fetch on
+   `created` from the array's start to today, folded to
+   `$SLICES/created-START_END.parquet`, which every build reads; it
+   holds what was created after each month's task ran, which the array
+   and the daily refresh both miss) → year builds smallest first
+   (`build_ready_years.sh`; a year built before the catch-up is rebuilt:
+   `rm` its `items.parquet`, `build_year` again) and uploads → audit per
+   year, repair and rebuild a short month → the metadata commit from a
+   laptop (`make_items.py` and `make_collection.py` with
+   `--collection sentinel-2-c1-l2a --remote-baseline`, the gates,
+   commit, `publish-catalog`, which restamps every collection from the
+   bucket before it uploads) → set the repository variable
+   `C1_LIVE_ENABLED` to `true`, on the day the catch-up ended, so its
+   window and the refresh's five-day lookback meet → dispatch
+   `publish-stats` (its Collection 1 entry runs only with the variable
+   set; it seeds `stats-c1`) → flip the explorer's default.
 6. **Daily**: `refresh-daily`'s `refresh-c1` job, on while
    `C1_LIVE_ENABLED` is `true`, fetches the lookback by
    `created` (so a scene ESA reprocessed last week, whatever its
@@ -146,8 +155,11 @@ The full instructions, the credentials setup and every script are in
 year, a person runs the fold:
 
 ```bash
-ssh rails 'cd ~/s2-catalog && sbatch --export=ALL,YEARS=2026 tools/rails/fold_live.sbatch'
-# January: YEARS=2025,2026
+ssh rails 'cd ~/s2-catalog && sbatch tools/rails/fold_live.sbatch'
+# YEARS unset: every year whose published live.parquet holds rows.
+# The refresh looks back on `created`, so a live can sit under any year
+# ESA is reprocessing, not only the current one. To name the years:
+ssh rails 'cd ~/s2-catalog && sbatch --export=ALL,YEARS=2022,2026 tools/rails/fold_live.sbatch'
 ```
 
 It downloads each year's `items.parquet` and `live.parquet`, rebuilds the
@@ -156,7 +168,12 @@ highest `s2:generation_time`, sort `(_tile, datetime)`, zstd 18), uploads
 the new year file and then a zero-row live, and prints the laptop
 commands: `make_items.py` and `make_collection.py` with
 `--collection sentinel-2-c1-l2a --remote-baseline`, the gates, a commit,
-and the `publish-catalog` workflow.
+and the `publish-catalog` workflow. That workflow restamps the first
+collection's items and both stats collections from the bucket before it
+uploads, so the publish keeps the daily restamp instead of putting the
+committed copies over it. Start the fold after 04:00 UTC: one that
+crosses the refresh's 03:42 UTC rewrite of live loses that day's
+`created` slice from live until the next lookback fetches it again.
 
 **If the fold is skipped**: live keeps growing (a whole year in live is
 about 5 million rows at zstd 3, a larger and slower file than the year

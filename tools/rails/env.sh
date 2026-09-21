@@ -1,5 +1,5 @@
 # Sourced by every script in this directory. Sets the toolchain, the AWS
-# defaults, the scratch directory of one job and the shared paths on /u.
+# defaults and the shared paths on /u.
 #
 # Every sbatch finds this file through $REPO, never through $BASH_SOURCE:
 # Slurm copies a submitted script to a spool directory, so the script's
@@ -23,13 +23,11 @@ export DRY_RUN="${DRY_RUN:-0}"
 export SMOKE="${SMOKE:-0}"
 export SMOKE_MONTH=2017-07
 
-# Node-local scratch is fast and private to the job. $SLURM_JOB_ID is unset
-# outside Slurm (a dry run on a laptop), so fall back to the shell pid.
-# /tmp on a RAILS node is a 64 GB tmpfs: fine for logs and small files,
-# too small for a year file or a DuckDB spill, which stay on /u. Only
-# named here: a job that needs it runs `run mkdir -p "$WORK"` itself, so
-# sourcing this file creates nothing.
-export WORK="${WORK:-/tmp/${JOB_NAME:-s2}-${SLURM_JOB_ID:-$$}}"
+# /tmp on a RAILS node is a 64 GB tmpfs: too small for a year file or a
+# year build's DuckDB spill, which stay on /u. The month fold's spill
+# (fold_month.py, FOLD_TMP) is the one thing that goes there: a month
+# fits, and a spill on the network filesystem failed. Sourcing this file
+# creates nothing.
 
 # Where fetched month slices live between the fetch and the build: the
 # shared project space, so a build job on another node can read them.

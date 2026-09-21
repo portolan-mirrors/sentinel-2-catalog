@@ -1,14 +1,20 @@
 #!/bin/bash
 # Fold each year's live.parquet into its items.parquet and empty live.
 #
-#     ssh rails 'cd ~/s2-catalog && sbatch --export=ALL,YEARS=2026 tools/rails/fold_live.sbatch'
-#     ssh rails 'cd ~/s2-catalog && sbatch --export=ALL,YEARS=2025,2026 tools/rails/fold_live.sbatch'
+#     ssh rails 'cd ~/s2-catalog && sbatch tools/rails/fold_live.sbatch'
+#     ssh rails 'cd ~/s2-catalog && sbatch --export=ALL,YEARS=2022,2026 tools/rails/fold_live.sbatch'
 #
 # The daily refresh (refresh-daily.yml) appends to year=YYYY/live.parquet
 # at zstd 3 and never consolidates Collection 1; this job is the
 # consolidation, run by hand every month or two and at year end (see
-# tools/README.md, "Sync & backfill"). For each year in YEARS (default:
-# the current year; in January name the old year too):
+# tools/README.md, "Sync & backfill"). The refresh looks back on
+# `created`, and ESA is reprocessing old years, so a live part can sit
+# under any year, not only the current one. YEARS unset (the usual run)
+# folds every year from 2015 to now whose published live.parquet holds
+# rows: one HEAD per year (s2_build.published_part, retried) and a
+# footer read of each live found (s2_build.published_rows); a probe that
+# cannot answer stops the job before anything is folded. YEARS=Y1,Y2
+# names the years by hand. For each year:
 #
 #   1. HEAD the year's published live.parquet; skip the year when it is
 #      not published or holds no rows.
@@ -33,8 +39,17 @@
 # Then regenerate and commit the metadata from a laptop; the job prints
 # the commands. Needs the source-coop AWS profile (README.md).
 #
+# Timing: the daily refresh rewrites live.parquet at 03:42 UTC. A fold
+# whose window (the download in step 2 to the upload in step 5) crosses
+# that moment puts the empty live over a live the refresh had just
+# rewritten, so that day's `created` slice drops out of live. The next
+# refresh's five-day lookback fetches those items again, so the loss
+# heals itself within a day; a fold that starts after 04:00 UTC and ends
+# before the next 03:42 never meets it.
+#
 # SMOKE=1 folds the smoke year under _smoke/. DRY_RUN=1 prints the
-# commands and assumes every probe answers 200.
+# commands, assumes every probe answers 200 and, with YEARS unset, takes
+# the current year (no HEAD is made).
 #SBATCH --job-name=s2c1-fold
 #SBATCH --partition=cpu
 #SBATCH --account=bgtj-tgirails
@@ -44,15 +59,45 @@
 #SBATCH --mem=300g
 #SBATCH --output=logs/s2c1-fold-%j.out
 set -euo pipefail
-JOB_NAME=s2c1-fold
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$HOME/s2-catalog}}"
 [ -f "$REPO/tools/rails/env.sh" ] || { echo "no checkout at $REPO; set REPO"; exit 1; }
 source "$REPO/tools/rails/env.sh"
 export AWS_PROFILE="${AWS_PROFILE:-source-coop}"
 if [ "$SMOKE" = 1 ]; then YEARS="${SMOKE_MONTH%-*}"; fi
-YEARS="${YEARS:-$(date -u +%Y)}"
 MEMORY="${MEMORY:-250GB}"
 BASE="$PUBLIC_BASE/$COLLECTION"
+if [ -z "${YEARS:-}" ]; then
+  if [ "$DRY_RUN" = 1 ]; then
+    YEARS="$(date -u +%Y)"
+    echo "dry-run: YEARS unset; taking the current year ($YEARS) instead of probing the bucket"
+  else
+    # Every year with a published, non-empty live: the list this run
+    # folds. published_part stops on a HEAD that is not 200 or 404, and
+    # published_rows on a footer it cannot read, so an unanswered probe
+    # stops the job here, before any download.
+    YEARS="$(python3 - "$REPO" "$BASE" <<'EOF'
+import sys
+from datetime import datetime, timezone
+import duckdb
+repo, base = sys.argv[1], sys.argv[2]
+sys.path.insert(0, f"{repo}/tools")
+from s2_build import published_part, published_rows
+con = duckdb.connect()
+years = []
+for y in range(2015, datetime.now(timezone.utc).year + 1):
+    if not published_part(base, y, "live.parquet"):
+        continue
+    n = published_rows(con, f"{base}/year={y}/live.parquet")
+    print(f"year={y}: live.parquet holds {n:,} row(s)", file=sys.stderr)
+    if n:
+        years.append(str(y))
+print(",".join(years))
+EOF
+)"
+    [ -n "$YEARS" ] || { echo "no year has a published live.parquet with rows; nothing to fold"; exit 0; }
+    echo "YEARS unset; folding every year with rows in live: $YEARS"
+  fi
+fi
 FOLD="$PUBLISH/fold"
 IN="$FOLD/in"; OUT="$FOLD/out/$COLLECTION"
 
@@ -128,5 +173,7 @@ $(for Y in "${FOLDED[@]}"; do echo "  mkdir -p staging/publish/$COLLECTION/year=
   python3 tools/make_collection.py --collection $COLLECTION --data-dir staging/publish/$COLLECTION --remote-baseline
   CI_LIGHT=1 python3 tests/run_all.py
   git add catalog/$COLLECTION && git commit -m "catalog(c1): fold ${FOLDED[*]}"
-then run the publish-catalog workflow.
+then run the publish-catalog workflow. It restamps every collection from
+the bucket before it uploads, so the first collection's daily restamp is
+kept.
 EOF

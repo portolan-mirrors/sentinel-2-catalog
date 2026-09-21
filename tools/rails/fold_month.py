@@ -18,12 +18,20 @@ published once.
 
 The slice is written to <dest>.tmp and renamed, so a killed fold leaves
 the previous slice in place.
+
+DuckDB's memory limit and spill directory are pinned (FOLD_MEMORY, default
+40GB; FOLD_TMP, default /tmp/s2c1-fold-<pid>): a month's ORDER BY spills,
+and the defaults (80 % of the node's RAM, a spill file in the working
+directory on the network filesystem) killed 50 array tasks with an OOM or
+"Could not read enough bytes from file". The sbatch that calls this sets
+--mem above FOLD_MEMORY.
 """
 from __future__ import annotations
 
 import argparse
 import glob
 import os
+import shutil
 
 
 def chunk_files(month_dir: str, subdirs: list[str]) -> list[str]:
@@ -43,13 +51,31 @@ def fold(month_dir: str, dest: str, subdirs: list[str]) -> int:
     import duckdb
     con = duckdb.connect()
     con.execute("SET TimeZone='UTC'; INSTALL spatial; LOAD spatial;")
+    # A month of Collection 1 is up to ~450k rows with an 18 KB assets
+    # string each, so the ORDER BY spills. DuckDB's default limit is 80 % of
+    # the node's RAM, far above the job's cgroup, and its default temp dir
+    # is the working directory on the network filesystem, where a spill
+    # read failed. Pin both: the job's memory (FOLD_MEMORY) and node-local
+    # /tmp for the spill.
+    mem = os.environ.get("FOLD_MEMORY", "40GB")
+    spill = os.environ.get("FOLD_TMP", f"/tmp/s2c1-fold-{os.getpid()}")
+    made_spill = not os.path.isdir(spill)
+    os.makedirs(spill, exist_ok=True)
+    con.execute(f"SET memory_limit='{mem}'; SET temp_directory='{spill}';")
     tmp = dest + ".tmp"
-    con.execute(f"""
-        COPY (SELECT * FROM read_parquet({files!r}, union_by_name=true)
-              ORDER BY datetime)
-        TO '{tmp}' (FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 3,
-                    ROW_GROUP_SIZE 100000)""")
-    n = con.execute(f"SELECT count(*) FROM read_parquet('{tmp}')").fetchone()[0]
+    try:
+        con.execute(f"""
+            COPY (SELECT * FROM read_parquet({files!r}, union_by_name=true)
+                  ORDER BY datetime)
+            TO '{tmp}' (FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 3,
+                        ROW_GROUP_SIZE 100000)""")
+        n = con.execute(f"SELECT count(*) FROM read_parquet('{tmp}')").fetchone()[0]
+    finally:
+        # DuckDB removes its spill files on close; the directory this fold
+        # made is removed too, so a node's /tmp does not collect one per job.
+        con.close()
+        if made_spill:
+            shutil.rmtree(spill, ignore_errors=True)
     os.replace(tmp, dest)
     print(f"{dest}: {n:,} rows from {len(files)} day chunk(s) in "
           f"{', '.join(subdirs)}")
