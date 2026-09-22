@@ -476,7 +476,7 @@ def test_app_collections_mirror_the_configs():
     html = (ROOT / "apps/explorer/index.html").read_text()
     assert '<select id="collection">' in html
     readme = (ROOT / "README.md").read_text()
-    assert "?collection=sentinel-2-c1-l2a" in readme
+    assert "?collection=sentinel-2-l2a" in readme
 
 
 # ---------------------------------------------------------------------------
