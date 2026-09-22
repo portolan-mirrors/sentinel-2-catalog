@@ -67,6 +67,12 @@ PUBLISHABLE_SUFFIXES = {
     ".laz",
 }
 
+# One JSON shape may pass beside the parquet: the search sidecar a part
+# publishes as <stem>.idx.json (tools/make_search_sidecar.mjs). The gate
+# admits the full double suffix, not ".json", so a stray scratch JSON
+# stays out.
+SIDECAR_SUFFIX = ".idx.json"
+
 
 def data_root(config: dict[str, str], root: Path = ROOT) -> Path:
     """The staging directory this script walks.
@@ -98,7 +104,10 @@ def is_data_publishable(rel: Path) -> bool:
     It applies the dotfile rule of ``publish.py`` and then the suffix
     allow-list.
     """
-    return is_publishable(rel) and rel.suffix.lower() in PUBLISHABLE_SUFFIXES
+    return is_publishable(rel) and (
+        rel.suffix.lower() in PUBLISHABLE_SUFFIXES
+        or rel.name.lower().endswith(SIDECAR_SUFFIX)
+    )
 
 
 def collect_data_uploads(
