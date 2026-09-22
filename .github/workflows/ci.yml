@@ -69,5 +69,5 @@ jobs:
           CI_LIGHT: "1"
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq tippecanoe
-          python -m pip install --quiet duckdb 'geoparquet-io==1.5.0' pmtiles pytest pytz
+          python -m pip install --quiet duckdb 'geoparquet-io==1.5.0' pmtiles pytest pytz boto3
           python3 -m pytest tests/ -q
