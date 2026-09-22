@@ -471,7 +471,9 @@ def test_app_collections_mirror_the_configs():
     default = next(line for line in js.splitlines()
                    if line.startswith("export const DEFAULT_COLLECTION = "))
     assert default.split('"')[1] in cols.NAMES
-    assert 'WHERE "${COL.tileColumn}" = ' in js
+    # The scene search (search.js since the hyparquet swap) filters by the
+    # collection's configured tile column, not a hard-coded name.
+    assert "tileColumn: COL.tileColumn" in js
     assert 'collections: [COLLECTION_ID]' in js
     html = (ROOT / "apps/explorer/index.html").read_text()
     assert '<select id="collection">' in html
