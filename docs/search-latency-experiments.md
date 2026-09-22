@@ -1,13 +1,14 @@
 # Scene-search latency experiments on 2025 data
 
-Measured 2026-09-21. The question: the explorer's scene search takes ~30 s
-cold; how far down can a tighter data layout drive it? All experiments use
+Measured 2026-09-21. The explorer's scene search takes ~30 s cold, and
+these experiments measure how much a tighter layout reduces it. All
+experiments use
 `year=2025/z21-31.parquet` (875,583 rows, 4,759 tiles, 241 MB — the octant
 holding the three test tiles of docs/query-performance.md: 31UFU, 30TVK,
 23KKQ). The workload is the app's exact search: one tile, a 3-month window,
 `eo:cloud_cover <= 20`, coverage ≥ 50 %, `ORDER BY cloud LIMIT 30`.
 
-## Why the current search is slow
+## The sequential request chain behind the 30 s
 
 Confirmed against the live bucket (fresh DuckDB connection, app-shaped query):
 **74–123 GETs, 2.1–2.3 MiB, 6.6–49.5 s wall** across the three tiles. The
@@ -16,11 +17,11 @@ mechanism is the one docs/query-performance.md established: on a path with
 sequential request chain (HEAD → footer ×2 → per-admitted-group bloom filter +
 filter columns → second pass for the projected columns), and the 2025 Hilbert
 sort scatters one tile's month across 5–10 of the month's row groups, so the
-chain is long *and* wide.
+chain is long and wide.
 
-## Two structural findings that make rows tiny
+## Derivable ids and thumbnail URLs make rows tiny
 
-1. **`thumbnail_url` is 100 % derivable from `id`** (0 exceptions in 875,583
+1. **`thumbnail_url` derives fully from `id`** (0 exceptions in 875,583
    rows): `https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/
    {zone}/{band}/{square}/{year}/{month}/{id}/{tail}` where zone/band/square
    parse out of the tile in the id, year/month out of the date in the id, and
@@ -32,8 +33,7 @@ chain is long *and* wide.
    fully carried by: tile (implicit or sorted), datetime, cloud, nodata,
    bbox (4×float32), baseline (dict string), platform letter, seq, thumb enum.
 
-A search row quantized this way (cloud/nodata as `USMALLINT` tenths of a
-percent) costs **~27 bytes compressed**; keeping the raw `id` +
+A search row quantized this way (cloud/nodata as `USMALLINT`, 0.1 % resolution) costs **~27 bytes compressed**; keeping the raw `id` +
 `thumbnail_url` strings instead costs 2.2× (29.3 MB vs 13.2 MB for the
 octant-year).
 
@@ -43,13 +43,13 @@ Local range-supporting HTTP server with injected latency (0.4 s or 0.8 s per
 request, 2.5 MB/s — the measured envelope of the real path), fresh DuckDB
 connection per run. Server-side counters give GET/bytes.
 
-| layout | file(s) | size | query path |
+| layout | files | size | query path |
 |---|---|---|---|
 | V2-current | the live part, local copy | 241 MB | httpfs range reads |
 | v3m | rebuild: sort `(_month, tile, _hilbert)`, month-aligned 6,144 groups (issue #9's plan) | 340 MB¹ | httpfs |
 | tilesort-full | rebuild: sort `(tile, datetime)`, 6,144 groups | 285 MB¹ | httpfs |
 | slim sidecar | search columns only, sort `(tile, datetime)`, rg 1k–20k | 13–15 MB | httpfs |
-| per-tile files | `tiles/tile={tile}/…parquet`, slim columns | 4,765 files, 22.8 MB total, median 4.6 KB, max 29.5 KB | 1 GET whole file, query locally |
+| per-tile files | `tiles/tile={tile}/…parquet`, slim columns | 4,765 parquet files, 22.8 MB total, median 4.6 KB, max 29.5 KB | 1 GET whole file, query locally |
 | tile-pack | the per-tile files concatenated + `{tile: [offset, length]}` index | 22.8 MB pack + 109 KB index (44.5 KB gz) | 1 range GET (+ index, cached), query locally |
 
 ¹ Written at DuckDB default zstd, not the production zstd-18; request counts
@@ -76,14 +76,14 @@ The floor for *any* DuckDB-httpfs layout is ~9 GETs, mostly sequential
 (HEAD, footer ×2, bloom, filter columns, late-materialization second pass) —
 about 4–8 s on this path no matter how the file is sorted or sized. The only
 way out is to stop range-reading parquet internals per click: fetch a
-tile-sized object whole and query it locally. Real-path spot check: a single
+tile-sized object whole and query it locally. Real-path spot check: one
 5 KB range GET from `data.source.coop` is 0.3–0.8 s on a warm connection
 (2.4 s cold TLS). **Scene search lands under one second.**
 
 ## The tile-pack in detail
 
 Per-tile parquet files answer in one GET but cost ~38k objects per year
-globally. The pack removes that: concatenate the per-tile files (each remains
+globally. The pack removes the object count: it concatenates the per-tile files (each remains
 a complete, standalone parquet file) into one object per octant-year and
 publish a `{tile: [offset, length]}` JSON index beside it. The client fetches
 the index once per octant-year (44.5 KB gzipped; cacheable, or prefetchable on
@@ -98,15 +98,15 @@ Global cost, extrapolated from this octant: ~180 MB and 16 objects
 exactly as they are; the pack is a derived search sidecar, rebuilt from the
 parts in seconds (the whole octant build: 2 s slim projection + pack
 concatenation). The daily refresh would regenerate only the current year's
-pack. A multi-year search window fans out to one range GET per year, in
+pack. A multi-year search window issues one range GET per year, in
 parallel — still one round trip.
 
-What the slim row keeps, meeting the product requirements: `datetime`,
+The slim row covers the product requirements with `datetime`,
 `cloud10`/`nodata10` (cloud-cover and coverage filtering at 0.1 % precision),
 bbox floats ("show on map"), baseline (BOA offset for the band mapper),
 platform/seq/thumb (id and thumbnail/COG URL reconstruction — image preview).
 
-## What this says about issue #9
+## Consequences for issue #9
 
 The planned archive rebuild (month-aligned groups) is still right for the
 *catalog* — it fixes the assets fetch and bulk analytics (29 vs 74–122 GETs).
@@ -114,20 +114,20 @@ But it does not fix the interactive search (5.7 s vs 6.5 s at 0.4 s RTT):
 no parquet-over-httpfs layout can. If the search moves to the pack, the
 rebuild's urgency drops to the assets-fetch and analytics cases, and the
 tile-major sort `(tile, datetime)` measured here is worth considering as the
-rebuild's sort instead — it beats the month-major plan for every tile-scoped
-query (11–20 vs 29 GETs) at equal bytes.
+rebuild's sort instead — it needs fewer requests than the month-major plan
+for every tile-scoped query (11–20 vs 29 GETs) at equal bytes.
 
 ## Round 2: pure standard parquet + sidecar index + hyparquet client
 
-The tile-pack's container is bespoke. The generic version keeps the file
-**100 % standard parquet** and moves the trick into a sidecar: a JSON index
-`{key: [byteStart, byteLen, rowStart, rowCount]}` derived mechanically from
-the footer (column chunks within consecutive row groups are contiguous bytes,
+The tile-pack's container is bespoke. In the generic version the file is
+plain, fully standard parquet, and a sidecar JSON index
+`{key: [byteStart, byteLen, rowStart, rowCount]}` carries the acceleration.
+The index derives mechanically from the footer (column chunks within consecutive row groups are contiguous bytes,
 so a key-sorted file gives every key one contiguous byte span — verified
 non-overlapping for all 4,759 tiles). Any parquet file sorted by a key column
 admits this index; nothing about it is Sentinel-2-specific.
 
-Two grain choices for the same slim table, plus the pack for reference:
+The same slim table at two grains, with the pack for reference:
 
 | file | groups | size | footer | median span/tile | index (gz) |
 |---|---|---|---|---|---|
@@ -158,13 +158,13 @@ for context:
 | hyparquet on tile-pack | — | **0.4 s** | **1** | 5–7 |
 
 Every mode returns rows byte-identical to the DuckDB answer (diffed on
-31UFU). Three things worth underlining:
+31UFU). Worth underlining:
 
 - **Even naive hyparquet beats DuckDB-httpfs 4×** (1.5 s vs 6.5 s): it
   fetches the footer in one suffix read and coalesces a row-group range into
   one request, where DuckDB chains HEAD, footer, bloom and per-column reads.
   Dropping DuckDB-WASM for the search is a win before any layout change —
-  and the app stops shipping a ~36 MB WASM bundle for it.
+  and the app stops loading a ~36 MB WASM bundle for it.
 - **The sidecar removes the footer from the per-query path**, and the footer
   is the only reason a pure-parquet client ever needs more than one request.
   Cold-start cost is one index + one footer fetch per session; mid-grain
@@ -208,14 +208,14 @@ So the ladder is:
 
 1. **Client swap alone** (no publishing change): 6.5 s → 2–3.4 s.
 2. **Client + tile-sorted canonical rebuild**: 0.5–0.6 s on fully standard
-   geoparquet, no side files. The rebuild is the 32–71 runner-hour job of
+   geoparquet alone. The rebuild is the 32–71 runner-hour job of
    issue #9, with `(tile, datetime)` as the sort.
 3. **Client + slim sidecar files**: 0.4 s and 31 KB/search, buildable from
-   the current parts in seconds, no rebuild needed.
+   the current parts in seconds, before any rebuild.
 
-Steps 2 and 3 converge: once the canonical parts are tile-sorted, the slim
-file's remaining edge is bytes (31 vs ~300 KiB) and cold-start, which is a
-mobile-bandwidth argument more than a latency one.
+Steps 2 and 3 converge. After a tile-sorted rebuild the slim file still
+saves bytes per search (31 vs ~300 KiB) and cold-start time. That saving is
+a mobile-bandwidth argument more than a latency one.
 
 ## Artifacts
 
