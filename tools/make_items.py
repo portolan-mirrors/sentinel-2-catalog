@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write one STAC item per published year of the sentinel-2-l2a index.
+"""Write one STAC item per published year of a collection's index.
 
 The partition extension allows items where a partition is a user-meaningful
 unit, and a year is one. Each item carries that year's real extent, row count
@@ -48,6 +48,15 @@ the parts.
 Collection item links are not written here. make_collection.py globs the item
 files it finds and links every one, so the two tools cannot disagree about
 which items exist.
+
+--collection picks the collection (s2_collections; default the first one, so
+every existing call is unchanged). It decides the candidate parts (a
+collection that never zone-splits has two: items.parquet and live.parquet),
+the published base the probes ask, the item's collection id and titles, and
+the default --out (catalog/<catalog_dir>/):
+
+    python3 tools/make_items.py --collection sentinel-2-c1-l2a \\
+        --data-dir ./staging/publish/sentinel-2-c1-l2a --remote-baseline
 """
 from __future__ import annotations
 
@@ -63,12 +72,15 @@ from pathlib import Path
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s2_collections as cols  # noqa: E402
 from s2_build import ZONE_PARTS, ZONE_PARTS_8  # noqa: E402
+from s2_collections import CollectionConfig  # noqa: E402
 from s2_schema import USER_AGENT  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
-PUBLIC = "https://data.source.coop/portolan-mirrors/sentinel-2-catalog"
+DEFAULT_CONFIG = cols.get(cols.DEFAULT)
+PUBLIC = cols.PUBLIC
 
 # Source Cooperative's CDN answers 403 to the default Python-urllib agent, so
 # every request here names itself. Without this a HEAD looks like a missing
@@ -86,16 +98,26 @@ UA = {"User-Agent": USER_AGENT}
 # rewrites the archive parts and resets live.parquet, so a year's row count
 # is the sum of its parts. Fourteen candidates, of which a year has at most
 # nine; a probe is one HEAD, so the misses cost nothing worth a table of
-# which year has which.
-PARTS = (
-    ("data", "items.parquet", "{year} scenes, GeoParquet 2.0",
-     ["data"]),
-    *((f"data-{label}", f"{label}.parquet",
-       f"{{year}} scenes, UTM zones {lo}\u2013{hi}", ["data"])
-      for label, lo, hi in (*ZONE_PARTS, *ZONE_PARTS_8)),
-    ("live", "live.parquet",
-     "Rolling tail since the last consolidation, refreshed daily", ["data"]),
-)
+# which year has which. A collection that never splits (Collection 1) has
+# just the first and the last: its archive is one items.parquet per year,
+# and its tail is folded back into that file by the periodic fold on
+# RAILS, not by the monthly consolidation; the live title says which.
+def parts_for(config: CollectionConfig = DEFAULT_CONFIG,
+              ) -> tuple[tuple[str, str, str, list[str]], ...]:
+    zones = (*ZONE_PARTS, *ZONE_PARTS_8) if config.zone_split else ()
+    merge = "consolidation" if config.zone_split else "fold"
+    return (
+        ("data", "items.parquet", "{year} scenes, GeoParquet 2.0",
+         ["data"]),
+        *((f"data-{label}", f"{label}.parquet",
+           f"{{year}} scenes, UTM zones {lo}\u2013{hi}", ["data"])
+          for label, lo, hi in zones),
+        ("live", "live.parquet",
+         f"Rolling tail since the last {merge}, refreshed daily", ["data"]),
+    )
+
+
+PARTS = parts_for()
 
 # Rounding a bbox has to widen it. round() can shrink a bound by up to half a
 # unit in the last place, which turns a footprint that touches the antimeridian
@@ -265,7 +287,8 @@ def recorded_part(committed: dict | None, key: str) -> dict | None:
 
 
 def discover(year_dir: Path, year: int, remote_baseline: bool,
-             committed: dict | None = None, probe=remote_probe) -> list[dict]:
+             committed: dict | None = None, probe=remote_probe,
+             config: CollectionConfig = DEFAULT_CONFIG) -> list[dict]:
     """The parts that make up one year: staged, published, or last recorded.
 
     A part is read from --data-dir when it is staged there. Otherwise, and only
@@ -287,10 +310,11 @@ def discover(year_dir: Path, year: int, remote_baseline: bool,
              built from the parts that happened to answer is worse than no new
              item at all.
     """
-    recorded_keys = {key for key, _, _, _ in PARTS
+    parts = parts_for(config)
+    recorded_keys = {key for key, _, _, _ in parts
                      if recorded_part(committed, key) is not None}
     found = []
-    for key, name, title, roles in PARTS:
+    for key, name, title, roles in parts:
         common = {"key": key, "name": name, "title": title, "roles": roles}
         local = year_dir / name
         if local.is_file():
@@ -300,7 +324,7 @@ def discover(year_dir: Path, year: int, remote_baseline: bool,
         if not remote_baseline:
             continue
 
-        url = f"{PUBLIC}/sentinel-2-l2a/year={year}/{name}"
+        url = f"{config.public_base}/year={year}/{name}"
         state, size = probe(url)
         recorded = recorded_part(committed, key)
 
@@ -331,7 +355,8 @@ def discover(year_dir: Path, year: int, remote_baseline: bool,
 
 
 def build_item(con: duckdb.DuckDBPyConnection, year: int, parts: list[dict],
-               committed: dict | None = None) -> dict:
+               committed: dict | None = None,
+               config: CollectionConfig = DEFAULT_CONFIG) -> dict:
     """One STAC item describing every part of a year."""
     stats = []
     for part in parts:
@@ -374,13 +399,13 @@ def build_item(con: duckdb.DuckDBPyConnection, year: int, parts: list[dict],
             "https://stac-extensions.github.io/file/v2.1.0/schema.json",
         ],
         "id": str(year),
-        "collection": "sentinel-2-l2a",
+        "collection": config.id,
         "bbox": bbox,
         "geometry": {"type": "Polygon", "coordinates": [[
             [bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[2], bbox[3]],
             [bbox[0], bbox[3]], [bbox[0], bbox[1]]]]},
         "properties": {
-            "title": f"Sentinel-2 L2A scenes, {year}",
+            "title": f"{config.title}, {year}",
             # Null with a start/end pair: the item covers a range, and STAC
             # says say so rather than pick a moment inside it.
             "datetime": None,
@@ -401,28 +426,33 @@ def build_item(con: duckdb.DuckDBPyConnection, year: int, parts: list[dict],
              "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"},
             {"rel": "parent", "href": "../collection.json",
              "type": "application/json",
-             "title": "Sentinel-2 L2A scenes (item index)"},
+             "title": f"{config.title} (item index)"},
             {"rel": "collection", "href": "../collection.json",
              "type": "application/json",
-             "title": "Sentinel-2 L2A scenes (item index)"},
+             "title": f"{config.title} (item index)"},
         ],
     }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    dirs = ", ".join(cols.get(n).catalog_dir for n in cols.NAMES)
+    cols.add_collection_arg(ap)
     ap.add_argument("--data-dir", required=True,
-                    help="staged sentinel-2-l2a/ directory holding year=*/")
-    ap.add_argument("--out", default=str(ROOT / "catalog" / "sentinel-2-l2a"),
-                    help="tracked collection directory (default: catalog/sentinel-2-l2a)")
+                    help="staged collection directory holding year=*/")
+    ap.add_argument("--out",
+                    help="tracked collection directory (default "
+                         f"catalog/<catalog_dir>: {dirs})")
     ap.add_argument("--remote-baseline", action="store_true",
                     help="for a staged year, read parts missing from --data-dir "
                          "from the published catalog over HTTP")
     ap.add_argument("--years", help="comma list; default = every staged year")
     a = ap.parse_args()
+    config = cols.get(a.collection)
 
     data = Path(a.data_dir).resolve()
-    out = Path(a.out).resolve()
+    out = (Path(a.out).resolve() if a.out
+           else ROOT / "catalog" / config.catalog_dir)
     if not data.is_dir():
         raise SystemExit(f"--data-dir does not exist: {data}")
 
@@ -445,11 +475,12 @@ def main() -> int:
     for year, year_dir in years:
         target = out / f"year={year}"
         committed = read_item(target / f"{year}.json")
-        parts = discover(year_dir, year, a.remote_baseline, committed)
+        parts = discover(year_dir, year, a.remote_baseline, committed,
+                         config=config)
         if not parts:
             print(f"  {year}: no parts, skipped")
             continue
-        item = build_item(con, year, parts, committed)
+        item = build_item(con, year, parts, committed, config=config)
         target.mkdir(parents=True, exist_ok=True)
         (target / f"{year}.json").write_text(json.dumps(item, indent=2) + "\n")
         props = item["properties"]

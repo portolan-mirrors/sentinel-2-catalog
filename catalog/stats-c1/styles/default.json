@@ -1,0 +1,33 @@
+{
+  "version": 8,
+  "name": "MGRS tiles (default)",
+  "sources": {
+    "mgrs": {
+      "type": "vector",
+      "url": "../mgrs.pmtiles"
+    }
+  },
+  "layers": [
+    {
+      "id": "mgrs-fill",
+      "type": "fill",
+      "source": "mgrs",
+      "source-layer": "mgrs",
+      "paint": {
+        "fill-color": "#2e6da4",
+        "fill-opacity": 0.35,
+        "fill-outline-color": "#173d5c"
+      }
+    },
+    {
+      "id": "mgrs-outline",
+      "type": "line",
+      "source": "mgrs",
+      "source-layer": "mgrs",
+      "paint": {
+        "line-color": "#173d5c",
+        "line-width": 0.5
+      }
+    }
+  ]
+}

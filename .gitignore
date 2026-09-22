@@ -22,6 +22,10 @@ sources/
 staging/*/data/
 .cache/
 
+# The RAILS lane's month list and Slurm logs (tools/rails/README.md).
+/months.txt
+/logs/
+
 # Secrets
 .env
 .env.*

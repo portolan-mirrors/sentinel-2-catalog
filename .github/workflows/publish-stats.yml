@@ -4,6 +4,17 @@ name: publish-stats
 # and timeline.parquet) and the mgrs.pmtiles footprint tileset from the
 # PUBLISHED year parts (HTTP reads, no artifacts) and upload them all.
 #
+# One matrix entry per collection, run one at a time (max-parallel 1,
+# because each entry ends with tools/publish.py and two publishes of
+# catalog/ at once would race): sentinel-2-l2a into catalog/stats, and
+# sentinel-2-c1-l2a into catalog/stats-c1. The Collection 1 entry runs only
+# while the repository variable C1_LIVE_ENABLED is the string "true" (the
+# same switch as refresh-daily's Collection 1 job); off, its guard says so
+# and the entry is a green no-op. The order to bring Collection 1 up
+# (tools/README.md, "Sync & backfill"): publish the backfill from RAILS,
+# commit and publish its metadata, set the variable, dispatch this workflow
+# to seed stats-c1, and the next refresh-daily cron splices into it.
+#
 # Why this exists as its own workflow: after the first data publish,
 # catalog/stats/ metadata (committed, static) references mgrs-monthly.parquet
 # and mgrs.pmtiles that nothing has built at full scale or uploaded yet --
@@ -11,11 +22,13 @@ name: publish-stats
 # published, refresh-daily's "splice current year into stats" step passes
 # --existing "$BASE/stats/mgrs-monthly.parquet" to s2_stats.py, which will
 # 404 until that file exists at all. Run this once, manually, right after
-# the first publish to seed it.
+# the first publish to seed it. The same holds for stats-c1: refresh-daily's
+# Collection 1 job splices into a table only this workflow creates.
 #
 # It doubles as the periodic full-rebuild path (footprints included) after
-# big archive changes (a repair run, a large backfill correction) where the
-# incremental --merge-years splice in refresh-daily is not enough.
+# big archive changes (a repair run, a large backfill correction, a fold on
+# RAILS) where the incremental --merge-years splice in refresh-daily is not
+# enough.
 #
 # Bootstrap guard: same reasoning as refresh-daily.yml -- on a fresh repo
 # nothing is published yet, so the first step probes for catalog.json and
@@ -53,12 +66,39 @@ jobs:
   rebuild:
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          # live_years: which years' live.parquet to probe. The first
+          # collection's live is the current year's (consolidate-month
+          # folds the rest); a Collection 1 live can sit under any year,
+          # because its lookback is on `created` and ESA reprocesses old
+          # years, so every mission year is probed.
+          - collection: sentinel-2-l2a
+            stats_dir: stats
+            live_years: current
+            artifact: mgrs-tiles
+          - collection: sentinel-2-c1-l2a
+            stats_dir: stats-c1
+            live_years: all
+            artifact: mgrs-tiles-c1
+    env:
+      COLLECTION: ${{ matrix.collection }}
+      STATS_DIR: ${{ matrix.stats_dir }}
+      LIVE_YEARS: ${{ matrix.live_years }}
+      BASE: https://data.source.coop/portolan-mirrors/sentinel-2-catalog/${{ matrix.collection }}
+      C1_LIVE_ENABLED: ${{ vars.C1_LIVE_ENABLED }}
     steps:
-      - name: Check the catalog is published
+      - name: Check the catalog is published and this collection is enabled
         id: guard
         run: |
           set -uo pipefail
-          if curl -fsI https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json > /dev/null; then
+          if [ "$COLLECTION" = sentinel-2-c1-l2a ] && [ "$C1_LIVE_ENABLED" != true ]; then
+            echo "::notice::C1_LIVE_ENABLED is not 'true'; nothing to build for $COLLECTION"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          elif curl -fsI https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json > /dev/null; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::catalog not yet published; nothing to build stats from"
@@ -86,31 +126,32 @@ jobs:
             'rashid>=0.1.8,<0.2.0' stac-check
 
       # Resolve the "every published year part" glob by hand: probe every
-      # archive part name a year can hold -- items.parquet for a year
-      # published whole (2015-2018), the four z*.parquet UTM-zone quartiles
-      # for 2019-2020, the eight octants from 2021 (spec Amendment 3; the
-      # names come from tools/s2_build.py archive_part_names() so this list
-      # cannot drift from the builder) -- from 2015 (Sentinel-2's launch
-      # year) through the current year with a HEAD request, plus the
-      # current year's live.parquet if refresh-daily has published one
-      # yet. A 404 is a part that does not exist for that year, which is
-      # the normal case for most of the thirteen names; any other answer
-      # is a part this run cannot see and would
-      # silently leave out of the stats, so it fails the job. Loud failure
-      # too if the guard passed (catalog.json exists) but this finds
-      # nothing -- that combination means the catalog is published but
-      # empty/broken, never a quiet reason to skip.
+      # archive part name a year can hold -- for the first collection
+      # items.parquet for a year published whole (2015-2018), the four
+      # z*.parquet UTM-zone quartiles for 2019-2020, the eight octants from
+      # 2021 (spec Amendment 3); for Collection 1 one items.parquet per
+      # year; the names come from tools/s2_build.py archive_part_names()
+      # with the collection's config so this list cannot drift from the
+      # builder -- from 2015 (Sentinel-2's launch year) through the current
+      # year with a HEAD request, plus live.parquet for the years
+      # LIVE_YEARS names, if refresh-daily has published one. A 404 is a
+      # part that does not exist for that year, which is the normal case
+      # for most of the names; any other answer is a part this run cannot
+      # see and would silently leave out of the stats, so it fails the
+      # job. Loud failure too if the guard passed (catalog.json exists) but
+      # this finds nothing -- that combination means the catalog is
+      # published but empty/broken, never a quiet reason to skip.
       - name: Enumerate published year parts
         id: enumerate
         if: steps.guard.outputs.published == 'true'
         run: |
           set -euo pipefail
-          BASE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-l2a
           CURRENT_YEAR=$(date -u +%Y)
           ARCHIVE_NAMES=$(python3 -c '
-          import sys; sys.path.insert(0, "tools")
+          import os, sys; sys.path.insert(0, "tools")
+          import s2_collections as cols
           from s2_build import archive_part_names
-          print(" ".join(archive_part_names()))')
+          print(" ".join(archive_part_names(cols.get(os.environ["COLLECTION"]))))')
           # probe <year> <name>: 0 if year=<year>/<name>.parquet is published,
           # 1 if it answers 404; anything else stops the job.
           probe() {
@@ -129,10 +170,12 @@ jobs:
                 urls+=("$BASE/year=$Y/$NAME.parquet")
               fi
             done
+            if [ "$LIVE_YEARS" = all ] || [ "$Y" = "$CURRENT_YEAR" ]; then
+              if probe "$Y" live; then
+                urls+=("$BASE/year=$Y/live.parquet")
+              fi
+            fi
           done
-          if probe "$CURRENT_YEAR" live; then
-            urls+=("$BASE/year=$CURRENT_YEAR/live.parquet")
-          fi
           if [ "${#urls[@]}" -eq 0 ]; then
             echo "::error::catalog.json is published but zero year parts were found under $BASE -- refusing to build stats from nothing"
             exit 1
@@ -147,11 +190,14 @@ jobs:
 
       - name: Build stats and footprints at full scale
         if: steps.guard.outputs.published == 'true'
+        env:
+          PART_URLS: ${{ steps.enumerate.outputs.urls }}
         run: |
           set -euo pipefail
-          mapfile -t URLS <<< "${{ steps.enumerate.outputs.urls }}"
-          python3 tools/s2_stats.py --sources "${URLS[@]}" \
-            --out ./staging/publish/stats --footprints \
+          mapfile -t URLS <<< "$PART_URLS"
+          python3 tools/s2_stats.py --collection "$COLLECTION" \
+            --sources "${URLS[@]}" \
+            --out "./staging/publish/$STATS_DIR" --footprints \
             --keep-footprint-table
 
       # mgrs-tiles.parquet (the ~33k-polygon tile-envelope table behind
@@ -164,24 +210,71 @@ jobs:
         if: steps.guard.outputs.published == 'true'
         run: |
           set -euo pipefail
-          mv ./staging/publish/stats/mgrs-tiles.parquet ./staging/
+          mv "./staging/publish/$STATS_DIR/mgrs-tiles.parquet" ./staging/
 
-      # Both collections, because tools/publish.py below uploads all of
-      # catalog/: without the item index restamp it would put the committed
-      # sentinel-2-l2a/collection.json and year items over the bucket's
-      # copies that refresh-daily restamped from the live part. Same
-      # recipe as refresh-daily: an empty year marker for every mission
-      # year, then both generators from the published parts.
+      # This collection's stats collection from the timeline just written;
+      # then every other collection tools/publish.py below would touch,
+      # from the bucket, because publish.py uploads all of catalog/:
+      # without the restamp it would put the committed sentinel-2-l2a
+      # collection.json and year items over the copies refresh-daily
+      # restamped from the live part, and the other stats collection's
+      # committed extent over its published one. Same recipe as
+      # refresh-daily: an empty year marker for every mission year, then
+      # both generators from the published parts (--remote-baseline), and
+      # the stats collection from its published timeline. The Collection 1
+      # pair only under C1_LIVE_ENABLED: before that its committed metadata
+      # is the truth. On the dispatch that seeds stats-c1 the first entry
+      # runs before the Collection 1 entry has published a timeline, so the
+      # timeline is probed through s2_build.published_url (retried; exit 0
+      # published, 3 not, anything else could not answer): a 404 keeps the
+      # committed stats-c1 collection and says so; an unanswered probe
+      # stops the job. The variable set before any Collection 1 year is
+      # published fails the Collection 1 entry here with "nothing to
+      # describe" (make_collection): the documented order publishes the
+      # backfill first.
       - name: Restamp collection metadata
         if: steps.guard.outputs.published == 'true'
         run: |
           set -euo pipefail
+          TIMELINE=https://data.source.coop/portolan-mirrors/sentinel-2-catalog/stats-c1/timeline.parquet
+          python3 tools/make_stats_collection.py --collection "$COLLECTION" \
+            --data-dir "./staging/publish/$STATS_DIR"
           for y in $(seq 2015 "$(date -u +%Y)"); do
-            mkdir -p "staging/publish/sentinel-2-l2a/year=$y"
+            mkdir -p "staging/baseline/sentinel-2-l2a/year=$y"
+            mkdir -p "staging/baseline/sentinel-2-c1-l2a/year=$y"
           done
-          python3 tools/make_items.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
-          python3 tools/make_collection.py --data-dir ./staging/publish/sentinel-2-l2a --remote-baseline
-          python3 tools/make_stats_collection.py --data-dir ./staging/publish/stats
+          python3 tools/make_items.py \
+            --data-dir ./staging/baseline/sentinel-2-l2a --remote-baseline
+          python3 tools/make_collection.py \
+            --data-dir ./staging/baseline/sentinel-2-l2a --remote-baseline
+          if [ "$STATS_DIR" != stats ]; then
+            python3 tools/make_stats_collection.py \
+              --data-dir ./staging/baseline/stats --remote-baseline
+          fi
+          if [ "$C1_LIVE_ENABLED" = true ]; then
+            python3 tools/make_items.py --collection sentinel-2-c1-l2a \
+              --data-dir ./staging/baseline/sentinel-2-c1-l2a --remote-baseline
+            python3 tools/make_collection.py --collection sentinel-2-c1-l2a \
+              --data-dir ./staging/baseline/sentinel-2-c1-l2a --remote-baseline
+            if [ "$STATS_DIR" != stats-c1 ]; then
+              CODE=0
+              python3 -c '
+          import sys; sys.path.insert(0, "tools")
+          from s2_build import published_url
+          sys.exit(0 if published_url(sys.argv[1], what="stats-c1/timeline.parquet") else 3)' \
+                "$TIMELINE" || CODE=$?
+              case "$CODE" in
+                0)
+                  python3 tools/make_stats_collection.py --collection sentinel-2-c1-l2a \
+                    --data-dir ./staging/baseline/stats-c1 --remote-baseline ;;
+                3)
+                  echo "::notice::stats-c1/timeline.parquet is not published yet; keeping the committed stats-c1 collection" ;;
+                *)
+                  echo "::error::stats-c1/timeline.parquet: the probe could not answer (exit $CODE; published_url said why above)"
+                  exit 1 ;;
+              esac
+            fi
+          fi
 
       - name: Validate before upload
         if: steps.guard.outputs.published == 'true'
@@ -194,7 +287,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
-          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ matrix.stats_dir }}
           aws-region: us-west-2
 
       - name: Upload data
@@ -214,7 +307,7 @@ jobs:
         if: steps.guard.outputs.published == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: mgrs-tiles
+          name: ${{ matrix.artifact }}
           path: ./staging/mgrs-tiles.parquet
           retention-days: 14
           if-no-files-found: error

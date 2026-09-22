@@ -1,15 +1,16 @@
-"""Bucket repair (s2_repair.py) and inventory audit (s2_audit.py).
+"""Bucket repair (s2_repair.py). The inventory audit is tests/test_audit.py.
 
-Only one real network call in this whole file: fetching the verified
-S2C_53HNV_20260910_0_L2A static item JSON, to prove the bucket's item shape
-still normalizes onto the canonical schema (same style as
+Two real network calls in this whole file: fetching the verified
+S2C_53HNV_20260910_0_L2A static item JSON (first collection) and the
+S2B_T31UET_20260921T105030_L2A one (Collection 1), to prove each bucket's
+item shape still normalizes onto its collection's schema (same style as
 test_fetch.py's live-normalize test). Everything else -- discovery, fetch,
-month-file naming, and the audit's aggregation -- runs against injected
-listers/getters or local fixtures, no S3.
+month-file naming -- runs against injected listers/getters, no S3.
 """
-import csv
 import io
 import json
+import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -23,18 +24,26 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
+import s2_collections as cols  # noqa: E402
 import s2_fetch  # noqa: E402  (module import: needed to monkeypatch s2_fetch.time.sleep)
-from s2_schema import COLUMNS  # noqa: E402
-from s2_fetch import copy_ndjson_to_parquet, normalize  # noqa: E402
+import s2_repair  # noqa: E402
+import s2c1_schema  # noqa: E402
+from s2_fetch import copy_ndjson_to_parquet  # noqa: E402
+from s2_schema import COLUMNS, normalize  # noqa: E402
 from s2_repair import (  # noqa: E402
-    MissingItem, _get_json, _is_valid_zone, discover_scenes, fetch_and_write,
-    group_scenes_by_day, repair_month, scene_day)
-from s2_audit import audit, expected_month_counts, have_month_counts  # noqa: E402
+    MissingItem, _get_json, _is_valid_zone, _list_common_prefixes, build_prefix_cache,
+    discover_scenes, fetch_and_write, group_scenes_by_day, prefix_cache_path,
+    repair_month, scene_day)
 
 STATIC_ITEM_URL = ("https://sentinel-cogs.s3.us-west-2.amazonaws.com/"
                    "sentinel-s2-l2a-cogs/53/H/NV/2026/9/"
                    "S2C_53HNV_20260910_0_L2A/S2C_53HNV_20260910_0_L2A.json")
 DATA_COLUMNS = [c for c in COLUMNS if c[0] not in ("_month", "_hilbert")]
+
+C1 = cols.get("sentinel-2-c1-l2a")
+C1_STATIC_ITEM_URL = ("https://e84-earth-search-sentinel-data.s3.us-west-2.amazonaws.com/"
+                      "sentinel-2-c1-l2a/31/U/ET/2026/9/"
+                      "S2B_T31UET_20260921T105030_L2A/S2B_T31UET_20260921T105030_L2A.json")
 
 
 # --------------------------------------------------------------------------
@@ -540,168 +549,165 @@ def test_repair_month_zero_scenes_writes_sentinel_per_day():
 
 
 # --------------------------------------------------------------------------
-# audit aggregation against fixtures (no S3)
+# --collection sentinel-2-c1-l2a: every bucket-specific constant comes from
+# the CollectionConfig; the first collection's defaults are untouched.
 # --------------------------------------------------------------------------
 
-def _write_inventory_csv(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
-    with open(path, "w", newline="") as f:
-        csv.writer(f).writerows(rows)
+def test_c1_static_item_normalizes_to_the_c1_schema():
+    """The second live fetch: the C1 bucket's static item JSON (the file
+    s2_repair GETs) normalizes onto the frozen C1 schema exactly like an
+    API feature does -- the repair path writes rows through
+    config.schema.normalize, so this is the shape it must accept."""
+    req = urllib.request.Request(C1_STATIC_ITEM_URL,
+                                 headers={"User-Agent": "sentinel-2-catalog-tools/1.0"})
+    item = json.load(urllib.request.urlopen(req, timeout=60))
+    row = C1.schema.normalize(item)
+    want = {c[0] for c in s2c1_schema.DATA_COLUMNS if c[0] != "geometry"} | {"_geometry_json"}
+    assert set(row) == want
+    assert row["id"] == "S2B_T31UET_20260921T105030_L2A"
+    assert row["_tile"] == "31UET"
 
 
-def _write_staged_parquet(con, path: Path, rows: list[tuple[str, str, int]]) -> None:
-    """rows: (id, iso_datetime, month)"""
-    vals = ", ".join(f"('{i}', TIMESTAMPTZ '{d}', {m})" for i, d, m in rows)
-    con.execute(f"""
-        COPY (SELECT * FROM (VALUES {vals}) t(id, datetime, _month))
-        TO '{path}' (FORMAT PARQUET)
-    """)
+def test_scene_day_uses_the_collection_id_regex():
+    assert scene_day("S2B_T31UET_20260921T105030_L2A", C1) == "2026-09-21"
+    # A first-collection id is not a C1 id, and vice versa.
+    with pytest.raises(ValueError):
+        scene_day("S2A_31UFU_20180905_0_L2A", C1)
+    with pytest.raises(ValueError):
+        scene_day("S2B_T31UET_20260921T105030_L2A")
 
 
-def test_expected_counts_exclude_tileinfo_and_handle_1_and_2_digit_months():
+def test_group_scenes_by_day_skips_an_id_the_c1_regex_rejects(capsys):
+    scenes = [("S2B_T31UET_20260921T105030_L2A", "https://x/a"),
+              ("S2A_31UFU_20260921_0_L2A", "https://x/first-collection-shape"),
+              ("S2A_T31UET_20260922T105031_L2A", "https://x/c")]
+    by_day = group_scenes_by_day(scenes, C1)
+    assert set(by_day) == {"2026-09-21", "2026-09-22"}
+    err = capsys.readouterr().err
+    assert "skipping unparsable scene id" in err
+    assert "S2A_31UFU_20260921_0_L2A" in err
+
+
+class _FakeS3:
+    """Records every list_objects_v2 call; returns canned CommonPrefixes."""
+
+    def __init__(self, tree: dict[str, list[str]]):
+        self.tree = tree
+        self.calls: list[dict] = []
+
+    def list_objects_v2(self, **kwargs):
+        self.calls.append(kwargs)
+        under = self.tree.get(kwargs["Prefix"], [])
+        return {"CommonPrefixes": [{"Prefix": p} for p in under], "IsTruncated": False}
+
+
+def test_list_common_prefixes_lists_the_collection_bucket():
+    s3 = _FakeS3({"sentinel-2-c1-l2a/": ["sentinel-2-c1-l2a/31/"]})
+    assert _list_common_prefixes(s3, C1.key_root, C1) == ["sentinel-2-c1-l2a/31/"]
+    assert s3.calls[0]["Bucket"] == "e84-earth-search-sentinel-data"
+    # Default: the first collection's bucket, as before.
+    s3 = _FakeS3({})
+    _list_common_prefixes(s3, "sentinel-s2-l2a-cogs/")
+    assert s3.calls[0]["Bucket"] == "sentinel-cogs"
+
+
+def test_build_prefix_cache_roots_the_crawl_at_config_key_root(tmp_path, monkeypatch):
+    tree = {
+        "sentinel-2-c1-l2a/": ["sentinel-2-c1-l2a/31/", "sentinel-2-c1-l2a/2019/"],
+        "sentinel-2-c1-l2a/31/": ["sentinel-2-c1-l2a/31/U/"],
+        "sentinel-2-c1-l2a/31/U/": ["sentinel-2-c1-l2a/31/U/ET/", "sentinel-2-c1-l2a/31/U/FU/"],
+    }
+    s3 = _FakeS3(tree)
+    monkeypatch.setattr(s2_repair, "_s3_client", lambda: s3)
+    out = tmp_path / "cache.txt"
+    squares = build_prefix_cache(out, workers=2, config=C1)
+    assert squares == ["sentinel-2-c1-l2a/31/U/ET/", "sentinel-2-c1-l2a/31/U/FU/"]
+    assert out.read_text() == "sentinel-2-c1-l2a/31/U/ET/\nsentinel-2-c1-l2a/31/U/FU/\n"
+    assert s3.calls[0]["Prefix"] == "sentinel-2-c1-l2a/"
+    assert {c["Bucket"] for c in s3.calls} == {"e84-earth-search-sentinel-data"}
+
+
+def test_prefix_cache_path_is_per_collection():
+    assert prefix_cache_path().name == "mgrs_prefixes.txt"
+    assert prefix_cache_path(cols.get(cols.DEFAULT)).name == "mgrs_prefixes.txt"
+    assert prefix_cache_path(C1).name == "mgrs_prefixes_c1.txt"
+    assert prefix_cache_path(C1).parent == prefix_cache_path().parent
+
+
+def test_committed_c1_prefix_cache_is_the_c1_bucket_layout():
+    """tools/mgrs_prefixes_c1.txt is built once by a real crawl and
+    committed; every line must be a zone/band/square prefix under the C1
+    key root."""
+    lines = prefix_cache_path(C1).read_text().splitlines()
+    assert len(lines) > 30_000
+    pat = re.compile(r"^sentinel-2-c1-l2a/\d{1,2}/[C-X]/[A-Z]{2}/$")
+    assert [l for l in lines if not pat.match(l)] == []
+    assert lines == sorted(lines)
+
+
+def test_discover_scenes_builds_urls_from_the_collection_https_base():
+    scenes = discover_scenes(
+        ["sentinel-2-c1-l2a/31/U/ET/"], "2026", "9",
+        lambda p: [p + "S2B_T31UET_20260921T105030_L2A/"], workers=1, config=C1)
+    assert scenes == [(
+        "S2B_T31UET_20260921T105030_L2A",
+        "https://e84-earth-search-sentinel-data.s3.us-west-2.amazonaws.com/"
+        "sentinel-2-c1-l2a/31/U/ET/2026/9/S2B_T31UET_20260921T105030_L2A/"
+        "S2B_T31UET_20260921T105030_L2A.json")]
+
+
+def _c1_item(item_id: str, dt: str) -> dict:
+    """A minimal C1 feature: the live fixture with id/datetime swapped."""
+    item = json.loads((ROOT / "tests" / "fixtures" / "c1_item.json").read_text())
+    item["id"] = item_id
+    item["properties"]["datetime"] = dt
+    return item
+
+
+def test_repair_month_writes_c1_rows_with_the_c1_schema():
+    def fake_list(prefix):
+        if prefix == "sentinel-2-c1-l2a/31/U/ET/2026/9/":
+            return [prefix + "S2B_T31UET_20260921T105030_L2A/",
+                    prefix + "S2A_T31UET_20260923T105031_L2A/"]
+        return []
+
+    def get_fn(url):
+        item_id = url.rsplit("/", 1)[-1].removesuffix(".json")
+        day = item_id.split("_")[2][:8]
+        return _c1_item(item_id, f"{day[:4]}-{day[4:6]}-{day[6:]}T10:50:30.000Z")
+
     with tempfile.TemporaryDirectory() as td:
-        inv = Path(td) / "inventory.csv"
-        _write_inventory_csv(inv, [
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/"
-             "S2A_31UFU_20180905_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/"
-             "tileinfo_metadata.json", "50", "2024-01-01T00:00:00Z"),
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/32/V/MJ/2018/12/S2A_32VMJ_20181215_0_L2A/"
-             "S2A_32VMJ_20181215_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-        ])
+        out = Path(td)
+        n = repair_month("2026-09", out, ["sentinel-2-c1-l2a/31/U/ET/"], workers=2,
+                         list_fn=fake_list, get_fn=get_fn, config=C1)
+        assert n == 2
+        dest_dir = out / "repair"
+        day21 = dest_dir / "2026-09-21_2026-09-21.parquet"
+        day23 = dest_dir / "2026-09-23_2026-09-23.parquet"
+        assert day21.stat().st_size > 0 and day23.stat().st_size > 0
+        assert len(list(dest_dir.glob("*.parquet"))) == 30
         con = duckdb.connect()
-        con.execute("SET TimeZone='UTC';")
-        counts = expected_month_counts(con, [str(inv)])
-        assert counts == {(2018, 9): 1, (2018, 12): 1}, (
-            "tileinfo_metadata.json must be excluded and both 1- and "
-            "2-digit months must parse")
+        con.execute("INSTALL spatial; LOAD spatial;")
+        desc = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{day21}')").fetchall()
+        assert [d[0] for d in desc] == [c[0] for c in s2c1_schema.DATA_COLUMNS]
+        assert con.execute(f"SELECT id, _tile FROM read_parquet('{day21}')").fetchall() == [
+            ("S2B_T31UET_20260921T105030_L2A", "31UET")]
 
 
-def test_expected_counts_exclude_stray_root_keys_without_crashing():
-    """Regression net for finding #1 (fix round 1): a real inventory
-    contains ~64k keys like this one -- self-named, ends in .json, but with
-    NO {yyyy}/{m}/ pair at all because they sit directly under the bogus
-    "sentinel-s2-l2a-cogs/2019/" root prefix (see s2_repair.py's
-    _is_valid_zone() note). Before the fix, regexp_extract() found no match,
-    returned '', and CAST('' AS INTEGER) raised -- crashing the whole query
-    instead of excluding the row. It must now be silently excluded."""
-    with tempfile.TemporaryDirectory() as td:
-        inv = Path(td) / "inventory.csv"
-        _write_inventory_csv(inv, [
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/2019/S2B_36KZC_20190806_0_L2A/"
-             "S2B_36KZC_20190806_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180905_0_L2A/"
-             "S2A_31UFU_20180905_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-        ])
-        con = duckdb.connect()
-        con.execute("SET TimeZone='UTC';")
-        counts = expected_month_counts(con, [str(inv)])  # must not raise
-        assert counts == {(2018, 9): 1}
-
-
-def test_expected_counts_exclude_non_self_named_json():
-    """Regression net for finding #2 (fix round 1): the brief's rule is
-    specifically {id}/{id}.json (self-named), not just "any .json that
-    isn't tileinfo_metadata.json". A differently-named JSON dropped in a
-    real scene directory must also be excluded."""
-    with tempfile.TemporaryDirectory() as td:
-        inv = Path(td) / "inventory.csv"
-        _write_inventory_csv(inv, [
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/32/V/MJ/2018/12/S2A_32VMJ_20181215_0_L2A/"
-             "other_metadata.json", "100", "2024-01-01T00:00:00Z"),
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/32/V/MJ/2018/12/S2A_32VMJ_20181215_0_L2A/"
-             "S2A_32VMJ_20181215_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-        ])
-        con = duckdb.connect()
-        con.execute("SET TimeZone='UTC';")
-        counts = expected_month_counts(con, [str(inv)])
-        assert counts == {(2018, 12): 1}, (
-            "only the self-named {id}/{id}.json row may count")
-
-
-def test_audit_delta_table_and_exit_codes():
-    with tempfile.TemporaryDirectory() as td:
-        inv = Path(td) / "inventory.csv"
-        _write_inventory_csv(inv, [
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180901_0_L2A/"
-             "S2A_31UFU_20180901_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180902_0_L2A/"
-             "S2A_31UFU_20180902_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/31/U/FU/2018/10/S2A_31UFU_20181001_0_L2A/"
-             "S2A_31UFU_20181001_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-        ])
-        con = duckdb.connect()
-        con.execute("SET TimeZone='UTC'; INSTALL spatial; LOAD spatial;")
-        published = Path(td) / "staging" / "sentinel-2-l2a" / "year=2018"
-        published.mkdir(parents=True)
-        # September: only 1 of 2 expected published (repair candidate).
-        # October: exactly matches.
-        _write_staged_parquet(con, published / "items.parquet", [
-            ("A1", "2018-09-01 10:00:00+00", 9),
-            ("B1", "2018-10-01 10:00:00+00", 10),
-        ])
-
-        rows, bad = audit(str(Path(td) / "staging"), [str(inv)], months=None,
-                          tolerance=0)
-        by_month = {(y, m): (e, h, d) for y, m, e, h, d in rows}
-        assert by_month[(2018, 9)] == (2, 1, -1)
-        assert by_month[(2018, 10)] == (1, 1, 0)
-        assert bad is True, "a -1 delta must fail at tolerance 0"
-
-        rows, bad = audit(str(Path(td) / "staging"), [str(inv)], months=None,
-                          tolerance=1)
-        assert bad is False, "a delta of 1 must pass at tolerance 1"
-
-
-def test_audit_months_filter_and_out_csv():
-    with tempfile.TemporaryDirectory() as td:
-        inv = Path(td) / "inventory.csv"
-        _write_inventory_csv(inv, [
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/31/U/FU/2018/9/S2A_31UFU_20180901_0_L2A/"
-             "S2A_31UFU_20180901_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-            ("sentinel-cogs",
-             "sentinel-s2-l2a-cogs/31/U/FU/2018/10/S2A_31UFU_20181001_0_L2A/"
-             "S2A_31UFU_20181001_0_L2A.json", "100", "2024-01-01T00:00:00Z"),
-        ])
-        con = duckdb.connect()
-        con.execute("SET TimeZone='UTC'; INSTALL spatial; LOAD spatial;")
-        published = Path(td) / "staging" / "sentinel-2-l2a" / "year=2018"
-        published.mkdir(parents=True)
-        _write_staged_parquet(con, published / "items.parquet", [
-            ("A1", "2018-09-01 10:00:00+00", 9),
-        ])
-        out_csv = Path(td) / "audit.csv"
-        rows, bad = audit(str(Path(td) / "staging"), [str(inv)],
-                          months=["2018-09"], tolerance=0, out_csv=str(out_csv))
-        assert [(y, m) for y, m, *_ in rows] == [(2018, 9)], (
-            "--months must prune the October row entirely")
-        assert bad is False
-        assert out_csv.exists()
-        with open(out_csv) as f:
-            r = list(csv.reader(f))
-        assert r[0] == ["year", "month", "expected", "have", "delta"]
-        assert r[1] == ["2018", "9", "1", "1", "0"]
-
-
-def test_have_month_counts_reads_local_staging_dir():
-    with tempfile.TemporaryDirectory() as td:
-        con = duckdb.connect()
-        con.execute("SET TimeZone='UTC';")
-        published = Path(td) / "sentinel-2-l2a" / "year=2020"
-        published.mkdir(parents=True)
-        _write_staged_parquet(con, published / "items.parquet", [
-            ("Z1", "2020-06-01 10:00:00+00", 6),
-            ("Z2", "2020-06-15 10:00:00+00", 6),
-        ])
-        counts = have_month_counts(con, str(td))
-        assert counts == {(2020, 6): 2}
+def test_repair_cli_takes_collection_and_defaults_to_the_first(tmp_path):
+    """repair-slices.yml calls the tool with no --collection; the option
+    must exist with the first collection as its default, and the
+    pre-existing argument checks must still fire before any network."""
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "s2_repair.py"), "--help"],
+        capture_output=True, text=True)
+    assert r.returncode == 0
+    assert "--collection" in r.stdout
+    assert "sentinel-2-c1-l2a" in r.stdout
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "s2_repair.py"),
+         "--collection", "sentinel-2-c1-l2a", "--month", "2026-09",
+         "--prefix-cache", str(tmp_path / "missing.txt")],
+        capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "--month requires --out" in r.stderr

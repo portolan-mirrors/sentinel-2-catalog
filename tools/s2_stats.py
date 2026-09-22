@@ -26,14 +26,31 @@ Three outputs land under --out (Task 24):
 Percent columns are rounded to integers (UTINYINT 0-100) and the best item's
 timestamp is kept as a DATE: the app never needed more, and it takes the full
 table from ~97 MB to ~21 MB.
+
+`--collection` picks the collection (s2_collections; default the first one,
+so every existing call is unchanged). The only per-collection fact the
+aggregates need is where the MGRS tile lives: `s2:mgrs_tile` for the first
+collection, `_tile` for `sentinel-2-c1-l2a` (config.tile_column). The
+output column is `mgrs_tile` either way, so the three products and the
+PMTiles layer have one shape and the explorer joins them the same way for
+both. `--out` stays explicit; by convention it is
+`staging/publish/<config.stats_dir>` (`stats`, `stats-c1`), which is what
+the workflows stage and make_stats_collection reads.
 """
 from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 
 import duckdb
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import s2_collections as cols  # noqa: E402
+from s2_collections import CollectionConfig  # noqa: E402
+
+DEFAULT_CONFIG = cols.get(cols.DEFAULT)
 
 
 def connect() -> duckdb.DuckDBPyConnection:
@@ -83,6 +100,13 @@ FULL_TABLE_OPTS = "FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 18, ROW_G
 SLICE_OPTS = "FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 18, ROW_GROUP_SIZE 1000000"
 
 
+def tile_sql(config: CollectionConfig = DEFAULT_CONFIG) -> str:
+    """The collection's tile column as a quoted identifier: "s2:mgrs_tile"
+    for the first collection, "_tile" for Collection 1. Both STATS_SQL and
+    the footprint table select it AS mgrs_tile, the one published name."""
+    return '"' + config.tile_column.replace('"', '""') + '"'
+
+
 def _pct(expr: str) -> str:
     """A 0-100 percent as an integer; NULL stays NULL.
 
@@ -107,7 +131,7 @@ STATS_SQL = """
          -- connect()), so the cast buckets the same way year()/month() do.
          (best.dt AT TIME ZONE 'UTC')::DATE AS best_item_date
   FROM (
-    SELECT "s2:mgrs_tile" AS mgrs_tile,
+    SELECT {tile} AS mgrs_tile,
            year(datetime)::SMALLINT AS year,
            month(datetime)::TINYINT AS month,
            count(*)::USMALLINT AS scene_count,
@@ -162,49 +186,52 @@ def existing_sql(con, existing: str) -> str:
     cover column the old file lacks comes through as NULL, not a failed read.
     """
     have = _columns(con, f"read_parquet('{existing}')")
-    cols = ["mgrs_tile::VARCHAR AS mgrs_tile",
-            "year::SMALLINT AS year",
-            "month::TINYINT AS month",
-            "scene_count::USMALLINT AS scene_count"]
+    columns = ["mgrs_tile::VARCHAR AS mgrs_tile",
+               "year::SMALLINT AS year",
+               "month::TINYINT AS month",
+               "scene_count::USMALLINT AS scene_count"]
     for c in PERCENT_COLUMNS:
-        cols.append(f"{_pct(c) if c in have else 'NULL::UTINYINT'} AS {c}")
-    cols.append("best_item_id::VARCHAR AS best_item_id")
+        columns.append(f"{_pct(c) if c in have else 'NULL::UTINYINT'} AS {c}")
+    columns.append("best_item_id::VARCHAR AS best_item_id")
     if "best_item_date" in have:
-        cols.append("best_item_date::DATE AS best_item_date")
+        columns.append("best_item_date::DATE AS best_item_date")
     else:
-        cols.append("(best_item_datetime AT TIME ZONE 'UTC')::DATE AS best_item_date")
-    return f"SELECT {', '.join(cols)} FROM read_parquet('{existing}')"
+        columns.append("(best_item_datetime AT TIME ZONE 'UTC')::DATE AS best_item_date")
+    return f"SELECT {', '.join(columns)} FROM read_parquet('{existing}')"
 
 
 def _month_name(year: int, month: int) -> str:
     return f"{year:04d}-{month:02d}"
 
 
-def build_stats(con, sources, out: Path, merge_years=None, existing=None):
+def build_stats(con, sources, out: Path, merge_years=None, existing=None,
+                config: CollectionConfig = DEFAULT_CONFIG):
     out.mkdir(parents=True, exist_ok=True)
     files = _sources_sql(sources)
     cover = cover_sql(con, files)
-    cols = ", ".join(STATS_COLUMNS)
+    tile = tile_sql(config)
+    columns = ", ".join(STATS_COLUMNS)
     if merge_years:
         yrs = ",".join(str(y) for y in merge_years)
         table_sql = f"""
-          SELECT {cols} FROM ({existing_sql(con, existing)}) WHERE year NOT IN ({yrs})
+          SELECT {columns} FROM ({existing_sql(con, existing)}) WHERE year NOT IN ({yrs})
           UNION ALL BY NAME
-          SELECT {cols} FROM ({STATS_SQL.format(
-              files=files, cover_sql=cover,
+          SELECT {columns} FROM ({STATS_SQL.format(
+              tile=tile, files=files, cover_sql=cover,
               where=f'WHERE year(datetime) IN ({yrs})')})
         """
     else:
-        table_sql = f"SELECT {cols} FROM ({STATS_SQL.format(files=files, cover_sql=cover, where='')})"
+        fresh = STATS_SQL.format(tile=tile, files=files, cover_sql=cover, where="")
+        table_sql = f"SELECT {columns} FROM ({fresh})"
     # One in-memory copy feeds all three outputs, so the month slices and the
     # timeline are cut from exactly the table that was written, not from a
     # second aggregation that could round or bucket differently.
-    con.execute(f"CREATE OR REPLACE TABLE stats AS SELECT {cols} FROM ({table_sql}) "
+    con.execute(f"CREATE OR REPLACE TABLE stats AS SELECT {columns} FROM ({table_sql}) "
                 "ORDER BY mgrs_tile, year, month")
 
     dest = out / "mgrs-monthly.parquet"
     con.execute(f"""
-      COPY (SELECT {cols} FROM stats ORDER BY mgrs_tile, year, month)
+      COPY (SELECT {columns} FROM stats ORDER BY mgrs_tile, year, month)
       TO '{dest}' ({FULL_TABLE_OPTS})
     """)
     n = con.execute("SELECT count(*) FROM stats").fetchone()[0]
@@ -227,12 +254,12 @@ def build_month_slices(con, months_dir: Path) -> list[str]:
     months_dir.mkdir(parents=True, exist_ok=True)
     months = con.execute(
         "SELECT DISTINCT year, month FROM stats ORDER BY 1, 2").fetchall()
-    cols = ", ".join(MONTH_COLUMNS)
+    columns = ", ".join(MONTH_COLUMNS)
     written = []
     for year, month in months:
         name = _month_name(year, month)
         con.execute(f"""
-          COPY (SELECT {cols} FROM stats
+          COPY (SELECT {columns} FROM stats
                 WHERE year = {year} AND month = {month}
                 ORDER BY mgrs_tile)
           TO '{months_dir / name}.parquet' ({SLICE_OPTS})
@@ -262,7 +289,8 @@ def build_timeline(con, dest: Path) -> None:
     print(f"  timeline.parquet: {n} months")
 
 
-def build_footprint_table(con, sources, dest: Path) -> None:
+def build_footprint_table(con, sources, dest: Path,
+                          config: CollectionConfig = DEFAULT_CONFIG) -> None:
     """Write the tile-envelope GeoParquet that feeds gpio pmtiles create.
 
     Split out from build_footprints so the antimeridian exclusion can be
@@ -272,7 +300,7 @@ def build_footprint_table(con, sources, dest: Path) -> None:
     con.execute(f"""
       COPY (
         WITH scenes AS (
-          SELECT "s2:mgrs_tile" AS mgrs_tile,
+          SELECT {tile_sql(config)} AS mgrs_tile,
                  -- Earth Search geometries can poke slightly past the
                  -- dateline (xmin of -180.6 observed); clamp here so no
                  -- output envelope ever leaks outside [-180, 180].
@@ -337,10 +365,11 @@ def pmtiles_command(fp: Path, pmtiles: Path) -> list[str]:
             "--layer", "mgrs"]
 
 
-def build_footprints(con, sources, out: Path, keep_footprint_table: bool = False):
+def build_footprints(con, sources, out: Path, keep_footprint_table: bool = False,
+                     config: CollectionConfig = DEFAULT_CONFIG):
     fp = (out / "mgrs-tiles.parquet").resolve()
     pmtiles = (out / "mgrs.pmtiles").resolve()
-    build_footprint_table(con, sources, fp)
+    build_footprint_table(con, sources, fp, config)
     # gpio drives tippecanoe straight from the GeoParquet, so no GeoJSONSeq
     # detour. Layer name must stay "mgrs" — the app's source-layer. gpio
     # rejects any path containing "..", so both paths above are resolved to
@@ -364,7 +393,11 @@ def build_footprints(con, sources, out: Path, keep_footprint_table: bool = False
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sources", nargs="+", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", required=True,
+                    help="output directory; by convention "
+                         "staging/publish/<stats_dir> of the collection "
+                         f"({', '.join(cols.get(n).stats_dir for n in cols.NAMES)})")
+    cols.add_collection_arg(ap)
     ap.add_argument("--footprints", action="store_true")
     ap.add_argument("--merge-years", help="comma list recomputed from sources")
     ap.add_argument("--existing", help="current stats parquet (path or URL)")
@@ -378,13 +411,14 @@ def main() -> int:
         ),
     )
     a = ap.parse_args()
+    config = cols.get(a.collection)
     con = connect()
     merge = [int(y) for y in a.merge_years.split(",")] if a.merge_years else None
     if merge and not a.existing:
         raise SystemExit("--merge-years requires --existing")
-    build_stats(con, a.sources, Path(a.out), merge, a.existing)
+    build_stats(con, a.sources, Path(a.out), merge, a.existing, config)
     if a.footprints:
-        build_footprints(con, a.sources, Path(a.out), a.keep_footprint_table)
+        build_footprints(con, a.sources, Path(a.out), a.keep_footprint_table, config)
     return 0
 
 

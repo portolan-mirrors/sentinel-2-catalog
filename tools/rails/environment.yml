@@ -1,0 +1,25 @@
+# micromamba env for the RAILS lane: python, DuckDB, pyarrow and boto3 for
+# the tools, geoparquet-io (gpio) for the year build, tippecanoe and pmtiles
+# for the stats tileset.
+#
+#     micromamba create -y -f tools/rails/environment.yml -p /u/cholmes/micromamba/envs/s2
+#
+# geoparquet-io is pinned to the version every workflow in this repo uses.
+# pyarrow >= 21: s2_build's month-aligned writer (experiments/) uses
+# pyarrow.parquet's geo_statistics, which arrived in 21. pip's resolver
+# prints a note about botocore's urllib3 pin while it installs; the env
+# works, and the note is harmless.
+name: s2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - duckdb>=1.4
+  - pyarrow>=21
+  - boto3
+  - pytz
+  - tippecanoe
+  - pip
+  - pip:
+      - geoparquet-io==1.5.0
+      - pmtiles

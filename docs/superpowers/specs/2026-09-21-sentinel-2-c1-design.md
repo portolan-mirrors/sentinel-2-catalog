@@ -122,3 +122,21 @@ row group's `_month` min equals its max.
 * Reprocessing the first collection (issue #9) — the month-aligned writer
   built here is what that job will use.
 * EOPF Zarr (issue #1).
+
+## Amendment 1 — 2026-09-21 (issue #9 amendment; user direction)
+
+`docs/search-latency-experiments.md` (branch `worktree-s2-optimization`)
+measured that a tile-major sort beats the month-major sort for tile-window
+queries, and that the explorer's search latency is request depth in
+DuckDB-WASM, not bytes. Collection 1 adopts the amended layout before any
+year is built:
+
+* Sort **`(_tile, datetime)`** for every year (was `(_month, _tile, _hilbert)`).
+  `_month` and `_hilbert` stay as columns.
+* Row groups **uniform, target 6,000 rows** (was month-aligned ≤ 20,000).
+  The month-aligned writer stays in `s2_build` behind `--row-group-mode`
+  for experiments; `row_group_mode="uniform"` for C1.
+* The explorer's C1 search path uses the small parquet client from issue #9
+  when that lands; until then DuckDB-WASM works on the same files.
+* Optional sidecars (`<part>.idx.json`, slim search file) are issue #9's,
+  built from published parts; not part of this plan.

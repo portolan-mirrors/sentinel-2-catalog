@@ -17,7 +17,10 @@ reads against a public bucket: no key, no server, no rate limit.
   static page that behaves like there is an API behind it. DuckDB-WASM range
   reads plus PMTiles, nothing else. Any band, composite, NDVI/NDWI or the
   SCL classes of a scene are drawn on the map straight from its COGs in
-  the browser, with histogram-and-handles stretch controls.
+  the browser, with histogram-and-handles stretch controls. A collection
+  switch in the sidebar (or `?collection=sentinel-2-c1-l2a`) points the
+  same page at Collection 1, reading `sentinel-2-c1-l2a/` and `stats-c1/`
+  as they are published.
 - **Published catalog**: https://source.coop/portolan-mirrors/sentinel-2-catalog
 - **STAC root**: `https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json`
 - **Upstream**: [Earth Search](https://earth-search.aws.element84.com/v1) by
@@ -210,14 +213,14 @@ Search stopped publishing them. The
 
 | Workflow | When | Does |
 |---|---|---|
-| `refresh-daily` | daily, 03:42 UTC | Fetches the last five days from Earth Search into `live.parquet` (one per year the window touches, two around New Year), splices those years into the stats table, restamps counts and extents, uploads. Nothing is committed. |
+| `refresh-daily` | daily, 03:42 UTC | Fetches the last five days from Earth Search into `live.parquet` (one per year the window touches, two around New Year), splices those years into the stats table, restamps counts and extents, uploads. Nothing is committed. A second job does the same for `sentinel-2-c1-l2a` on a `created` lookback (any year), into `stats-c1`, while the repository variable `C1_LIVE_ENABLED` is `true`. |
 | `consolidate-month` | the 3rd of each month, 05:17 UTC | Folds `live.parquet` into the year's archive parts for the current year and, while it still has a tail, the previous one, one job per part, deduped by `id`; then empties each folded `live`. |
-| `publish-stats` | manual | Full rebuild of `mgrs-monthly.parquet`, the month slices, `timeline.parquet` and `mgrs.pmtiles` from the published parts. |
+| `publish-stats` | manual | Full rebuild of `mgrs-monthly.parquet`, the month slices, `timeline.parquet` and `mgrs.pmtiles` from the published parts, one matrix entry per collection (`stats`, and `stats-c1` while `C1_LIVE_ENABLED` is `true`). |
 | `backfill` and `publish-backfill` | manual | Fetch the whole record one month-slice at a time, then the credentialed year-by-year build and upload. How the archive was seeded; also the repair path. |
 | `repair-slices` | manual | Re-fetch given months from the static item JSON in the `sentinel-cogs` bucket instead of the API, as `slice-YYYY-MM` artifacts `publish-backfill` consumes unchanged. |
 | `upload-file-data` | manual | Publishes one locally built data file (for example `mgrs.pmtiles`) from an https URL into a catalog directory. |
 | `check-access` | manual | Writes and deletes a marker object with the Source Cooperative role: a smoke test of the credentials. |
-| `publish-catalog` | manual | Publishes the committed `catalog/` metadata as-is. |
+| `publish-catalog` | manual | Publishes the committed `catalog/` metadata, after restamping the measured fields (row counts, extents, part sizes, `updated`) of both item indexes and both stats collections from the bucket, so the daily restamp is kept. |
 | `pages` | on push to `apps/explorer/` | Deploys the explorer to GitHub Pages. |
 
 `tools/make_collection.py` regenerates the item index's `updated` stamp, row
@@ -241,7 +244,10 @@ in object storage next to it, referenced by URL and never committed.
 `tools/s2_stats.py` builds the aggregates, `tools/make_items.py`,
 `tools/make_collection.py` and `tools/make_stats_collection.py` restamp the
 metadata, and `tools/publish.py` and
-`tools/upload_data.py` carry metadata and data to the bucket. The design and
+`tools/upload_data.py` carry metadata and data to the bucket. How each
+collection is kept in sync with Earth Search, and how each was backfilled
+(GitHub for the first, the RAILS cluster for Collection 1), is in
+[`tools/README.md`](tools/README.md), "Sync & backfill". The design and
 its amendments are in
 [`docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md`](docs/superpowers/specs/2026-09-15-sentinel-2-catalog-design.md).
 

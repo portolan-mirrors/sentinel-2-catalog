@@ -1,19 +1,39 @@
 #!/usr/bin/env python3
-"""Fetch Earth Search sentinel-2-l2a items for a date window into chunk
-Parquet matching the seed archive's slim schema.
+"""Fetch Earth Search items for one collection and a date window into chunk
+Parquet matching that collection's canonical schema (s2_collections.py
+names the collection, its API id and its schema module; --collection picks
+one, default sentinel-2-l2a).
 
 Resumable: a window whose chunk file already exists is skipped, and a window
 with zero matches leaves a zero-byte sentinel so the next run skips it too.
 limit=200 because the API 500s at limit=500 (measured 2026-09-15).
 
-Normalization notes (newer items moved off the s2 extension for several
-fields; the archive keeps the seed schema):
-  s2:mgrs_tile        <- props or mgrs:utm_zone + mgrs:latitude_band + mgrs:grid_square
-  sat:relative_orbit  <- props or _R(\\d{3})_ in s2:product_uri
-  s2:mean_solar_zenith  <- props or 90 - view:sun_elevation
-  s2:mean_solar_azimuth <- props or view:sun_azimuth
-Absent values stay NULL rather than being invented (s2:granule_id,
-sat:orbit_state on newer items).
+Two lookback fields (--field). `datetime` windows the acquisition time,
+which is what a backfill and the first collection's daily refresh want.
+`created` windows the time Earth Search created the item: Collection 1
+(sentinel-2-c1-l2a) is being back-processed, so on any given day it gains
+items whose acquisition dates are years old, and a refresh that only
+looked at recent `datetime`s would never see them. Its daily refresh
+therefore fetches by `created` and lets the build fold the rows into
+whichever year each item's `datetime` belongs to. The first collection's
+schema has no `created` column, so `--field created` is refused for it.
+
+The `created` form that works (verified live 2026-09-21, 15,053 matches for
+one day; the query extension, not CQL2 `filter`):
+  {"collections": ["sentinel-2-c1-l2a"],
+   "query": {"created": {"gte": "2026-09-20T00:00:00Z", "lte": "2026-09-20T23:59:59Z"}},
+   "limit": 200}
+The next link comes back with merge=false and a self-contained body that
+carries the `query` through, so paging needs nothing collection-specific.
+A `query` on a property the API does not index silently matches nothing
+rather than erroring, which is why the CLI test asserts on `created`
+bounds and not just on row count.
+
+Each collection's normalize() and DATA_COLUMNS live with its schema
+(s2_schema.py, s2c1_schema.py); this tool and s2_repair.py both reach them
+through config.schema. A run ends with one warning line if the schema
+module saw upstream properties it does not know (Collection 1's drift
+guard).
 """
 from __future__ import annotations
 
@@ -21,7 +41,6 @@ import argparse
 import http.client
 import json
 import os
-import re
 import sys
 import tempfile
 import time
@@ -33,13 +52,22 @@ from pathlib import Path
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from s2_schema import COLUMNS, USER_AGENT
+import s2_collections as cols  # noqa: E402
+import s2_schema  # noqa: E402
+from s2_schema import USER_AGENT  # noqa: E402
 
 API = "https://earth-search.aws.element84.com/v1/search"
 PAGE = 200
 UA = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
-DATA_COLUMNS = [c for c in COLUMNS if c[0] not in ("_month", "_hilbert")]
-_REL_ORBIT = re.compile(r"_R(\d{3})_")
+DEFAULT_CONFIG = cols.get(cols.DEFAULT)
+FIELDS = ("datetime", "created")
+
+
+# The first collection's chunk columns (everything normalize() emits; the
+# two build-time sort helpers are left out): the default for the writers
+# below. Every schema module exports its own DATA_COLUMNS, and callers that
+# know their collection pass config.schema.DATA_COLUMNS explicitly.
+DATA_COLUMNS = s2_schema.DATA_COLUMNS
 
 
 def with_retries(fn, tries: int = 8):
@@ -80,76 +108,46 @@ def _post(body: dict, tries: int = 8) -> dict:
     return with_retries(call, tries)
 
 
-def normalize(f: dict) -> dict:
-    p = f["properties"]
-    tile = p.get("s2:mgrs_tile")
-    if not tile:
-        try:
-            tile = (f"{p['mgrs:utm_zone']}{p['mgrs:latitude_band']}"
-                    f"{p['mgrs:grid_square']}")
-        except KeyError as e:
-            raise ValueError(
-                f"{f.get('id', '<unknown id>')}: missing mgrs field {e} "
-                "and no s2:mgrs_tile") from e
-    rel = p.get("sat:relative_orbit")
-    if rel is None and p.get("s2:product_uri"):
-        m = _REL_ORBIT.search(p["s2:product_uri"])
-        rel = int(m.group(1)) if m else None
-    zen = p.get("s2:mean_solar_zenith")
-    if zen is None and p.get("view:sun_elevation") is not None:
-        zen = 90.0 - p["view:sun_elevation"]
-    azi = p.get("s2:mean_solar_azimuth", p.get("view:sun_azimuth"))
-    row = {
-        "assets": json.dumps(f.get("assets", {}), separators=(",", ":")),
-        "thumbnail_url": (f.get("assets", {}).get("thumbnail") or {}).get("href"),
-        "type": "Feature",
-        "stac_version": f.get("stac_version"),
-        "stac_extensions": f.get("stac_extensions") or [],
-        "id": f["id"],
-        "bbox": f.get("bbox"),
-        "links": [{"href": l.get("href"), "rel": l.get("rel"),
-                   "title": l.get("title"), "type": l.get("type")}
-                  for l in f.get("links", [])
-                  if l.get("rel") not in ("next", "prev", "root", "parent")],
-        "collection": "sentinel-2-l2a",
-        "datetime": p["datetime"],
-        "platform": p.get("platform"),
-        "proj:epsg": p.get("proj:epsg"),
-        "instruments": p.get("instruments") or [],
-        "s2:mgrs_tile": tile,
-        "constellation": p.get("constellation"),
-        "s2:granule_id": p.get("s2:granule_id"),
-        "eo:cloud_cover": p.get("eo:cloud_cover"),
-        "sat:orbit_state": p.get("sat:orbit_state"),
-        "sat:relative_orbit": rel,
-        "s2:mean_solar_zenith": zen,
-        "s2:mean_solar_azimuth": azi,
-        "_geometry_json": json.dumps(f["geometry"]),
-    }
-    # Every remaining s2:* column comes straight from properties.
-    for name, _, _ in DATA_COLUMNS:
-        if name not in row and name != "geometry":
-            row[name] = p.get(name)
-    return {k: row[k] for k in
-            [c[0] for c in DATA_COLUMNS if c[0] != "geometry"] + ["_geometry_json"]}
+def search_body(config: cols.CollectionConfig, start: str, end: str,
+                field: str = "datetime") -> dict:
+    """The POST /search body for one inclusive day window [start, end] on
+    `field`. Key order is deliberate: the datetime form is byte-identical
+    to what the first collection has always sent."""
+    if field not in FIELDS:
+        raise ValueError(f"field must be one of {FIELDS}, not {field!r}")
+    if field != "datetime" and config.lookback_field != field:
+        raise ValueError(
+            f"{config.id} does not look back on {field!r}; "
+            f"its lookback field is {config.lookback_field!r}")
+    lo, hi = f"{start}T00:00:00Z", f"{end}T23:59:59Z"
+    body: dict = {"collections": [config.api_collection]}
+    if field == "datetime":
+        body["datetime"] = f"{lo}/{hi}"
+    else:
+        # The STAC query extension; see the module docstring for the
+        # live-verified form.
+        body["query"] = {field: {"gte": lo, "lte": hi}}
+    body["limit"] = PAGE
+    return body
 
 
 def fetch_window(start: str, end: str, out_dir: Path,
-                 limit_pages: int | None = None) -> int:
+                 limit_pages: int | None = None,
+                 config: cols.CollectionConfig = DEFAULT_CONFIG,
+                 field: str = "datetime") -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     dest = out_dir / f"{start}_{end}.parquet"
     if dest.exists():
         print(f"  {dest.name}: exists, skipping")
         return 0
-    body = {"collections": ["sentinel-2-l2a"],
-            "datetime": f"{start}T00:00:00Z/{end}T23:59:59Z",
-            "limit": PAGE}
+    body = search_body(config, start, end, field)
+    norm = config.schema.normalize
     # Rows for a window are held in memory before being written; bounded
     # because the CLI runs with --days-per-chunk=1 (~5k items/day).
     rows, pages, next_body = [], 0, body
     while True:
         resp = _post(next_body)
-        rows.extend(normalize(f) for f in resp.get("features", []))
+        rows.extend(norm(f) for f in resp.get("features", []))
         pages += 1
         nxt = [l for l in resp.get("links", []) if l.get("rel") == "next"]
         if not nxt or (limit_pages and pages >= limit_pages):
@@ -171,12 +169,13 @@ def fetch_window(start: str, end: str, out_dir: Path,
     if not rows:
         dest.touch()          # sentinel: fetched, zero matches
         return 0
-    write_rows(rows, dest)
+    write_rows(rows, dest, config.schema.DATA_COLUMNS)
     print(f"  {dest.name}: {len(rows):,} rows in {pages} page(s)", flush=True)
     return len(rows)
 
 
-def write_rows(rows: list[dict], dest: Path) -> None:
+def write_rows(rows: list[dict], dest: Path,
+               columns: list[tuple] = DATA_COLUMNS) -> None:
     """Write normalize()d rows to a canonical-schema chunk parquet. Shared
     with s2_repair.py so the bucket repair path produces byte-identical
     chunk schema to the API fetch path. Holds all of `rows` in memory at
@@ -189,16 +188,18 @@ def write_rows(rows: list[dict], dest: Path) -> None:
             tf.write(json.dumps(r) + "\n")
         nd = tf.name
     try:
-        copy_ndjson_to_parquet(nd, dest)
+        copy_ndjson_to_parquet(nd, dest, columns)
     finally:
         Path(nd).unlink()
 
 
-def copy_ndjson_to_parquet(nd_path: str, dest: Path) -> None:
+def copy_ndjson_to_parquet(nd_path: str, dest: Path,
+                           columns: list[tuple] = DATA_COLUMNS) -> None:
     """The COPY/cast step shared by write_rows() above and s2_repair.py's
     streaming writer: turn an NDJSON file of normalize()d rows (one JSON
     object per line, `_geometry_json` instead of `geometry`) into a
-    canonical-schema chunk parquet.
+    canonical-schema chunk parquet. `columns` is the collection's
+    schema.DATA_COLUMNS; the default is the first collection's.
 
     COPYs to a same-directory temp name first, then os.replace()s it onto
     `dest` -- a same-filesystem rename, atomic on POSIX and Windows alike.
@@ -212,7 +213,7 @@ def copy_ndjson_to_parquet(nd_path: str, dest: Path) -> None:
         con.execute("INSTALL spatial; LOAD spatial;")
         cast = ", ".join(
             f'CAST("{n}" AS {t}) AS "{n}"'
-            for n, t, _ in DATA_COLUMNS if n != "geometry")
+            for n, t, _ in columns if n != "geometry")
         con.execute(f"""
             COPY (
               SELECT {cast},
@@ -233,7 +234,17 @@ def main() -> int:
     ap.add_argument("--days-per-chunk", type=int, default=1)
     ap.add_argument("--limit-pages", type=int, default=None,
                     help="test hook: stop after N pages")
+    cols.add_collection_arg(ap)
+    ap.add_argument("--field", choices=FIELDS, default="datetime",
+                    help="which item property the window bounds: datetime "
+                         "(acquisition; backfills) or created (when Earth "
+                         "Search made the item; Collection 1's refresh)")
     a = ap.parse_args()
+    config = cols.get(a.collection)
+    try:
+        search_body(config, a.start, a.end, a.field)
+    except ValueError as e:
+        ap.error(str(e))
     out = Path(a.out) / "api"
     total = 0
     d0, d1 = date.fromisoformat(a.start), date.fromisoformat(a.end)
@@ -241,9 +252,17 @@ def main() -> int:
     while cur <= d1:
         end = min(cur + timedelta(days=a.days_per_chunk - 1), d1)
         total += fetch_window(cur.isoformat(), end.isoformat(), out,
-                              a.limit_pages)
+                              a.limit_pages, config, a.field)
         cur = end + timedelta(days=1)
     print(f"TOTAL {total:,} rows fetched")
+    unknown = getattr(config.schema, "UNKNOWN_PROPERTIES", None)
+    if unknown:
+        # Drift guard, not an error: the frozen schema dropped these.
+        print(f"WARNING: {config.id}: {len(unknown)} upstream propert"
+              f"{'y' if len(unknown) == 1 else 'ies'} not in the schema, "
+              "dropped from every row: "
+              + ", ".join(f"{k} (x{n})" for k, n in sorted(unknown.items())),
+              file=sys.stderr, flush=True)
     return 0
 
 

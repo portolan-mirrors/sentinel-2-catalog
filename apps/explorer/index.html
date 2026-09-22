@@ -50,8 +50,11 @@
   </details>
 </div>
 <aside id="panel">
-  <h1>Sentinel-2 L2A</h1>
-  <p class="sub">Sentinel-2 L2A scenes since 2016 — every query on this page
+  <!-- The header names the loaded collection; app.js fills the select from
+       its COLLECTIONS table, reads ?collection= and reloads on a change. -->
+  <h1 id="title">Sentinel-2 L2A</h1>
+  <label class="switch">Collection <select id="collection"></select></label>
+  <p class="sub" id="sub">Sentinel-2 L2A scenes since 2016 — every query on this page
      is a range read against static GeoParquet on Source Cooperative;
      there is no API.</p>
   <p id="status" class="status" role="status">Booting DuckDB-WASM…</p>

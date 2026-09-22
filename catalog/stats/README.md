@@ -1,6 +1,6 @@
 # MGRS coverage and cloud statistics
 
-Four parquet products and one tileset, generated from the `sentinel-2-l2a`
+Three parquet products and one tileset, generated from the `sentinel-2-l2a`
 item index by `tools/s2_stats.py`, meant to be joined by `mgrs_tile`:
 
 - **`mgrs-monthly.parquet`** -- one row per MGRS tile per month: scene

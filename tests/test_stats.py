@@ -794,3 +794,206 @@ def test_stats_collection_extent_is_stamped_from_the_timeline():
              "--data-dir", str(Path(td) / "empty"), "--out", str(out)],
             cwd=ROOT, capture_output=True, text=True)
         assert proc.returncode != 0 and "--remote-baseline" in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# --collection sentinel-2-c1-l2a: the tile comes from `_tile` (Collection 1
+# has no s2:mgrs_tile), the output column is still mgrs_tile, and the
+# stats collection's paths follow config.stats_dir.
+# ---------------------------------------------------------------------------
+import s2_collections as cols  # noqa: E402
+
+C1 = cols.get("sentinel-2-c1-l2a")
+C1_FLAG = ["--collection", C1.id]
+
+
+def _c1_fixture(con, path):
+    """Two Collection 1 tiles over two months, C1 column names: the tile
+    in `_tile`, no s2:mgrs_tile, real bbox + polygon footprints so the
+    footprint table has something to envelope."""
+    con.execute(f"""
+      COPY (SELECT * FROM (VALUES
+        ('S2B_T31UET_20260501T105030_L2A', TIMESTAMPTZ '2026-05-01 10:50:30+00',
+         '31UET', 80.0, 0.0, [3.0, 51.0, 4.0, 52.0]::DOUBLE[],
+         ST_MakeEnvelope(3.0, 51.0, 4.0, 52.0)),
+        ('S2B_T31UET_20260511T105030_L2A', TIMESTAMPTZ '2026-05-11 10:50:30+00',
+         '31UET', 10.0, 40.0, [3.1, 51.1, 4.1, 52.1]::DOUBLE[],
+         ST_MakeEnvelope(3.1, 51.1, 4.1, 52.1)),
+        ('S2B_T31UET_20260521T105030_L2A', TIMESTAMPTZ '2026-05-21 10:50:30+00',
+         '31UET', 40.0, 100.0, [3.0, 51.0, 4.0, 52.0]::DOUBLE[],
+         ST_MakeEnvelope(3.0, 51.0, 4.0, 52.0)),
+        ('S2A_T32UMV_20260601T103030_L2A', TIMESTAMPTZ '2026-06-01 10:30:30+00',
+         '32UMV', 5.0, NULL, [9.0, 50.0, 10.0, 51.0]::DOUBLE[],
+         ST_MakeEnvelope(9.0, 50.0, 10.0, 51.0))
+      ) t(id, datetime, _tile, "eo:cloud_cover", "s2:nodata_pixel_percentage",
+          bbox, geometry)
+      ) TO '{path}' (FORMAT PARQUET)
+    """)
+
+
+def test_c1_stats_take_the_tile_from_the_config():
+    """`--collection sentinel-2-c1-l2a` aggregates a C1-shaped source by
+    `_tile`, published under the same `mgrs_tile` name and types as the
+    first collection; the merge path (the daily refresh's splice) does the
+    same; and without the flag the same source is refused, since the first
+    collection's tile column does not exist in it."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"; out = Path(td) / "stats"
+        _c1_fixture(con, src)
+        subprocess.run([sys.executable, "tools/s2_stats.py", *C1_FLAG,
+                        "--sources", str(src), "--out", str(out)],
+                       check=True, cwd=ROOT, capture_output=True)
+        rows = con.execute(f"""
+            SELECT mgrs_tile, year, month, scene_count, min_cloud_cover,
+                   median_cloud_cover, mean_cover, max_cover, best_item_id,
+                   best_item_date
+            FROM read_parquet('{out}/mgrs-monthly.parquet') ORDER BY 1""").fetchall()
+        assert rows == [
+            ("31UET", 2026, 5, 3, 10, 40, 53, 100,
+             "S2B_T31UET_20260511T105030_L2A", date(2026, 5, 11)),
+            ("32UMV", 2026, 6, 1, 5, 5, None, None,
+             "S2A_T32UMV_20260601T103030_L2A", date(2026, 6, 1)),
+        ]
+        assert dict(_schema(con, out / "mgrs-monthly.parquet")) == STATS_TYPES
+        assert sorted(p.name for p in (out / "months").glob("*.parquet")) == \
+            ["2026-05.parquet", "2026-06.parquet"]
+        tiles = [r[0] for r in con.execute(
+            f"SELECT mgrs_tile FROM read_parquet('{out}/months/2026-05.parquet')").fetchall()]
+        assert tiles == ["31UET"]
+        assert con.execute(f"SELECT tile_count, scene_count FROM "
+                           f"read_parquet('{out}/timeline.parquet') ORDER BY 1, 2").fetchall() \
+            == [(1, 1), (1, 3)]
+
+        # The splice: an existing C1 table plus a recomputed year.
+        existing = Path(td) / "existing.parquet"
+        con.execute(f"""
+          COPY (SELECT '31UET' AS mgrs_tile, 2025::SMALLINT AS year,
+                       12::TINYINT AS month, 2::USMALLINT AS scene_count,
+                       1::UTINYINT AS min_cloud_cover, 2::UTINYINT AS median_cloud_cover,
+                       90::UTINYINT AS mean_cover, 99::UTINYINT AS max_cover,
+                       'S2B_T31UET_20251201T105030_L2A' AS best_item_id,
+                       DATE '2025-12-01' AS best_item_date)
+          TO '{existing}' (FORMAT PARQUET)""")
+        merged = Path(td) / "merged"
+        subprocess.run([sys.executable, "tools/s2_stats.py", *C1_FLAG,
+                        "--sources", str(src), "--out", str(merged),
+                        "--merge-years", "2026", "--existing", str(existing)],
+                       check=True, cwd=ROOT, capture_output=True)
+        keys = con.execute(f"""
+            SELECT mgrs_tile, year, month, scene_count
+            FROM read_parquet('{merged}/mgrs-monthly.parquet') ORDER BY 1, 2, 3""").fetchall()
+        assert keys == [("31UET", 2025, 12, 2), ("31UET", 2026, 5, 3),
+                        ("32UMV", 2026, 6, 1)]
+
+        # No --collection: the first collection's tile column, which this
+        # source does not have.
+        proc = subprocess.run([sys.executable, "tools/s2_stats.py",
+                               "--sources", str(src), "--out", str(Path(td) / "wrong")],
+                              cwd=ROOT, capture_output=True, text=True)
+        assert proc.returncode != 0 and "s2:mgrs_tile" in proc.stderr
+
+
+def test_c1_footprints_envelope_the_tiles_from_c1_geometries():
+    """build_footprint_table with the C1 config groups the C1 footprints by
+    `_tile`: one envelope per tile, the union of its scenes' bboxes, in
+    the same mgrs_tile column the PMTiles layer and the app join on."""
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "items.parquet"
+        _c1_fixture(con, src)
+        fp = Path(td) / "mgrs-tiles.parquet"
+        build_footprint_table(con, [str(src)], fp, config=C1)
+        rows = con.execute(f"""
+            SELECT mgrs_tile, ST_XMin(geometry), ST_YMin(geometry),
+                   ST_XMax(geometry), ST_YMax(geometry)
+            FROM read_parquet('{fp}') ORDER BY 1""").fetchall()
+        assert rows == [("31UET", 3.0, 51.0, 4.1, 52.1),
+                        ("32UMV", 9.0, 50.0, 10.0, 51.0)]
+        assert [c for c, _ in _schema(con, fp)] == ["mgrs_tile", "geometry"]
+
+
+def test_c1_built_year_part_feeds_stats_and_footprints():
+    """End to end on what s2_build --collection sentinel-2-c1-l2a actually
+    writes: the full C1 schema (nested columns, native GEOMETRY, `_tile`
+    between `_hilbert` and `geometry`, month-aligned row groups) from the
+    frozen fixture, aggregated in-process by build_stats and enveloped by
+    build_footprint_table with the C1 config."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from test_build import _build_c1, _mk_c1_full_chunk
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_c1_full_chunk(chunks / "a.parquet", rows=300, months=3)
+        built = Path(td) / "built"
+        proc = _build_c1(built, chunks)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        part = built / "year=2026" / "items.parquet"
+        assert "_tile" in dict(_schema(con, part))
+        assert "s2:mgrs_tile" not in dict(_schema(con, part))
+
+        out = Path(td) / "stats"
+        build_stats(con, [str(part)], out, config=C1)
+        rows = con.execute(f"""
+            SELECT mgrs_tile, year, month, scene_count
+            FROM read_parquet('{out}/mgrs-monthly.parquet') ORDER BY 1, 2, 3""").fetchall()
+        assert {r[0] for r in rows} == {"31UET", "32UMV", "33UUP"}
+        assert {(r[1], r[2]) for r in rows} == {(2026, 1), (2026, 2), (2026, 3)}
+        assert sum(r[3] for r in rows) == 300
+        assert dict(_schema(con, out / "mgrs-monthly.parquet")) == STATS_TYPES
+
+        fp = Path(td) / "mgrs-tiles.parquet"
+        build_footprint_table(con, [str(part)], fp, config=C1)
+        tiles = con.execute(f"""
+            SELECT mgrs_tile, ST_XMin(geometry) < ST_XMax(geometry)
+            FROM read_parquet('{fp}') ORDER BY 1""").fetchall()
+        assert tiles == [("31UET", True), ("32UMV", True), ("33UUP", True)]
+
+
+def test_stats_collection_paths_follow_the_config():
+    """make_stats_collection --collection: the collection.json it stamps,
+    the staged directory it reads and the published timeline it falls
+    back to all live under config.stats_dir (stats / stats-c1); the first
+    collection's are the old literals. catalog/stats-c1/collection.json
+    does not exist yet, so the C1 CLI run stamps a copy of the first
+    collection's file through --out."""
+    from make_stats_collection import (
+        PUBLISHED_TIMELINE, collection_path, published_timeline, staged_dir)
+    first = cols.get(cols.DEFAULT)
+    assert collection_path(first) == ROOT / "catalog" / "stats" / "collection.json"
+    assert collection_path(C1) == ROOT / "catalog" / "stats-c1" / "collection.json"
+    assert staged_dir(first) == Path("./staging/publish/stats")
+    assert staged_dir(C1) == Path("./staging/publish/stats-c1")
+    assert published_timeline(first) == PUBLISHED_TIMELINE == \
+        f"{cols.PUBLIC}/stats/timeline.parquet"
+    assert published_timeline(C1) == f"{cols.PUBLIC}/stats-c1/timeline.parquet"
+
+    con = connect()
+    with tempfile.TemporaryDirectory() as td:
+        con.execute(f"""
+          COPY (SELECT * FROM (VALUES
+            (2017::SMALLINT, 11::TINYINT, 2, 5, 3::UTINYINT),
+            (2026::SMALLINT,  9::TINYINT, 4, 9, 0::UTINYINT)
+          ) t(year, month, tile_count, scene_count, min_cloud_cover)
+          ) TO '{Path(td) / "timeline.parquet"}' (FORMAT PARQUET)""")
+        out = Path(td) / "collection.json"
+        out.write_text((ROOT / "catalog" / "stats" / "collection.json").read_text())
+        proc = subprocess.run(
+            [sys.executable, "tools/make_stats_collection.py", *C1_FLAG,
+             "--data-dir", td, "--out", str(out)],
+            check=True, cwd=ROOT, capture_output=True, text=True)
+        after = json.loads(out.read_text())
+        assert after["extent"]["temporal"]["interval"] == \
+            [["2017-11-01T00:00:00Z", "2026-09-30T23:59:59Z"]]
+        assert after["table:row_count"] == 6
+        assert str(out) in proc.stdout
+
+        help_text = subprocess.run(
+            [sys.executable, "tools/make_stats_collection.py", "--help"],
+            cwd=ROOT, capture_output=True, text=True, check=True).stdout
+        assert "--collection" in help_text and "stats-c1" in help_text
+        help_text = subprocess.run(
+            [sys.executable, "tools/s2_stats.py", "--help"],
+            cwd=ROOT, capture_output=True, text=True, check=True).stdout
+        assert "--collection" in help_text and "stats-c1" in help_text

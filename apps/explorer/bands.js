@@ -32,10 +32,23 @@ export const BANDS = {
   WVP: { label: "Water vapour column", nm: null, res: 20 },
   SCL: { label: "Scene classification", nm: null, res: 20 },
 };
+// Collection 1 scenes also carry Sen2Cor's cloud and snow probability masks
+// (assets `cloud` and `snow`: CLD_20m.tif, SNW_20m.tif next to the bands),
+// uint8 percent on the 20 m grid. app.js offers them as single bands only
+// when that collection is shown; `fixed` is the stretch they open with —
+// the whole 0..100 % scale, not the overview's percentiles, so a clear
+// scene and an overcast one read on the same grey scale.
+export const MASK_BANDS = {
+  CLD_20m: { label: "Cloud probability", nm: null, res: 20, fixed: [0, 100] },
+  SNW_20m: { label: "Snow probability", nm: null, res: 20, fixed: [0, 100] },
+};
+export const bandInfo = (b) => BANDS[b] ?? MASK_BANDS[b] ?? null;
 export const bandTitle = (b) => {
-  const d = BANDS[b];
+  const d = bandInfo(b);
   return d ? `${b} ${d.label}${d.nm ? ` ${d.nm} nm` : ""} · ${d.res} m` : b;
 };
+// [min, max] a band's handles always open at, or null for the percentile seed.
+export const fixedRange = (b) => bandInfo(b)?.fixed ?? null;
 
 // The indices: (a - b) / (a + b), and the fixed diverging ramp each is drawn
 // with over -1..1 (three stops; the handles narrow the range the ramp spans,
