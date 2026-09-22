@@ -41,6 +41,29 @@ globe. Those scenes are dropped from the footprint aggregation that builds
 `mgrs-monthly.parquet`: the exclusion is a geometry-rendering fix, not a
 data-quality filter.
 
+## The layout behind the speed
+
+The speed is layout, not infrastructure. Each product is shaped for exactly
+one access pattern:
+
+- **One tile's history** never reads the whole table. `mgrs-monthly.parquet`
+  is sorted by `mgrs_tile`, so one tile's rows sit together in one or two
+  row groups. A reader checks the footer's per-group tile ranges, fetches
+  only the matching groups with HTTP range requests, and moves tens of
+  kilobytes instead of the ~21 MB file.
+- **One month's map** is a pre-cut file. Each `months/YYYY-MM.parquet`
+  slice contains one month's rows with only the paint columns, ~100-150 KB.
+  A client fetches it whole in one request; there is nothing to prune.
+- **The global timeline** is a few-KB file, fetched whole.
+
+The [scene explorer](https://portolan-mirrors.github.io/sentinel-2-catalog/)
+reads all three this way with [hyparquet](https://github.com/hyparam/hyparquet),
+a small pure-JS parquet reader, in the page: whole-file fetches for the
+small products, footer-pruned range reads for the big one. No server or
+query engine sits between the browser and the bucket. The item index uses
+the same idea at larger scale: sort by the query key, and the footer
+statistics route each read to a few small row groups.
+
 ## Query it
 
 One tile's history (a range read of one or two row groups):

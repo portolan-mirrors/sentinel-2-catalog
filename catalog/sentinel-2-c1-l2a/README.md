@@ -13,15 +13,13 @@ This catalog carries no imagery. The Cloud-Optimized GeoTIFFs stay in the
 public `e84-earth-search-sentinel-data` bucket on AWS, and every one of
 their URLs is already in the table.
 
-**Status: the backfill is in progress.** No year is published yet, so the
-collection's `table:row_count` is 0, its temporal extent is the source's,
-and there are no per-year items. Years appear as the backfill lands them,
-each with its own `year=YYYY/YYYY.json`; check
-[`collection.json`](collection.json) for the current list. Every query below
-is written for the layout the backfill publishes and runs once its year
-exists.
+Every year from 2015 on is published, each with its own
+`year=YYYY/YYYY.json` item; the collection.json counted 30,402,025 rows
+(2015-10 to 2026-09) when read on 2026-09-22. The collection's
+`table:row_count` and temporal extent follow the table at each publish, so
+[`collection.json`](collection.json) is the authority on what is here.
 
-## Query it (after the backfill)
+## Query it
 
 ```sql
 -- Cloud-free scenes over a field during harvest, no API, no rate limits.

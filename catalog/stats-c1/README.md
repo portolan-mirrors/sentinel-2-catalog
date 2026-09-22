@@ -8,13 +8,6 @@ Three parquet products and one tileset, generated from the
 one difference in the making is the tile column they group on, which in
 Collection 1 is the index's `_tile`.
 
-**Status: the backfill is in progress.** The `sentinel-2-c1-l2a` index has
-no published year yet, so nothing is published here either: the
-collection's `table:row_count` is 0 and its temporal extent is the
-source's. The products appear once the first year of the index is
-published and `publish-stats` has run for Collection 1. Every query below
-runs then.
-
 - **`mgrs-monthly.parquet`** -- one row per MGRS tile per month: scene
   count, minimum and median `eo:cloud_cover`, the id and UTC date of that
   tile-month's least-cloudy scene, and the mean and maximum percent of the
@@ -52,7 +45,30 @@ globe. Those scenes are dropped from the footprint aggregation that builds
 `mgrs-monthly.parquet`: the exclusion is a geometry-rendering fix, not a
 data-quality filter.
 
-## Query it (after the backfill)
+## The layout behind the speed
+
+The speed is layout, not infrastructure. Each product is shaped for exactly
+one access pattern:
+
+- **One tile's history** never reads the whole table. `mgrs-monthly.parquet`
+  is sorted by `mgrs_tile`, so one tile's rows sit together in one or two
+  row groups. A reader checks the footer's per-group tile ranges, fetches
+  only the matching groups with HTTP range requests, and moves tens of
+  kilobytes instead of the ~21 MB file.
+- **One month's map** is a pre-cut file. Each `months/YYYY-MM.parquet`
+  slice contains one month's rows with only the paint columns, ~100-150 KB.
+  A client fetches it whole in one request; there is nothing to prune.
+- **The global timeline** is a few-KB file, fetched whole.
+
+The [scene explorer](https://portolan-mirrors.github.io/sentinel-2-catalog/)
+reads all three this way with [hyparquet](https://github.com/hyparam/hyparquet),
+a small pure-JS parquet reader, in the page: whole-file fetches for the
+small products, footer-pruned range reads for the big one. No server or
+query engine sits between the browser and the bucket. The item index uses
+the same idea at larger scale: sort by the query key, and the footer
+statistics route each read to a few small row groups.
+
+## Query it
 
 One tile's history (a range read of one or two row groups):
 
@@ -81,7 +97,7 @@ ORDER BY year DESC, month DESC LIMIT 1;
 
 ## Status
 
-Nothing is published yet (see above). Once it is, the table covers every
+The table covers every
 month the `sentinel-2-c1-l2a` index holds, from 2015-10 on; the newest
 month is the `max(year, month)` row of `timeline.parquet`. The daily
 refresh recomputes every year its `created` lookback touches and rewrites

@@ -19,18 +19,16 @@
 // that differs — directories, the tile column, which parts a year has, the
 // two extra mask bands — and the sidebar's select reloads the page with
 // the parameter set.
-// There is no API, no server and no database behind this page: the scene
-// search range-reads the item parts with hyparquet (search.js), DuckDB-WASM
-// range-reads the stats products, and so do the COG reads. The map is
-// MapLibre for the camera; the tiles are drawn by deck.gl
+// There is no API, no server and no database behind this page: every
+// parquet read — the scene search over the item parts, the stats timeline,
+// the month slices and the per-tile history — goes through hyparquet
+// (search.js), a small pure-JS reader, as HTTP range or whole-file fetches
+// straight at the object store, and the COG reads work the same way. The
+// map is MapLibre for the camera; the tiles are drawn by deck.gl
 // interleaved into the same canvas (Task 20), because MapLibre's per-feature
 // state and filter changes re-parse the 33k-polygon tile on every update.
 import maplibregl from "https://esm.sh/maplibre-gl@4.7.1";
 import { PMTiles, Protocol } from "https://esm.sh/pmtiles@3.2.0";
-// 1.32.0 (DuckDB v1.4.3) is a floor, not a preference: the item parts are
-// GeoParquet 2.0.0, and 1.29.0 (DuckDB v1.1.1) refuses them outright with
-// "Geoparquet version 2.0.0 is not supported".
-import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm";
 import { parse } from "https://esm.sh/@loaders.gl/core@4.5.1";
 import { MVTLoader } from "https://esm.sh/@loaders.gl/mvt@4.5.1";
 import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOverviews,
@@ -38,7 +36,7 @@ import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOver
 import { BANDS, MASK_BANDS, bandInfo, bandTitle, fixedRange, INDICES, SCL_CLASSES, PRESETS,
   bandsOf, HIST_BINS } from "./bands.js";
 import { dayRange, valueRange } from "./rangeslider.js";
-import { sceneSearch, warmPart } from "./search.js";
+import { sceneSearch, warmPart, readTable, keyedRows } from "./search.js";
 // deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
 // transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
 // A classic script that failed to load is a missing global, not an import
@@ -118,7 +116,6 @@ const collectionNote = requestedCollection && !COLLECTIONS[requestedCollection]
 //    ~55 KB footer plus one row group's column chunks, not the file.
 const STATS = `${BASE}/${COL.statsDir}/mgrs-monthly.parquet`;
 const TIMELINE = `${BASE}/${COL.statsDir}/timeline.parquet`;
-const TIMELINE_FILE = "timeline.parquet";
 const monthUrl = (ym) => `${BASE}/${COL.statsDir}/months/${ym}.parquet`;
 // Only these may reach the SQL string; the <select> is not trusted input.
 const METRICS = new Set(["min_cloud_cover", "scene_count", "median_cloud_cover", "max_cover"]);
@@ -135,9 +132,9 @@ const say = (msg, isError = false) => {
 
 // The sidebar's collection switch. The select shows the loaded collection;
 // a change reloads the page with ?collection= set (the other parameters
-// kept), which is how every piece of per-collection state — DuckDB's
-// registered files, the stats, timeline and month, the results, a shown
-// scene — starts over rather than being unpicked one by one.
+// kept), which is how every piece of per-collection state — the cached
+// part metadata, the stats, timeline and month buffers, the results, a
+// shown scene — starts over rather than being unpicked one by one.
 {
   const sel = $("collection");
   for (const [id, c] of Object.entries(COLLECTIONS)) sel.append(new Option(c.label, id));
@@ -150,21 +147,6 @@ const say = (msg, isError = false) => {
   $("title").textContent = COL.title;
   $("sub").textContent = `${COL.title} scenes since ${COL.since} — every query on this page `
     + "is a range read against static GeoParquet on Source Cooperative; there is no API.";
-}
-
-async function initDb() {
-  const bundles = duckdb.getJsDelivrBundles();
-  const bundle = await duckdb.selectBundle(bundles);
-  const worker = new Worker(URL.createObjectURL(new Blob(
-    [`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" })));
-  const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING), worker);
-  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
-  // Measured, not assumed: duckdb-wasm 1.32.0 defaults forceFullHTTPReads to
-  // true, so a query against a 573 MB year part downloaded the whole file
-  // (162 s) instead of range-reading the ~5 MB it needed. With the flag off
-  // the same query is ~30 range GETs. Nothing else about the FS is changed.
-  await db.open({ filesystem: { forceFullHTTPReads: false } });
-  return db;
 }
 
 const protocol = new Protocol();
@@ -180,11 +162,9 @@ map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-ri
 // Registered before any await, so a fast style load cannot be missed.
 const mapReady = new Promise((resolve) => map.on("load", resolve));
 
-const db = await initDb();
-const conn = await db.connect();
 // A console handle saves reaching into the module; the deck.gl overlay and
 // the per-month lookup are added below once they exist.
-window.S2 = { BASE, collection: COLLECTION_ID, db, conn, map };
+window.S2 = { BASE, collection: COLLECTION_ID, map };
 
 // The choropleth ramp, shared by the map fill, the legend and the timeline
 // bars so one colour always means one thing.
@@ -265,7 +245,9 @@ if (mgrsReachable) {
 map.addSource("mgrs", { type: "vector", url: `pmtiles://${mgrsUrl}` });
 map.addLayer({ id: "mgrs-line", type: "line", source: "mgrs",
   "source-layer": "mgrs",
-  paint: { "line-color": "#8899bb", "line-width": 0.4 } });
+  // Subtle on purpose: the choropleth is the picture and the grid only
+  // separates the cells, so it sits at a quarter opacity.
+  paint: { "line-color": "#8899bb", "line-width": 0.4, "line-opacity": 0.25 } });
 // MVTLayer asks for "{z}/{x}/{y}" of its data template; the bytes come from
 // the PMTiles archive (one range read per tile, cached by the library) and
 // are parsed on this thread with loaders.gl's MVTLoader, using the options
@@ -468,22 +450,26 @@ render();
 // Stats: the choropleth and the timeline.
 // ---------------------------------------------------------------------------
 
-// A small remote parquet fetched whole and handed to DuckDB as an in-memory
-// file under `name`. Resolves false on a 404, which for a month slice means
-// "no tile-months for that month" (the builder writes a slice only for
-// months the table has), not a broken bucket.
-async function registerRemote(url, name) {
+// A small remote parquet fetched whole and decoded in the page with
+// hyparquet (search.js readTable). Resolves null on a 404, which for a
+// month slice means "no tile-months for that month" (the builder writes a
+// slice only for months the table has), not a broken bucket.
+async function fetchParquet(url) {
   const res = await fetch(url);
-  if (res.status === 404) return false;
+  if (res.status === 404) return null;
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  await db.registerFileBuffer(name, new Uint8Array(await res.arrayBuffer()));
-  return true;
+  return res.arrayBuffer();
 }
 
-// False when the collection has no stats in the bucket yet (Collection 1
-// until publish-stats first runs for it): init() then keeps the page in its
+// The timeline file's bytes, kept for every later read. False when the
+// collection has no stats in the bucket yet (Collection 1 until
+// publish-stats first runs for it): init() then keeps the page in its
 // no-stats state below rather than treating the 404 as a broken bucket.
-const loadTimeline = () => registerRemote(TIMELINE, TIMELINE_FILE);
+let timelineBuf = null;
+const loadTimeline = async () => {
+  timelineBuf = await fetchParquet(TIMELINE);
+  return timelineBuf !== null;
+};
 
 // Set by init() when the collection's stats are not published: the map
 // stays unpainted, the timeline empty, and the month and tile-history reads
@@ -493,17 +479,15 @@ const loadTimeline = () => registerRemote(TIMELINE, TIMELINE_FILE);
 let statsMissing = false;
 let statsNote = "";
 
-// Month slices already registered with DuckDB: ym -> the registered file
-// name, or null for a month the bucket has no slice for. The value is the
-// in-flight promise, so two callers for the same month share one fetch and
-// a revisit costs nothing. A failed fetch is forgotten so the next attempt
-// retries rather than replaying the error.
+// Month slices fetched whole, ym -> the file's bytes, or null for a month
+// the bucket has no slice for. The value is the in-flight promise, so two
+// callers for the same month share one fetch and a revisit costs nothing. A
+// failed fetch is forgotten so the next attempt retries rather than
+// replaying the error.
 const monthFiles = new Map();
 function monthFile(ym) {
   if (!monthFiles.has(ym)) {
-    const name = `month-${ym}.parquet`;
-    const p = registerRemote(monthUrl(ym), name)
-      .then((ok) => (ok ? name : null))
+    const p = fetchParquet(monthUrl(ym))
       .catch((err) => { monthFiles.delete(ym); throw err; });
     monthFiles.set(ym, p);
   }
@@ -527,13 +511,12 @@ export async function statsForMonth(y, m) {
   const metric = $("metric").value;
   if (!METRICS.has(metric)) throw new Error(`unknown metric ${metric}`);
   const ym = `${Number(y)}-${String(Number(m)).padStart(2, "0")}`;
-  const file = await monthFile(ym);
-  if (!file) return [];
-  const res = await conn.query(`
-    SELECT mgrs_tile, ${metric} AS v, min_cloud_cover AS cc, scene_count AS sc,
-           max_cover AS cover
-    FROM read_parquet('${file}')`);
-  return res.toArray();
+  const buf = await monthFile(ym);
+  if (!buf) return [];
+  const cols = [...new Set(["mgrs_tile", metric, "min_cloud_cover", "scene_count", "max_cover"])];
+  const rows = await readTable(buf, cols);
+  return rows.map((r) => ({ mgrs_tile: r.mgrs_tile, v: r[metric],
+    cc: r.min_cloud_cover, sc: r.scene_count, cover: r.max_cover }));
 }
 
 // The three filter sliders, combined into one sentence for the status line
@@ -632,12 +615,12 @@ async function paintMonth() {
 }
 
 // All tiles: the timeline file, already in memory, one row per month. One
-// tile: the full table over httpfs, WHERE mgrs_tile = ... — DuckDB reads
-// the footer, keeps only the row groups whose mgrs_tile range covers the
-// tile (the table is sorted by tile), and range-reads those. That is
-// several network round trips, so like paintMonth() only the latest call
-// may touch the bars or the status line: click tile A then B and A's
-// answer, landing last, must not replace B's.
+// tile: keyedRows (search.js) range-reads mgrs-monthly.parquet — footer
+// once per session, then only the row groups whose mgrs_tile range covers
+// the tile (the table is tile-sorted), aggregated here per month. That is
+// still a network read, so like paintMonth() only the latest call may
+// touch the bars or the status line: click tile A then B and A's answer,
+// landing last, must not replace B's.
 let timelineSeq = 0;
 
 export async function timelineFor(tile) {
@@ -653,15 +636,26 @@ export async function timelineFor(tile) {
   let rows;
   try {
     if (tile) say(`Reading tile ${tile}'s history…`);
-    const res = await conn.query(tile
-      ? `SELECT year, month, sum(scene_count)::INT AS n,
-                min(min_cloud_cover) AS clearest
-         FROM read_parquet('${STATS}')
-         WHERE mgrs_tile = '${tile.replace(/'/g, "")}'
-         GROUP BY 1, 2 ORDER BY 1, 2`
-      : `SELECT year, month, scene_count AS n, min_cloud_cover AS clearest
-         FROM read_parquet('${TIMELINE_FILE}') ORDER BY 1, 2`);
-    rows = res.toArray();
+    if (tile) {
+      const raw = await keyedRows({ url: STATS, keyColumn: "mgrs_tile",
+        key: tile, columns: ["year", "month", "scene_count", "min_cloud_cover"] });
+      const byMonth = new Map();
+      for (const r of raw) {
+        const k = Number(r.year) * 100 + Number(r.month);
+        const cur = byMonth.get(k) ?? { year: Number(r.year), month: Number(r.month),
+          n: 0, clearest: Infinity };
+        cur.n += Number(r.scene_count);
+        cur.clearest = Math.min(cur.clearest, Number(r.min_cloud_cover));
+        byMonth.set(k, cur);
+      }
+      rows = [...byMonth.keys()].sort((a, b) => a - b).map((k) => byMonth.get(k));
+    } else {
+      rows = (await readTable(timelineBuf,
+        ["year", "month", "scene_count", "min_cloud_cover"]))
+        .map((r) => ({ year: Number(r.year), month: Number(r.month),
+          n: Number(r.scene_count), clearest: Number(r.min_cloud_cover) }))
+        .sort((a, b) => a.year - b.year || a.month - b.month);
+    }
   } catch (err) {
     if (seq !== timelineSeq) return;
     bars.replaceChildren(el("p", "hint", `Timeline unavailable — ${err.message}`));
@@ -736,13 +730,11 @@ function updateLegend() {
 // opens on the newest month the stats actually contain: the last row of the
 // timeline file, which is also the newest month with a months/ slice.
 async function newestMonth() {
-  const res = await conn.query(
-    `SELECT max(year::INT * 100 + month::INT) AS ym,
-            min(year::INT * 100 + month::INT) AS lo
-     FROM read_parquet('${TIMELINE_FILE}')`);
-  const [row] = res.toArray();
+  const rows = await readTable(timelineBuf, ["year", "month"]);
+  if (!rows.length) return null;
+  const yms = rows.map((r) => Number(r.year) * 100 + Number(r.month));
   const fmt = (n) => `${Math.floor(n / 100)}-${String(n % 100).padStart(2, "0")}`;
-  return row?.ym ? { newest: fmt(row.ym), oldest: fmt(row.lo) } : null;
+  return { newest: fmt(Math.max(...yms)), oldest: fmt(Math.min(...yms)) };
 }
 
 // The three sliders live-filter the map: tiles that fail any gate go grey.
