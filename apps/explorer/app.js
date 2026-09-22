@@ -68,9 +68,10 @@ export const BASE = new URLSearchParams(location.search).get("base")
 // grid:code "MGRS-31UET". `masks` are the extra single bands its scenes
 // carry (bands.js MASK_BANDS). `since` is the first year with scenes, for
 // the header and the month picker when no stats say better.
-// DEFAULT_COLLECTION is what loads without ?collection=: one constant, to
-// flip to Collection 1 once its backfill and stats are complete.
-export const DEFAULT_COLLECTION = "sentinel-2-l2a";
+// DEFAULT_COLLECTION is what loads without ?collection=. Collection 1 is
+// the default since 2026-09-22, when its backfill and stats were published;
+// ?collection=sentinel-2-l2a opens the first collection.
+export const DEFAULT_COLLECTION = "sentinel-2-c1-l2a";
 export const COLLECTIONS = {
   "sentinel-2-l2a": {
     label: "Sentinel-2 L2A (Earth Search)", title: "Sentinel-2 L2A", since: 2016,
