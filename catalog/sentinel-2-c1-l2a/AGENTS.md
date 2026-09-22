@@ -8,12 +8,11 @@ fact came from, it does not belong in this file. An agent acting on an invented
 column name or an invented join key produces a confident wrong answer, and
 nothing downstream catches it.
 
-**Status: the backfill is in progress.** No year of this collection is
-published yet (`table:row_count` 0, no per-year items). Every URL and query
-below describes the layout the backfill publishes; run them once the year
-you need has an item under `year=YYYY/`, and until then use the
-[`sentinel-2-l2a`](../sentinel-2-l2a/AGENTS.md) collection, which is
-complete.
+Every year from 2015 on is published (the collection.json counted
+30,402,025 rows, 2015-10 to 2026-09, when read on 2026-09-22). This is the
+uniform record: query it first, and use
+[`sentinel-2-l2a`](../sentinel-2-l2a/AGENTS.md) when you need Earth
+Search's original index instead.
 
 ## What this is
 
@@ -333,9 +332,9 @@ and the cluster scripts in `tools/rails/`:
   consolidation on GitHub for this collection. Between folds a year's two
   files together are the year; the dedupe above makes the count exact.
 
-The daily job runs only once the repository variable `C1_LIVE_ENABLED` is
-set, after the backfill is published and the stats table is seeded. Until
-then this collection changes only when a person commits and publishes it.
+The daily job runs only while the repository variable `C1_LIVE_ENABLED` is
+set. With it unset this collection changes only when a person commits and
+publishes it.
 
 ## What this collection does not do
 

@@ -14,8 +14,10 @@ carries only the item index and a small set of MGRS-tile aggregates, with
 reads against a public bucket: no key, no server, no rate limit.
 
 - **Explore it**: https://portolan-mirrors.github.io/sentinel-2-catalog/, a
-  static page that behaves like there is an API behind it. DuckDB-WASM range
-  reads plus PMTiles, nothing else. Any band, composite, NDVI/NDWI or the
+  static page that behaves like there is an API behind it. Every query runs
+  on [hyparquet](https://github.com/hyparam/hyparquet) range reads plus
+  PMTiles — a small pure-JS parquet reader in place of a 36 MB WASM query
+  engine. Any band, composite, NDVI/NDWI or the
   SCL classes of a scene are drawn on the map straight from its COGs in
   the browser, with histogram-and-handles stretch controls. The page
   opens on Collection 1 (`sentinel-2-c1-l2a/` and `stats-c1/`); a
@@ -188,9 +190,10 @@ everywhere. The two `_`-prefixed columns are sort helpers added by the mirror,
 not STAC properties. Measured costs per vintage are in
 [`docs/query-performance.md`](docs/query-performance.md).
 
-**Reader floors.** The parts are GeoParquet 2.0 with native geometry. They
-need DuckDB 1.4 or newer, and duckdb-wasm 1.32 or newer in the browser. Older
-readers refuse them with "Geoparquet version 2.0.0 is not supported".
+**Reader floors.** The parts are GeoParquet 2.0 with native geometry. DuckDB
+needs to be 1.4 or newer (duckdb-wasm 1.32 or newer); older versions refuse
+them with "Geoparquet version 2.0.0 is not supported". The explorer reads
+them with hyparquet, which has no such floor.
 
 ## What the numbers mean
 

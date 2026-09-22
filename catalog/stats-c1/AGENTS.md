@@ -6,12 +6,6 @@ Guidance for AI agents and automated clients querying this collection.
 quoted from a source or measured from the data. If you cannot point at where a
 fact came from, it does not belong in this file.
 
-**Status: the backfill is in progress.** The `sentinel-2-c1-l2a` index this
-collection aggregates has no published year yet, so none of the files below
-exist yet: `table:row_count` is 0 and the temporal extent is the source's.
-Until they do, the [`stats`](../stats/AGENTS.md) collection (the same
-products over `sentinel-2-l2a`) is complete and answers the same questions.
-
 ## What this is
 
 Three parquet products and one tileset, joined by `mgrs_tile`, all generated

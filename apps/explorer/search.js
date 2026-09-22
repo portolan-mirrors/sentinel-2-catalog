@@ -265,3 +265,37 @@ export async function sceneSearch({ urls, tileColumn, tile, d0, d1, cc, cov }) {
 export function warmPart(url) {
   partMeta(url).catch(() => {});
 }
+
+// The stats reads share the machinery above, so the whole page runs on one
+// parquet reader and DuckDB-WASM is not loaded at all.
+
+// A whole in-memory parquet file (a fetched timeline or month slice),
+// decoded to row objects. `columns` narrows the decode.
+export function readTable(buf, columns) {
+  return parquetReadObjects({ file: buf, compressors, columns });
+}
+
+// The rows of one key from a key-sorted remote parquet file: footer (or
+// sidecar) once per session via partMeta, groups admitted by the key
+// column's ranges, the named columns' chunks fetched in parallel, rows
+// filtered to the key. This is timelineFor's per-tile history read over
+// stats/mgrs-monthly.parquet, and it works for any key-sorted table.
+export async function keyedRows({ url, keyColumn, key, columns }) {
+  const meta = await partMeta(url);
+  const groups = admittedGroups(meta, keyColumn, key);
+  if (!groups.length) return [];
+  const wanted = [...new Set([keyColumn, ...columns])];
+  const jobs = groups.flatMap((g) => g.chunks.filter((c) => wanted.includes(c.column)));
+  const tally = { gets: 0, bytes: 0, misses: 0 };
+  const regions = [{ off: meta.footerOff, buf: meta.footer }];
+  await Promise.all(jobs.map(async (job) => {
+    const buf = await rangeGet(url, job.off, job.len);
+    regions.push({ off: job.off, buf });
+  }));
+  const file = regionBuffer(url, meta.size, regions, tally);
+  const parts = await Promise.all(groups.map((g) => parquetReadObjects({
+    file, metadata: meta.metadata, compressors, columns: wanted,
+    rowStart: g.row0, rowEnd: g.row1,
+  })));
+  return parts.flat().filter((r) => r[keyColumn] === key);
+}

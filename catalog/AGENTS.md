@@ -12,14 +12,15 @@ answer, and nothing downstream catches it.
 
 Public root: `https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json`
 
-Two item indexes, each with a stats collection beside it: `sentinel-2-l2a`,
-the AWS Earth Search Sentinel-2 L2A item index as year-partitioned
-STAC-GeoParquet (Earth Search held 51.25 million items when it was counted
-on 2026-09-15), with `stats` holding its MGRS-tile aggregates; and
-`sentinel-2-c1-l2a`, Earth Search's Sentinel-2 Collection 1 index (ESA's
-reprocessing of the archive, sorted tile-major, joined on `_tile` rather
-than `s2:mgrs_tile`), with `stats-c1` -- its backfill is in progress and it
-holds no published year yet, so query `sentinel-2-l2a` until it does.
+Two item indexes, each with a stats collection beside it: `sentinel-2-c1-l2a`,
+Earth Search's Sentinel-2 Collection 1 index (ESA's reprocessing of the
+archive, sorted tile-major, joined on `_tile` rather than `s2:mgrs_tile`;
+its collection.json counted 30,402,025 rows, 2015-10 to 2026-09, when read
+on 2026-09-22), with `stats-c1` holding its MGRS-tile aggregates; and
+`sentinel-2-l2a`, the original Earth Search Sentinel-2 L2A item index as
+year-partitioned STAC-GeoParquet (Earth Search held 51.25 million items
+when it was counted on 2026-09-15), with `stats`. Collection 1 is the
+uniform record and the one to query first.
 
 Read [`sentinel-2-l2a/AGENTS.md`](sentinel-2-l2a/AGENTS.md) (or
 [`sentinel-2-c1-l2a/AGENTS.md`](sentinel-2-c1-l2a/AGENTS.md)) before you
