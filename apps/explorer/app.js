@@ -19,9 +19,10 @@
 // that differs — directories, the tile column, which parts a year has, the
 // two extra mask bands — and the sidebar's select reloads the page with
 // the parameter set.
-// There is no API, no server and no database behind this page: DuckDB-WASM
-// issues HTTP range reads straight at the object store, and so do the COG
-// reads. The map is MapLibre for the camera; the tiles are drawn by deck.gl
+// There is no API, no server and no database behind this page: the scene
+// search range-reads the item parts with hyparquet (search.js), DuckDB-WASM
+// range-reads the stats products, and so do the COG reads. The map is
+// MapLibre for the camera; the tiles are drawn by deck.gl
 // interleaved into the same canvas (Task 20), because MapLibre's per-feature
 // state and filter changes re-parse the 33k-polygon tile on every update.
 import maplibregl from "https://esm.sh/maplibre-gl@4.7.1";
@@ -37,6 +38,7 @@ import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOver
 import { BANDS, MASK_BANDS, bandInfo, bandTitle, fixedRange, INDICES, SCL_CLASSES, PRESETS,
   bandsOf, HIST_BINS } from "./bands.js";
 import { dayRange, valueRange } from "./rangeslider.js";
+import { sceneSearch } from "./search.js";
 // deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
 // transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
 // A classic script that failed to load is a missing global, not an import
@@ -898,17 +900,17 @@ async function initWithoutStats() {
 // scene query's constants and helpers, which are defined below.
 
 // ---------------------------------------------------------------------------
-// The scene query. Click a tile, pick a window, and DuckDB-WASM range-reads the
-// year parts of the collection directly. The row's `assets` column (a JSON
-// string carrying the upstream STAC assets object) is ~18 KB a row and half
-// the bytes of a part, so the search leaves it out; every COG the page draws
-// or links sits in the scene directory that `thumbnail_url` names (see
-// sceneDirOf), so no row ever needs `assets`.
+// The scene query. Click a tile, pick a window, and hyparquet (search.js)
+// range-reads the year parts of the collection directly: the footer once per
+// part per session, then the admitted row groups' search columns in
+// parallel. Every COG the page draws or links sits in the scene directory
+// that `thumbnail_url` names (see sceneDirOf), so no row ever needs the
+// parts' ~18 KB-a-row `assets` column.
 // ---------------------------------------------------------------------------
 
 // An MGRS tile id: 1-2 digit UTM zone, latitude band C..X, then two letters.
-// The values come from the tileset, not from a text box, but they are the only
-// thing on this page that reaches a SQL string, so they are checked anyway.
+// The values come from the tileset, not from a text box, but they reach the
+// stats SQL string (timelineFor), so they are checked anyway.
 const TILE_RE = /^\d{1,2}[C-X][A-Z]{2}$/;
 const CURRENT_YEAR = new Date().getUTCFullYear();
 
@@ -1007,45 +1009,15 @@ async function partUrls(y0, y1, tile) {
   return candidates.filter((_, i) => present[i]);
 }
 
-const partList = (urls) => `[${urls.map((u) => `'${u}'`).join(", ")}]`;
-
-function sceneSql(urls, tile, d0, d1, cc, cov) {
-  // `_month` is the cheap row-group filter, but it only narrows anything while
-  // the window stays inside one calendar year — across a year boundary
-  // (2023-11 → 2024-02) months 11..2 is empty, so it widens to the whole year.
-  // Collection 1 parts are sorted by tile then time, not month-major; they
-  // keep the `_month` column, so the predicate is the same and still prunes
-  // by the row groups' min/max where it can.
-  const sameYear = d0.slice(0, 4) === d1.slice(0, 4);
-  const m0 = sameYear ? Number(d0.slice(5, 7)) : 1;
-  const m1 = sameYear ? Number(d1.slice(5, 7)) : 12;
-  // The coverage gate is the item-level twin of the stats file's max_cover
-  // (100 - s2:nodata_pixel_percentage), projected straight from the column
-  // the item parts always carry — never from `assets`. Omitted at 0 (the
-  // slider's no-op value, and its state whenever the slider is hidden).
-  const coverClause = cov > 0
-    ? `\n  AND (100 - "s2:nodata_pixel_percentage") >= ${cov}` : "";
-  // `datetime` is TIMESTAMPTZ; comparing it against a bare literal would be
-  // read in the session's zone, so both sides are pinned to UTC. The same
-  // conversion formats the label, rather than guessing at the epoch units
-  // Arrow hands back. `assets` is deliberately not selected (see above);
-  // `bbox` is, for "Show on map", and the processing baseline (a short
-  // dictionary-coded string) for the band mapper's index offset (bands.js).
-  return `SELECT id,
-       strftime(datetime AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ') AS ts,
-       "eo:cloud_cover" AS cloud,
-       thumbnail_url,
-       bbox,
-       "s2:processing_baseline" AS baseline
-FROM read_parquet(${partList(urls)}, union_by_name=true)
-WHERE "${COL.tileColumn}" = '${tile}'
-  AND _month BETWEEN ${m0} AND ${m1}
-  AND (datetime AT TIME ZONE 'UTC')
-      BETWEEN TIMESTAMP '${d0} 00:00:00' AND TIMESTAMP '${d1} 23:59:59'
-  AND "eo:cloud_cover" <= ${cc}${coverClause}
-ORDER BY "eo:cloud_cover", id
-LIMIT 30`;
-}
+// The query itself lives in search.js (sceneSearch): hyparquet range-reads
+// the parts' footers once per session, admits row groups by the tile
+// column's statistics, fetches the admitted groups' search columns in
+// parallel, and filters the rows here in the page. The coverage gate is the
+// item-level twin of the stats file's max_cover
+// (100 - s2:nodata_pixel_percentage), and is omitted at 0 (the slider's
+// no-op value, and its state whenever the slider is hidden). `assets`
+// (~half the bytes of a part) is never fetched; `bbox` is, for "Show on
+// map", and the processing baseline for the band mapper's index offset.
 
 // The request a STAC API would have been asked for the same answer. Shown in
 // full because not making it is the point of this page.
@@ -1054,7 +1026,7 @@ function apiMirror(tile, d0, d1, cc, cov) {
     "eo:cloud_cover": { lte: cc },
     ...COL.apiTile(tile),
   };
-  // Mirrors sceneSql's coverage gate: coverage = 100 - nodata, so
+  // Mirrors sceneSearch's coverage gate: coverage = 100 - nodata, so
   // coverage >= cov is nodata <= 100 - cov. Omitted at the slider's inert
   // value, same as the real query.
   if (cov > 0) query["s2:nodata_pixel_percentage"] = { lte: 100 - cov };
@@ -1690,12 +1662,13 @@ async function runQuery() {
       say(`Nothing published for ${d0.slice(0, 4)}–${d1.slice(0, 4)} in ${COLLECTION_ID} yet.`);
       return;
     }
-    const sql = sceneSql(urls, selectedTile, d0, d1, cc, minCoverage);
-    $("sql").textContent = sql;
+    $("sql").textContent = "Range-reading…";
     $("api").textContent = apiMirror(selectedTile, d0, d1, cc, minCoverage);
     say(`Range-reading ${urls.length} parquet part`
       + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
-    const rows = (await conn.query(sql)).toArray();
+    const { rows, plan } = await sceneSearch({ urls, tileColumn: COL.tileColumn,
+      tile: selectedTile, d0, d1, cc, cov: minCoverage });
+    $("sql").textContent = plan;
     box.replaceChildren();
     if (!rows.length) {
       box.append(el("p", "hint",
@@ -1705,6 +1678,10 @@ async function runQuery() {
       return;
     }
     box.append(...rows.map(sceneCard));
+    // The clearest scene goes straight onto the map: the search's answer is
+    // an image, not a list. Clicking the best card's own button keeps this
+    // path identical to a hand click (state, spinner, band mapper).
+    box.querySelector(".scene.best .actions button")?.click();
     // The results sit below the timeline in the panel; without this the hero
     // flow's answer lands off-screen on a short window.
     box.scrollIntoView({ block: "nearest", behavior: "smooth" });
