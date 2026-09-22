@@ -65,6 +65,10 @@ def exit_message(call) -> str:
 check(".parquet" in PUBLISHABLE_SUFFIXES, "parquet is publishable")
 check(".pmtiles" in PUBLISHABLE_SUFFIXES, "pmtiles is publishable")
 check(".geojson" not in PUBLISHABLE_SUFFIXES, "geojson scratch never uploads")
+check(is_data_publishable(Path("c1/year=2025/items.idx.json")),
+      "a search sidecar uploads beside its part")
+check(not is_data_publishable(Path("c1/scratch.json")),
+      "a plain .json still never uploads")
 check(is_data_publishable(Path("a/roads.parquet")), "parquet passes")
 check(is_data_publishable(Path("a/roads.PARQUET")), "suffix case is ignored")
 check(is_data_publishable(Path("a/tiles.pmtiles")), "pmtiles passes")

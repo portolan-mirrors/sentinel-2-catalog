@@ -38,7 +38,7 @@ import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOver
 import { BANDS, MASK_BANDS, bandInfo, bandTitle, fixedRange, INDICES, SCL_CLASSES, PRESETS,
   bandsOf, HIST_BINS } from "./bands.js";
 import { dayRange, valueRange } from "./rangeslider.js";
-import { sceneSearch } from "./search.js";
+import { sceneSearch, warmPart } from "./search.js";
 // deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
 // transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
 // A classic script that failed to load is a missing global, not an import
@@ -90,6 +90,8 @@ export const COLLECTIONS = {
     since: 2015,
     dir: "sentinel-2-c1-l2a", statsDir: "stats-c1", tileColumn: "_tile",
     parts: () => ["items", "live"],
+    // The parts hold every tile, so they can warm before any tile is picked.
+    prefetchParts: true,
     apiTile: (tile) => ({ "grid:code": { eq: `MGRS-${tile}` } }),
     masks: Object.keys(MASK_BANDS),
   },
@@ -785,6 +787,7 @@ function reboundDateRange(ym) {
   const from0 = `${ym}-01`, to0 = lastDayOfMonth(ym);
   if (dateRange) {
     dateRange.rebound(from0, to0);
+    warmWindowParts();
     return;
   }
   // dayRange()'s own construction calls fromDates() once, but that no-ops
@@ -794,6 +797,24 @@ function reboundDateRange(ym) {
   dateRange = dayRange({ container: $("dayrange"), from: $("date0"), to: $("date1"),
     min: from0, max: to0 });
   dateRange.set(from0, to0);
+  warmWindowParts();
+}
+
+// Warm the window's parts the moment the window is known, for the
+// collections whose parts hold every tile (prefetchParts). The metadata —
+// sidecar or footer — then sits in the session cache while the user is
+// still looking at the map, and the first tile click skips the 5-10 s it
+// used to pay for it.
+function warmWindowParts() {
+  if (!COL.prefetchParts) return;
+  const d0 = $("date0").value;
+  const d1 = $("date1").value;
+  if (!d0 || !d1) return;
+  for (let y = Number(d0.slice(0, 4)); y <= Number(d1.slice(0, 4)); y++) {
+    for (const url of partUrlsFor(y, "")) {
+      partExists(url).then((ok) => { if (ok) warmPart(url); });
+    }
+  }
 }
 
 async function init() {

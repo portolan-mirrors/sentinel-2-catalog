@@ -33,14 +33,64 @@ const rangeGet = async (url, start, len) => {
   return res.arrayBuffer();
 };
 
-// One footer fetch per part per session. The 8-byte tail names the footer
+// The BigInt revival for sidecar numbers: hyparquet's own parse returns
+// thrift i64 fields as BigInt, and its readers expect the same shapes back.
+const big = (v) => (v === undefined || v === null ? undefined : BigInt(v));
+
+// A part's sidecar (<stem>.idx.json, tools/make_search_sidecar.mjs): the
+// slice of the footer the search uses, published beside the part. ~100 KB
+// gzip-encoded on the wire against the 7.5 MB footer of a Collection 1
+// year part, which is the whole cost of the first search on a year. The
+// metadata rebuilt from it carries only the search columns, so hyparquet
+// reads the part as if it were an eight-column file; the byte offsets are
+// absolute, so the reads land exactly where the footer would send them.
+async function sidecarMeta(url) {
+  const res = await fetch(url.replace(/\.parquet$/, ".idx.json"));
+  if (!res.ok) return null;
+  const sc = await res.json();
+  if (sc.v !== 1 || !Array.isArray(sc.groups)) return null;
+  let row = 0;
+  const rowGroups = [];
+  const groups = [];
+  for (const g of sc.groups) {
+    const columns = g.columns.map((c) => ({
+      file_offset: 0n,
+      meta_data: { ...c,
+        num_values: big(c.num_values),
+        total_compressed_size: big(c.total_compressed_size),
+        total_uncompressed_size: big(c.total_uncompressed_size),
+        data_page_offset: big(c.data_page_offset),
+        dictionary_page_offset: big(c.dictionary_page_offset),
+      },
+    }));
+    rowGroups.push({ num_rows: big(g.num_rows), columns,
+      total_byte_size: columns.reduce((a, c) => a + c.meta_data.total_compressed_size, 0n) });
+    groups.push({ row0: row, row1: row + g.num_rows,
+      tileMin: g.tile_min, tileMax: g.tile_max,
+      chunks: g.columns.map((c) => ({ column: c.path_in_schema[0],
+        off: Number(c.dictionary_page_offset ?? c.data_page_offset),
+        len: Number(c.total_compressed_size) })) });
+    row += g.num_rows;
+  }
+  const metadata = { version: 2, created_by: "sidecar", num_rows: big(sc.num_rows),
+    schema: sc.schema, row_groups: rowGroups, metadata_length: 0 };
+  return { url, size: sc.size, footerOff: sc.size, footer: new ArrayBuffer(0),
+    metadata, groups };
+}
+
+// One metadata fetch per part per session: the sidecar when the part has
+// one, else the footer. On the footer path the 8-byte tail names the footer
 // length, and its Content-Range names the file size; the footer follows as
 // one exact suffix read. ~2 sequential requests, then the parsed metadata
 // (and the file size) are cached for every later search.
 const metadataCache = new Map();
+const noSidecar = new Set();
 const partMeta = (url) => {
   if (!metadataCache.has(url)) {
     metadataCache.set(url, (async () => {
+      const sidecar = noSidecar.has(url) ? null
+        : await sidecarMeta(url).catch(() => null);
+      if (sidecar) return { ...sidecar, fromSidecar: true };
       const tail = await fetch(url, { headers: { Range: "bytes=-8" } });
       if (tail.status !== 206) throw new Error(`range read of ${url} got HTTP ${tail.status}`);
       const size = Number(tail.headers.get("content-range")?.split("/")[1]);
@@ -73,15 +123,22 @@ const partMeta = (url) => {
 
 const decodeStat = (v) => (typeof v === "string" ? v : v == null ? null : new TextDecoder().decode(v));
 
-// The groups whose tile-column statistics cannot exclude `tile`. A group
-// without statistics (nothing guarantees a live part carries them) is
-// admitted rather than skipped: correctness over bytes.
+// The groups whose tile range cannot exclude `tile` — the sidecar carries
+// the range per group, the footer path reads it off the tile column's
+// statistics. A group without either (nothing guarantees a live part
+// carries statistics) is admitted rather than skipped: correctness over
+// bytes.
 function admittedGroups(meta, tileColumn, tile) {
   return meta.groups.filter((g) => {
-    const chunk = g.chunks.find((c) => c.column === tileColumn);
-    if (!chunk) return false;
-    const min = decodeStat(chunk.stats?.min_value);
-    const max = decodeStat(chunk.stats?.max_value);
+    let min, max;
+    if (g.tileMin !== undefined) {
+      min = g.tileMin; max = g.tileMax;
+    } else {
+      const chunk = g.chunks.find((c) => c.column === tileColumn);
+      if (!chunk) return false;
+      min = decodeStat(chunk.stats?.min_value);
+      max = decodeStat(chunk.stats?.max_value);
+    }
     if (min == null || max == null) return true;
     return min <= tile && tile <= max;
   });
@@ -110,8 +167,23 @@ function regionBuffer(url, size, regions, tally) {
 
 // The search over one part: admit groups, prefetch the needed chunks, decode
 // each admitted group, keep the tile's rows. Returns raw decoded rows.
+// A decode failure on sidecar-built metadata retries once on the footer
+// path, so a stale or malformed sidecar degrades to the slow path instead
+// of failing the search.
 async function searchPart(url, tileColumn, tile, tally) {
   const meta = await partMeta(url);
+  try {
+    return await searchPartWith(meta, url, tileColumn, tile, tally);
+  } catch (err) {
+    if (!meta.fromSidecar) throw err;
+    console.warn(`sidecar decode failed for ${url} — retrying via the footer: ${err.message}`);
+    metadataCache.delete(url);
+    noSidecar.add(url);
+    return searchPartWith(await partMeta(url), url, tileColumn, tile, tally);
+  }
+}
+
+async function searchPartWith(meta, url, tileColumn, tile, tally) {
   const groups = admittedGroups(meta, tileColumn, tile);
   if (!groups.length) return [];
   tally.parts += 1;
@@ -165,10 +237,18 @@ export async function sceneSearch({ urls, tileColumn, tile, d0, d1, cc, cov }) {
     }));
   const secs = ((performance.now() - t0) / 1000).toFixed(1);
   const plan = `hyparquet range-read plan (no SQL engine, no API):\n`
-    + `  ${tally.parts} part(s) held ${tile}, ${tally.groups} row group(s) admitted by the`
-    + ` footer's ${tileColumn} statistics\n`
+    + `  ${tally.parts} part(s) held ${tile}, ${tally.groups} row group(s) admitted by their`
+    + ` ${tileColumn} ranges\n`
     + `  ${tally.gets} parallel range GETs, ${(tally.bytes / 1024).toFixed(0)} KiB`
     + ` (footers cached per session), ${secs} s`
     + (tally.misses ? `\n  ${tally.misses} read(s) fell outside the prefetched chunks` : "");
   return { rows, plan };
+}
+
+// Warm a part before the first search needs it: resolve its metadata
+// (sidecar or footer) in the background and swallow the failure — the
+// search itself will surface it. app.js calls this for the parts of the
+// window on screen, so the first click finds the metadata already cached.
+export function warmPart(url) {
+  partMeta(url).catch(() => {});
 }
