@@ -918,10 +918,19 @@ map.on("click", (e) => {
   const tile = hitIndex.at(e.lngLat.wrap().lng, e.lngLat.lat)?.tile;
   if (!TILE_RE.test(tile ?? "")) return;
   selectedTile = tile;
-  $("query").querySelector(".hint").textContent =
-    `Tile ${tile}. Pick a window and search.`;
   $("run").disabled = false;
   timelineFor(tile);
+  // The click is the search: picking a tile runs the query for the window
+  // already on screen. The button stays for re-runs after a slider or
+  // window change. Before the month picker has settled a window (no dates
+  // yet), the old two-step hint stands and nothing runs.
+  if ($("date0").value && $("date1").value) {
+    $("query").querySelector(".hint").textContent = `Tile ${tile}.`;
+    runQuery();
+  } else {
+    $("query").querySelector(".hint").textContent =
+      `Tile ${tile}. Pick a window and search.`;
+  }
 });
 
 // The zone parts of a year: [file stem, first zone, last zone], mirrored
@@ -1631,7 +1640,13 @@ function sceneCard(r, i) {
   return card;
 }
 
+// A tile click starts a search, so two can overlap when clicks come
+// fast. Each run takes a sequence number; a run that awoke from an
+// await to find a newer number leaves the page to the newer run.
+let searchSeq = 0;
+
 async function runQuery() {
+  const seq = ++searchSeq;
   const d0 = $("date0").value;
   const d1 = $("date1").value;
   const cc = Number($("maxcloud").value);
@@ -1653,6 +1668,7 @@ async function runQuery() {
   try {
     const urls = await partUrls(Number(d0.slice(0, 4)), Number(d1.slice(0, 4)),
       selectedTile);
+    if (seq !== searchSeq) return;
     if (!urls.length) {
       $("sql").textContent = "";
       $("api").textContent = "";
@@ -1668,6 +1684,7 @@ async function runQuery() {
       + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
     const { rows, plan } = await sceneSearch({ urls, tileColumn: COL.tileColumn,
       tile: selectedTile, d0, d1, cc, cov: minCoverage });
+    if (seq !== searchSeq) return;
     $("sql").textContent = plan;
     box.replaceChildren();
     if (!rows.length) {
@@ -1692,10 +1709,11 @@ async function runQuery() {
       + `clearest first — ${urls.length} range-read ${parts}`
       + `${urls.length === 1 ? "" : "s"}, no API call.`);
   } catch (err) {
+    if (seq !== searchSeq) return;
     box.replaceChildren(el("p", "hint", `Query failed — ${err.message}`));
     say(`Could not read the item parts — ${err.message}`, true);
   } finally {
-    $("run").disabled = false;
+    if (seq === searchSeq) $("run").disabled = false;
   }
 }
 
