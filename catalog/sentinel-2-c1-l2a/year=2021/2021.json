@@ -1,0 +1,88 @@
+{
+  "type": "Feature",
+  "stac_version": "1.1.0",
+  "stac_extensions": [
+    "https://stac-extensions.github.io/table/v1.2.0/schema.json",
+    "https://stac-extensions.github.io/file/v2.1.0/schema.json"
+  ],
+  "id": "2021",
+  "collection": "sentinel-2-c1-l2a",
+  "bbox": [
+    -180.0,
+    -82.8511,
+    180.0,
+    82.8181
+  ],
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          -180.0,
+          -82.8511
+        ],
+        [
+          180.0,
+          -82.8511
+        ],
+        [
+          180.0,
+          82.8181
+        ],
+        [
+          -180.0,
+          82.8181
+        ],
+        [
+          -180.0,
+          -82.8511
+        ]
+      ]
+    ]
+  },
+  "properties": {
+    "title": "Sentinel-2 Collection 1 L2A scenes, 2021",
+    "datetime": null,
+    "start_datetime": "2021-01-01T00:07:57.393Z",
+    "end_datetime": "2021-12-31T22:56:37.014Z",
+    "table:row_count": 4055717,
+    "s2:platforms": [
+      "sentinel-2a",
+      "sentinel-2b"
+    ]
+  },
+  "assets": {
+    "data": {
+      "href": "./items.parquet",
+      "type": "application/vnd.apache.parquet",
+      "title": "2021 scenes, GeoParquet 2.0",
+      "roles": [
+        "data"
+      ],
+      "start_datetime": "2021-01-01T00:07:57.393Z",
+      "end_datetime": "2021-12-31T22:56:37.014Z",
+      "table:row_count": 4055717,
+      "file:size": 5015478785
+    }
+  },
+  "links": [
+    {
+      "rel": "root",
+      "href": "../../catalog.json",
+      "type": "application/json",
+      "title": "Sentinel-2 L2A STAC-GeoParquet Mirror"
+    },
+    {
+      "rel": "parent",
+      "href": "../collection.json",
+      "type": "application/json",
+      "title": "Sentinel-2 Collection 1 L2A scenes (item index)"
+    },
+    {
+      "rel": "collection",
+      "href": "../collection.json",
+      "type": "application/json",
+      "title": "Sentinel-2 Collection 1 L2A scenes (item index)"
+    }
+  ]
+}
