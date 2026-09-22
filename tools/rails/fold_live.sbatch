@@ -37,7 +37,11 @@
 #      so the copy on /u matches the bucket (audit_year.sbatch reads it).
 #
 # Then regenerate and commit the metadata from a laptop; the job prints
-# the commands. Needs the source-coop AWS profile (README.md).
+# the commands. They include one search sidecar (items.idx.json) per
+# folded year: the fold rewrites items.parquet, which makes the published
+# sidecar stale. A stale sidecar only slows the search (the explorer
+# detects the size mismatch and falls back to the footer), but regenerate
+# it the same day. Needs the source-coop AWS profile (README.md).
 #
 # Timing: the daily refresh rewrites live.parquet at 03:42 UTC. A fold
 # whose window (the download in step 2 to the upload in step 5) crosses
@@ -171,6 +175,12 @@ Folded: ${FOLDED[*]}. Next, on a laptop with the repository checked out:
 $(for Y in "${FOLDED[@]}"; do echo "  mkdir -p staging/publish/$COLLECTION/year=$Y"; done)
   python3 tools/make_items.py --collection $COLLECTION --data-dir staging/publish/$COLLECTION --remote-baseline
   python3 tools/make_collection.py --collection $COLLECTION --data-dir staging/publish/$COLLECTION --remote-baseline
+$(for Y in "${FOLDED[@]}"; do cat <<SIDECAR
+  node tools/make_search_sidecar.mjs $PUBLIC_BASE/$COLLECTION/year=$Y/items.parquet
+  mv items.idx.json staging/publish/$COLLECTION/year=$Y/
+  python3 tools/upload_data.py --data-dir staging/publish --only $COLLECTION/year=$Y/items.idx.json --confirm
+SIDECAR
+done)
   CI_LIGHT=1 python3 tests/run_all.py
   git add catalog/$COLLECTION && git commit -m "catalog(c1): fold ${FOLDED[*]}"
 then run the publish-catalog workflow. It restamps every collection from

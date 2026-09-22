@@ -25,11 +25,21 @@ const SEARCH_COLUMNS = ["id", "datetime", "eo:cloud_cover",
 // no tile order) from queueing hundreds of streams at once.
 const MAX_IN_FLIGHT = 24;
 
-const rangeGet = async (url, start, len) => {
+const rangeGet = async (url, start, len, expectSize) => {
   const res = await fetch(url, { headers: { Range: `bytes=${start}-${start + len - 1}` } });
   // 200 means the server ignored the Range header; the whole part must never
   // be pulled to answer a search.
   if (res.status !== 206) throw new Error(`range read of ${url} got HTTP ${res.status}`);
+  // Every 206 carries the file's true length in Content-Range, so checking
+  // it against the caller's expectation is free. A mismatch means the part
+  // was rebuilt after its sidecar: the error routes into searchPart's
+  // footer retry before a byte is decoded.
+  if (expectSize !== undefined) {
+    const total = Number(res.headers.get("content-range")?.split("/")[1]);
+    if (Number.isFinite(total) && total !== expectSize) {
+      throw new Error(`the part is ${total} bytes but its sidecar says ${expectSize} — the sidecar is stale`);
+    }
+  }
   return res.arrayBuffer();
 };
 
@@ -147,9 +157,10 @@ function admittedGroups(meta, tileColumn, tile) {
 // An AsyncBuffer over prefetched byte regions. Everything hyparquet asks for
 // is already in a region; a miss falls through to the network so a decode
 // never fails, and is counted so the plan can say it happened.
-function regionBuffer(url, size, regions, tally) {
+function regionBuffer(url, size, regions, tally, expectSize) {
   return {
     byteLength: size,
+    expectSize,
     async slice(start, end) {
       for (const r of regions) {
         if (start >= r.off && end <= r.off + r.buf.byteLength) {
@@ -157,7 +168,7 @@ function regionBuffer(url, size, regions, tally) {
         }
       }
       tally.misses += 1;
-      const buf = await rangeGet(url, start, end - start);
+      const buf = await rangeGet(url, start, end - start, this.expectSize);
       tally.gets += 1;
       tally.bytes += buf.byteLength;
       return buf;
@@ -196,13 +207,15 @@ async function searchPartWith(meta, url, tileColumn, tile, tally) {
     while (next < jobs.length) {
       const job = jobs[next];
       next += 1;
-      const buf = await rangeGet(url, job.off, job.len);
+      const buf = await rangeGet(url, job.off, job.len,
+        meta.fromSidecar ? meta.size : undefined);
       tally.gets += 1;
       tally.bytes += buf.byteLength;
       regions.push({ off: job.off, buf });
     }
   }));
-  const file = regionBuffer(url, meta.size, regions, tally);
+  const file = regionBuffer(url, meta.size, regions, tally,
+    meta.fromSidecar ? meta.size : undefined);
   const parts = await Promise.all(groups.map((g) => parquetReadObjects({
     file, metadata: meta.metadata, compressors, columns, rowStart: g.row0, rowEnd: g.row1,
   })));
