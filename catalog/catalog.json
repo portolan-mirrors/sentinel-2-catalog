@@ -59,12 +59,12 @@
     },
     {
       "rel": "vcs",
-      "href": "https://github.com/portolan-mirrors/sentinel-2-catalog",
+      "href": "https://github.com/taylor-geospatial/s2-stac-geoparquet",
       "title": "Source repository"
     },
     {
       "rel": "issues",
-      "href": "https://github.com/portolan-mirrors/sentinel-2-catalog/issues",
+      "href": "https://github.com/taylor-geospatial/s2-stac-geoparquet/issues",
       "title": "Issue tracker"
     }
   ]

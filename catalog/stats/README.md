@@ -56,7 +56,7 @@ one access pattern:
   A client fetches it whole in one request; there is nothing to prune.
 - **The global timeline** is a few-KB file, fetched whole.
 
-The [scene explorer](https://portolan-mirrors.github.io/sentinel-2-catalog/)
+The [scene explorer](https://research.taylorgeospatial.org/s2-stac-geoparquet/)
 reads all three this way with [hyparquet](https://github.com/hyparam/hyparquet),
 a small pure-JS parquet reader, in the page: whole-file fetches for the
 small products, footer-pruned range reads for the big one. No server or

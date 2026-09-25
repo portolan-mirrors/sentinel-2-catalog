@@ -67,8 +67,8 @@ from s2_build import (  # noqa: E402
 from s2_collections import CollectionConfig  # noqa: E402
 
 S3 = "s3://us-west-2.opendata.source.coop/portolan-mirrors/sentinel-2-catalog"
-REPO = "https://github.com/portolan-mirrors/sentinel-2-catalog"
-APP = "https://portolan-mirrors.github.io/sentinel-2-catalog/"
+REPO = "https://github.com/taylor-geospatial/s2-stac-geoparquet"
+APP = "https://research.taylorgeospatial.org/s2-stac-geoparquet/"
 
 EARTH_SEARCH = "https://earth-search.aws.element84.com/v1"
 EARTH_SEARCH_PAGE = "https://element84.com/earth-search/"
