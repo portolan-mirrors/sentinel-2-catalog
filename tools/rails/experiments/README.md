@@ -1,11 +1,44 @@
-# Layout experiments (placeholder)
+# Layout experiments
 
-Nothing here runs yet. This directory is reserved for the row-group and
-partition experiments the
-[Collection 1 design](../../../docs/superpowers/specs/2026-09-21-sentinel-2-c1-design.md)
-defers until after the backfill. Each experiment is one sbatch script
-beside this file, and its result is a section of
-[`docs/query-performance.md`](../../../docs/query-performance.md).
+## Done: search-request shape — parallelism, one-request metadata, V7
+
+The follow-on that found the lever the layout sweep only pointed at: Chrome
+serialises concurrent range GETs that share a URL behind its HTTP cache lock,
+and `cache: "no-store"` removes the stall without giving each read its own CDN
+cache key. Results, and the V7 verdict, in the same document's sections A–C:
+[`docs/c1-layout-experiments.md`](../../../docs/c1-layout-experiments.md).
+
+| file | what it does |
+|---|---|
+| `parallel_probe.py` | the four ways to issue a search's concurrent ranges, timed in Chrome against one real part: as issued, `no-store`, coalesced into one range, distinct URLs |
+| `measure_search.py` | the sweep that compares *clients* — git HEAD's `search.js` against the working tree's — over the same objects, with and without a sidecar, on the published layout and on V7 |
+| `search_harness.html` | the page it serves; imports whichever client the cell names and counts every request |
+| `ground_truth.py` | the rows a search must return, from DuckDB over the same part: the only check available for an arm whose baseline cannot finish |
+| `check_app.py` | the gate: the real `apps/explorer/index.html` headless, both collections, committed client against candidate, both against DuckDB |
+| `v7_parts_local.py` | the few V7 grid-zone parts a measurement reads, built from the laptop off the published year part (the fallback for a RAILS job that did not land) |
+
+## Done: the Collection 1 item-part layout sweep
+
+Eight partitionings and three row-group sizes of a Collection 1 year, built
+here and measured against the shipped explorer client over the live bucket.
+Results and recommendation:
+[`docs/c1-layout-experiments.md`](../../../docs/c1-layout-experiments.md).
+
+| file | what it does |
+|---|---|
+| `layout_parts.py` | the variants as part lists, and how a client prunes to a part |
+| `build_layout.py` | one variant from one published year: DuckDB split, `gpio sort column`, `gpio check all`, `layout.json` |
+| `build_layout.sbatch` | one variant per Slurm job, then upload to `_experiments/layout/` |
+| `layout_table.py` | the `layout.json` manifests as the document's layout table |
+| `measure_layout.py` | the measurement: a local server plus `chrome-headless-shell`, driving `apps/explorer/search.js` unchanged |
+| `harness.html` | the page it serves; imports the shipped module and counts every request |
+| `coalesce_probe.py` | what the per-search request count costs, and what coalescing or distinct URLs would save |
+| `fold_cost.sh` | one part's write: wall time and peak RSS at a runner-sized memory budget |
+| `clean_experiments.py` | delete the `_experiments/` prefix when the numbers are recorded |
+
+Covered by that sweep, from the list below: (1) row-group size on 2018, and
+(5) partition tiers. Row-group *mode* (2), `assets` statistics (3) and gpio
+against DuckDB `COPY` (4) are still open.
 
 ## Planned
 

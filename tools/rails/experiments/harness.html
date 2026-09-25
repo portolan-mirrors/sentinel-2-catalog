@@ -1,0 +1,122 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>C1 layout measurement</title>
+<pre id="log">starting…</pre>
+<script type="module">
+// The measurement page of docs/c1-layout-experiments.md.
+//
+// It imports apps/explorer/search.js UNCHANGED and calls sceneSearch() exactly
+// as apps/explorer/app.js does, so what is measured is the shipped client over
+// the real network. Everything this page adds sits outside that module:
+//
+//  * a counting wrapper around globalThis.fetch, installed BEFORE search.js is
+//    imported, which records every request the search makes to the bucket --
+//    url, Range header, status, Content-Length and the start/end instants. The
+//    bucket answers with `access-control-expose-headers: *`, so Content-Length
+//    is readable cross-origin (`performance.getEntriesByType("resource")` is
+//    not usable for bytes here: the bucket sends no Timing-Allow-Origin, so
+//    transferSize comes back 0).
+//  * a per-run cache-busting query parameter on bucket URLs. S3 ignores an
+//    unknown query parameter and Cloudflare reports `cf-cache-status: DYNAMIC`
+//    for this prefix either way, so the same object comes back over the same
+//    path -- but Chrome's own disk cache cannot serve a repeat, which is what
+//    makes every "cold" run actually cold and the "warm" run measure a client
+//    whose part metadata is resolved rather than one reading its own cache.
+//
+// One page load is one (variant, tile, shape, repetition) cell: the module
+// registry starts empty, so search.js's metadata cache starts empty, which is
+// the definition of cold here. The page then asks the harness server for the
+// next cell and navigates to it, so the server drives the whole sweep and no
+// CDP client is needed.
+const log = document.getElementById("log");
+const say = (m) => { log.textContent += `\n${m}`; };
+
+const BUCKET = "data.source.coop";
+let token = "cold";
+let counting = false;
+let requests = [];
+const realFetch = globalThis.fetch.bind(globalThis);
+
+globalThis.fetch = async (input, init) => {
+  let url = typeof input === "string" ? input : input.url;
+  const ours = url.includes(BUCKET);
+  if (ours) url += (url.includes("?") ? "&" : "?") + "hz=" + token;
+  const t0 = performance.now();
+  let res, err = null;
+  try {
+    res = await realFetch(url, init);
+  } catch (e) {
+    err = String(e);
+    throw e;
+  } finally {
+    if (counting && ours) {
+      const rec = {
+        url: url.split(BUCKET)[1],
+        range: init?.headers?.Range ?? null,
+        status: err ? 0 : res.status,
+        bytes: err ? 0 : Number(res.headers.get("content-length") ?? 0),
+        encoding: err ? null : res.headers.get("content-encoding"),
+        t0: +t0.toFixed(1), t1: +performance.now().toFixed(1),
+        error: err,
+      };
+      // A compressed response (the sidecar arrives zstd-encoded) carries no
+      // Content-Length, so its size is filled in from a clone afterwards --
+      // decoded bytes, flagged as such, and never awaited, so the search's
+      // own timing is untouched. The compressed size on the wire is measured
+      // separately, once, with curl; see the document.
+      if (!err && !rec.bytes) {
+        rec.decoded = true;
+        res.clone().arrayBuffer().then((b) => { rec.bytes = b.byteLength; },
+                                      () => {});
+      }
+      requests.push(rec);
+    }
+  }
+  return res;
+};
+
+const { sceneSearch } = await import("/apps/explorer/search.js");
+
+const assign = await realFetch("/assign").then((r) => r.json());
+if (assign.done) {
+  say("plan complete");
+  document.title = "HARNESS-DONE";
+} else {
+  const { run } = assign;
+  say(`${run.variant} ${run.tile} ${run.shape} rep ${run.rep} `
+      + `(${run.index + 1}/${run.total})`);
+  const result = { ...run, cold: null, warm: null, error: null };
+  try {
+    for (const phase of ["cold", "warm"]) {
+      // A distinct token per phase: the warm search re-fetches its column
+      // chunks over the wire, so "warm" is "metadata already resolved", not
+      // "answered out of the browser cache".
+      token = `${run.index}-${phase}`;
+      requests = [];
+      counting = true;
+      const t0 = performance.now();
+      const out = await sceneSearch(run.args);
+      const ms = performance.now() - t0;
+      counting = false;
+      result[phase] = {
+        ms: +ms.toFixed(1),
+        rows: out.rows.length,
+        ids: out.rows.map((r) => r.id),
+        plan: out.plan,
+        requests,
+      };
+      say(`  ${phase}: ${ms.toFixed(0)} ms, ${requests.length} req, `
+          + `${(requests.reduce((a, r) => a + r.bytes, 0) / 1024).toFixed(0)} KiB, `
+          + `${out.rows.length} rows`);
+    }
+  } catch (e) {
+    result.error = `${e}\n${e.stack ?? ""}`;
+    say(`  ERROR ${e}`);
+  }
+  await realFetch("/report", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(result),
+  });
+  location.replace(`/run?i=${run.index + 1}`);
+}
+</script>

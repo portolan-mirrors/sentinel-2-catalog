@@ -57,7 +57,10 @@ export const BASE = new URLSearchParams(location.search).get("base")
 
 // The collections this page can show and what differs between them; the
 // rest — the stats products, the scene query, the COG reads — is the same
-// shape under another directory. `parts(year, tile)` are the file stems
+// shape under another directory. `sidecars` says whether the collection
+// publishes a <stem>.idx.json beside every part; false lets search.js skip
+// the 404 probe that would otherwise precede every footer read.
+// `parts(year, tile)` are the file stems
 // that may hold a tile's scenes in that year, each HEAD-probed before it is
 // read (partExists): the first collection is the one zone part of the
 // year's tier plus live.parquet for the current year; Collection 1 is one
@@ -76,6 +79,10 @@ export const COLLECTIONS = {
   "sentinel-2-l2a": {
     label: "Sentinel-2 L2A (Earth Search)", title: "Sentinel-2 L2A", since: 2016,
     dir: "sentinel-2-l2a", statsDir: "stats", tileColumn: "s2:mgrs_tile",
+    // No part of this collection has ever had a sidecar: only Collection 1's
+    // items.parquet gets one (tools/rails/fold_live.sbatch). Saying so saves
+    // every first search on a part the 404 probe it would otherwise pay.
+    sidecars: false,
     parts: (year, tile) => {
       const archive = archivePartFor(tile, year);
       return [...(archive ? [archive] : []), ...(year === CURRENT_YEAR ? ["live"] : [])];
@@ -87,6 +94,8 @@ export const COLLECTIONS = {
     label: "Sentinel-2 Collection 1 (Earth Search)", title: "Sentinel-2 Collection 1 L2A",
     since: 2015,
     dir: "sentinel-2-c1-l2a", statsDir: "stats-c1", tileColumn: "_tile",
+    // items.parquet publishes one; live.parquet does not, and pays the probe.
+    sidecars: true,
     parts: () => ["items", "live"],
     // The parts hold every tile, so they can warm before any tile is picked.
     prefetchParts: true,
@@ -637,8 +646,12 @@ export async function timelineFor(tile) {
   try {
     if (tile) say(`Reading tile ${tile}'s history…`);
     if (tile) {
+      // No stats product publishes a sidecar (only a year's items.parquet
+      // gets one, in fold_live.sbatch), so telling search.js so saves the
+      // 404 probe this read would otherwise pay before its footer.
       const raw = await keyedRows({ url: STATS, keyColumn: "mgrs_tile",
-        key: tile, columns: ["year", "month", "scene_count", "min_cloud_cover"] });
+        key: tile, columns: ["year", "month", "scene_count", "min_cloud_cover"],
+        sidecars: false });
       const byMonth = new Map();
       for (const r of raw) {
         const k = Number(r.year) * 100 + Number(r.month);
@@ -804,7 +817,7 @@ function warmWindowParts() {
   if (!d0 || !d1) return;
   for (let y = Number(d0.slice(0, 4)); y <= Number(d1.slice(0, 4)); y++) {
     for (const url of partUrlsFor(y, "")) {
-      partExists(url).then((ok) => { if (ok) warmPart(url); });
+      partExists(url).then((ok) => { if (ok) warmPart(url, COL.sidecars !== false); });
     }
   }
 }
@@ -1696,7 +1709,8 @@ async function runQuery() {
     say(`Range-reading ${urls.length} parquet part`
       + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
     const { rows, plan } = await sceneSearch({ urls, tileColumn: COL.tileColumn,
-      tile: selectedTile, d0, d1, cc, cov: minCoverage });
+      tile: selectedTile, d0, d1, cc, cov: minCoverage,
+      sidecars: COL.sidecars !== false });
     if (seq !== searchSeq) return;
     $("sql").textContent = plan;
     box.replaceChildren();
