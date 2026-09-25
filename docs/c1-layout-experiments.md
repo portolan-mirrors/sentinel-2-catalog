@@ -37,6 +37,10 @@ sidecar, and can any of them beat today's sidecar-assisted single-file year?*
    change in `rangeGet`, worth 1.6 s per search, against the 0.6 s the whole
    layout question spans. With that fix in place, bytes are all that is left to
    optimise, and V7 is the layout with the fewest.
+   *(Part two below settles this: `cache: "no-store"` buys the same 4–5× with
+   no extra CDN cache key, and it is what shipped. Points 2 and 5 of this
+   summary are superseded there — with the client fixed, V7 without a sidecar
+   is 2.4–2.8× faster than today's published layout with one.)*
 
 ## Method
 
@@ -421,7 +425,10 @@ And the whole-variant jobs, from `sacct` (2018 unless noted):
   decodes the table), which is exactly why the per-part row count is the number
   that decides whether a runner can do it.
 
-## Recommendation
+## Recommendation (superseded by sections A–C below)
+
+The recommendation as it stood before the request-shape experiment. Section C
+overturns its point 2: with the client fixed, V7 *does* beat the sidecar.
 
 **Do the client fix first, and do not rebuild for latency.**
 
@@ -516,3 +523,373 @@ Five things cost time here and none of them is obvious:
   started at once, and none of them needs more. Only the whole-year single-part
   variants (V1, V2) need a big-memory profile, for the reason the fold table
   gives.
+
+---
+
+# Part two: the request shape, and V7 with the client fixed
+
+Measured 2026-09-25, same laptop, same bucket, the question of
+[the follow-on brief](c1-search-speed-brief.md): the sweep above concluded that
+no sidecar-free layout can beat the sidecar *because the footer path spends
+three sequential metadata round trips*. That premise was not fixed. With it
+removed, the conclusion reverses.
+
+`tools/rails/experiments/measure_search.py` runs the sweep this part needs.
+Where `measure_layout.py` compares layouts with one client, this compares
+**clients** — the file at git HEAD against the working tree's — over the same
+objects, in one interleaved sweep, with the same harness, the same three tiles,
+the same four shapes and the same cache-busting discipline. `search_harness.html`
+imports whichever module the cell names (`/apps/explorer/search.js`, or
+`/baseline/search.js` served straight from the committed blob), so "before" is
+literally the committed file.
+
+## Summary of part two
+
+1. **`cache: "no-store"` is the fix, not a distinct URL.** Chrome serialises
+   concurrent range GETs that share a URL behind its HTTP cache lock.
+   `cache: "no-store"` takes the request out of the cache entirely and the
+   eight reads of one row group go from 2,423 ms to **472 ms** — statistically
+   the same as the 462 ms a distinct URL per read buys, without making each
+   read its own CDN cache key. It is a one-word change and it is now shipped.
+2. **It is worth 1.2–1.3 s of every search on the layout published today**:
+   cold 2,871 → 1,703 ms, warm **2,121 → 829 ms** (2.6×), sidecar and all.
+3. **It fixes a search that was failing outright.** On the *other* collection
+   (`sentinel-2-l2a`, whose octant parts admit 34 of 118 row groups for one
+   tile, so a search is 272 chunk reads of one object) the committed client
+   throws `TypeError: Failed to fetch` on all three tiles — Chrome gives up on
+   requests queued too long behind the cache lock. The candidate completes and
+   returns exactly DuckDB's rows. The same failure appeared twice in 60
+   `foot-old` cells on Collection 1's own footer path.
+4. **One speculative tail read replaces two metadata round trips**, and a
+   collection that says it publishes no sidecar skips the 404 probe: on V7 the
+   metadata phase goes **3 requests / 830 ms → 1 request / 276–298 ms**.
+5. **V7 + A + B beats today's sidecar, by 2.4–2.8× cold and 3.1–6.6× warm.**
+   V7 with no sidecar: **1,018–1,222 ms cold, 316–681 ms warm, 122 KiB**.
+   Today, published: 2,713–3,060 ms cold, 2,090–2,121 ms warm, 248 KiB.
+6. **The sidecar can be dropped — on V7, not on the year file.** What the
+   sidecar buys is now one request against one, so all it buys is bytes and
+   parse: 84 KiB of JSON against a 6.7 MB footer. Against a 48 KB footer there
+   is nothing left to buy.
+
+## A. How to issue the concurrent range reads
+
+`parallel_probe.py` reads a part's footer over HTTPS, admits the row groups
+whose tile statistics cannot exclude the tile, and replays exactly the
+(column, group) chunk ranges `search.js` would fetch — five ways, interleaved,
+five repetitions, in the same headless Chrome:
+
+| part (admitted reads, bytes) | as issued<br>N ranges, 1 URL | **`no-store`**<br>N ranges, 1 URL | coalesced<br>1 range, 1 URL | coalesced<br>+ `no-store` | *distinct URLs*<br>*(reference)* |
+|---|---|---|---|---|---|
+| C1 2024 `items` (8 GET, 158 KiB) | 2,423 ms | **472 ms** | 792 ms | 815 ms | *462 ms* |
+| C1 2018 `items` (8 GET, 190 KiB) | 2,094 ms | **396 ms** | 782 ms | 779 ms | *406 ms* |
+| C1 2024 V7 `t=31U` (8 GET, 59 KiB) | 2,622 ms | **806 ms** | 1,295 ms | 1,379 ms | *821 ms* |
+| L2A 2024 `z21-31` (238 GET, 7.3 MB) | 38,084 ms | **3,308 ms** | 10,367 ms | 9,761 ms | *5,806 ms* |
+
+Medians of five. The coalesced column is one GET spanning `min(off)` to
+`max(off + len)` of the same reads, sliced in memory.
+
+**`cache: "no-store"` wins, and it is the candidate that costs nothing.**
+
+* It **matches the distinct-URL reference** on every part (472/462, 396/406,
+  806/821) and *beats* it on the 238-read L2A case (3,308 against 5,806),
+  because 238 distinct query strings are 238 separate CDN cache keys and 238
+  origin fetches. That is the cost the brief said to discount; here it is
+  measurable rather than hypothetical.
+* It sends **no extra request header** (unlike `reload` or `no-cache`, which add
+  `Cache-Control`), so the object, the range, the bytes and the edge cache entry
+  are exactly what they were. The only thing it gives up is the browser's own
+  disk cache for that response — which was buying nothing, because consecutive
+  searches read different ranges and the metadata is already cached in the
+  module for the session.
+* **Coalescing is the worse fix and it is expensive.** The eight search columns
+  of one row group are spread across that group's whole byte range in a
+  63-column file, so one spanning read costs **+4,554 %** bytes on the published
+  layout (158 KiB → 7.37 MB), **+4,171 %** on V7 (59 KiB → 2.52 MB) and
+  **+2,558 %** on L2A (7.3 MB → 194 MB). It is 1.6–3.1× slower than `no-store`
+  and adding `no-store` to it does not help. Rejected.
+
+The mechanism is Chrome's cache lock: only one in-flight request per cache entry
+may write it, so the others wait, ~260 ms apiece, and one that waits too long
+fails. That is why the fix is not "fewer requests" and not "different URLs" but
+"do not involve the cache".
+
+## B. One-request metadata
+
+Two changes to the footer path, both in `partMeta`:
+
+* **One speculative suffix read of 64 KiB** instead of an 8-byte tail read for
+  the footer's length followed by the footer itself. The speculative read's
+  Content-Range still names the file size, its last 8 bytes still name the
+  footer length, and the footer is normally already inside the buffer. A footer
+  that does not fit costs exactly the second request the old path always paid.
+* **`sidecars: false` from the caller** drops the 404 probe. `app.js` now says
+  it per collection, and the truth was worth stating: `sentinel-2-l2a` has never
+  published a sidecar for any part, and no stats product has one — only a
+  Collection 1 year's `items.parquet` gets one, in `fold_live.sbatch`. So the
+  probe was pure loss on the other collection and on every tile-timeline read.
+
+The metadata phase, isolated (the warm phase is exactly the chunk GETs, so the
+cold phase's leading requests are the metadata phase), medians over 15 runs:
+
+| arm | metadata requests | bytes | wall ms | footer parse ms |
+|---|---|---|---|---|
+| published + sidecar, either client | 1 | 84 KiB | 247–272 | 13–656 |
+| published, footer, committed client | 3 | 6,710 KiB | 754–872 | 701–1,217 |
+| published, footer, candidate | 3 | 6,774 KiB | 786–886 | 546–1,207 |
+| published, footer, candidate, `sidecars: false` | **2** | 6,774 KiB | **566–664** | 582–1,266 |
+| V7, footer, committed client | 3 | 40 KiB | 762–909 | 2–3 |
+| V7, footer, candidate | 2 | 64 KiB | 540–574 | 6–147 |
+| **V7, footer, candidate, `sidecars: false`** | **1** | **64 KiB** | **276–298** | **6–9** |
+
+Read the two halves separately:
+
+* **On V7 the speculative read does its job.** A 48 KB footer fits in 64 KiB, so
+  the tail read *is* the footer read: three requests become two, and dropping the
+  probe makes it one. 830 ms → 540 ms → **287 ms**, for +24 KiB that were going
+  to be fetched anyway. This is the gap the first sweep said no layout could
+  close, closed.
+* **On the year file it cannot.** A 6.7 MB footer does not fit in 64 KiB, so the
+  candidate still makes two reads and the probe is the only request available to
+  drop: 3 → 2, ~800 ms → ~600 ms. Raising `TAIL_BYTES` to 8 MB would buy the
+  third request at the cost of fetching 8 MB for every part; 64 KiB is the size
+  that is free when the footer is small and harmless when it is not.
+* **The footer's own parse is the other half of why the year file loses**:
+  0.7–1.2 s of main-thread thrift for 6.7 MB against 2–9 ms for 48 KB. (In one
+  earlier sweep, with another job holding four of this laptop's twelve cores,
+  the same parse measured 12–15 s. The number is load-sensitive; its sign is
+  not.)
+
+## C. Does V7 + A + B beat the sidecar?
+
+2024 only, three tiles, four shapes, five repetitions, eight arms interleaved
+cell by cell: 479 cells, 4 errors (two CDN 520s, and two `foot-old` cache-lock
+failures). Every arm that completed returned **exactly DuckDB's rows** for its
+cell — `ground_truth.py` checks each against `read_parquet` over the same object
+— and no two arms disagreed either.
+
+V7 here is three real grid-zone parts in the bucket
+(`_experiments/layout/2024/V7/t={31U,33U,23K}.parquet`: 8,038–8,500 rows, 4–5
+groups of 2,000, zstd 18, sorted `_tile,datetime`, footers 39–48 KB). The RAILS
+job that was to build all 1,011 spent its whole wall limit without reaching its
+upload step, so `v7_parts_local.py` built the three the sweep reads directly off
+the published year part — DuckDB rather than `gpio`, which changes the
+GeoParquet metadata block and nothing a reader measures. The whole-year V7 facts
+(1,011 objects, 5.49 GB, +1.1 %, fold cost) stand on part one's full RAILS
+build.
+
+RTT to the bucket: **before** median 0.507 s (0.388–0.992), **after** 0.947 s
+(0.373–6.314). The path had a bad half-hour in the middle — Cloudflare 520s and
+a 6 s outlier — which is why the spreads are wide; arms are interleaved cell by
+cell, so it lands on all of them equally, and the reps-3–5 subset (288 cells,
+quiet path) gives the same ordering with medians within 10 %.
+
+**Cold** (fresh page) — median ms / requests / KiB, 15 runs per cell
+
+| arm | 1 month | 3 months | whole year | 3 months + cloud ≤ 20 |
+|---|---|---|---|---|
+| `prod` — published + sidecar, **committed client (today)** | 2,871 / 9 / 248 | 3,060 / 9 / 248 | 2,928 / 9 / 248 | 2,713 / 9 / 248 |
+| `prod-AB` — published + sidecar, candidate | 1,703 / 9 / 248 | 1,051 / 9 / 248 | 1,825 / 9 / 248 | 1,119 / 9 / 248 |
+| `foot-old` — published, no sidecar, committed | 4,197 / 11 / 6,875 | 3,702 / 11 / 6,875 | 4,242 / 11 / 6,875 | 4,148 / 11 / 6,875 |
+| `foot-AB` — published, no sidecar, candidate | 3,056 / 11 / 6,939 | 3,215 / 11 / 6,939 | 2,412 / 11 / 6,939 | 4,212 / 11 / 6,939 |
+| `foot-AB-nosc` — published, `sidecars: false` | 2,279 / 10 / 6,939 | 1,913 / 10 / 6,939 | 2,349 / 10 / 6,939 | 2,188 / 10 / 6,939 |
+| `v7-old` — V7, no sidecar, committed | 3,091 / 11 / 98 | 3,635 / 11 / 98 | 2,966 / 11 / 98 | 2,934 / 11 / 98 |
+| `v7-AB` — V7, candidate, probe kept | 1,308 / 10 / 122 | 1,575 / 10 / 122 | 1,572 / 10 / 122 | 1,346 / 10 / 122 |
+| **`v7-AB-nosc` — V7, candidate, `sidecars: false`** | **1,048** / 9 / **122** | **1,222** / 9 / **122** | **1,045** / 9 / **122** | **1,018** / 9 / **122** |
+
+**Warm** (second identical search, metadata resolved)
+
+| arm | 1 month | 3 months | whole year | 3 months + cloud ≤ 20 |
+|---|---|---|---|---|
+| `prod` (today) | 2,121 / 8 / 164 | 2,095 / 8 / 164 | 2,108 / 8 / 164 | 2,090 / 8 / 164 |
+| `prod-AB` | 829 / 8 / 164 | 844 / 8 / 164 | 924 / 8 / 164 | 337 / 8 / 164 |
+| `foot-old` | 2,098 / 8 / 164 | 2,512 / 8 / 164 | 2,410 / 8 / 164 | 2,320 / 8 / 164 |
+| `foot-AB` | 749 / 8 / 164 | 793 / 8 / 164 | 841 / 8 / 164 | 784 / 8 / 164 |
+| `foot-AB-nosc` | 921 / 8 / 164 | 949 / 8 / 164 | 720 / 8 / 164 | 858 / 8 / 164 |
+| `v7-old` | 2,209 / 8 / 58 | 2,446 / 8 / 58 | 2,458 / 8 / 58 | 3,462 / 8 / 58 |
+| `v7-AB` | 767 / 8 / 58 | 737 / 8 / 58 | 721 / 8 / 58 | 747 / 8 / 58 |
+| **`v7-AB-nosc`** | **681** / 8 / **58** | **316** / 8 / **58** | **666** / 8 / **58** | **582** / 8 / **58** |
+
+**The answer is yes.** V7 with no sidecar and the fixed client is the fastest
+arm in every column, cold and warm: 1,018–1,222 ms against today's 2,713–3,060
+(**2.4–2.8×**) and 316–681 ms warm against 2,090–2,121 (**3.1–6.6×**). It also
+beats the sidecar arm *with the same client fix* (`prod-AB`, 1,051–1,825 ms
+cold) in three of four shapes and ties the fourth, because it is now one
+metadata request against one and the only difference left is bytes: 122 KiB
+against 248, a 48 KB footer against an 84 KiB sidecar whose JSON costs 0.2–0.7 s
+to revive.
+
+Three readings worth keeping:
+
+* **The client fix is worth more than the layout, and the layout is still worth
+  having.** `prod` → `prod-AB` is −1.2 s cold and −1.3 s warm on the layout
+  published today, with no rebuild. `prod-AB` → `v7-AB-nosc` is a further
+  −0.1 to −0.8 s cold, −0.2 to −0.5 s warm, and −126 KiB.
+* **The committed client is nearly insensitive to layout, which is the tell.**
+  `prod`, `foot-old` and `v7-old` all sit at 2.1–2.5 s warm whether they read
+  58 KiB or 164 KiB, because the eight reads are serialised and the wall time is
+  eight lock waits. With `no-store` the arms separate by bytes, as they should:
+  58 KiB (V7) beats 164 KiB (year file).
+* **`foot-AB-nosc` is the one arm that barely improves** — 1,913–2,349 ms cold —
+  and it is exactly the sidecar-free year file: 6.9 MB of metadata and a second
+  of parse that no request-shaping can remove. Dropping the sidecar is a layout
+  decision, not a client one.
+
+## The gate: the real page, both collections
+
+`check_app.py` loads `apps/explorer/index.html` itself in headless Chrome
+(SwiftShader, because maplibre needs a WebGL context), in two served variants
+that differ only in `search.js` — the working tree's against the committed blob
+— waits for the page's own MGRS hit index, fires the map click a user's mouse
+fires, and reads the ids off the rendered result cards. Both variants are also
+checked against `ground_truth.py`'s DuckDB answer, which is what makes a case
+checkable even where one client cannot finish it.
+
+Collection 1 is searched in 2024 (one tile-major file per year).
+`sentinel-2-l2a` is searched in **2016**, whose year is a single 4.4 MB file:
+its post-2021 years are zone octants whose `s2:mgrs_tile` statistics overlap
+across nearly every row group — 43 to 70 of 70 admitted for one tile, 300–490
+range reads, 14 MB — so a search there takes minutes in the page with *either*
+client and is no use as a gate. 2016 exercises exactly the same client path.
+
+| collection | year | tile | candidate | matches DuckDB | committed client | wall (committed → candidate) |
+|---|---|---|---|---|---|---|
+| `sentinel-2-c1-l2a` | 2024 | 31UFT | 12 rows | yes | the same 12 rows | 10.5 s → 10.5 s |
+| `sentinel-2-c1-l2a` | 2024 | 23KMR | 6 rows | yes | the same 6 rows | 9.4 s → 9.7 s |
+| `sentinel-2-l2a` | 2016 | 33VVF | 13 rows | yes | the same 13 rows | 10.9 s → **6.1 s** |
+| `sentinel-2-l2a` | 2016 | 34UCC | 12 rows | yes | the same 12 rows | 10.9 s → **6.9 s** |
+
+All four pass: identical ids on both collections under both clients, and both
+equal to DuckDB's. (The wall times here include the whole page — map, stats,
+timeline, PMTiles — so they are not the per-search numbers of section C; the
+L2A pair is where the page's own work is smallest and the search's share shows.)
+
+**Where the committed client cannot finish at all** is the same collection's
+2024 octant parts, and that is measured in the direct-client sweep rather than
+the page, because the page cannot do it either way. `measure_search.py`'s
+`l2a-old` arm — the committed client, `sentinel-2-l2a/year=2024/z21-31.parquet`,
+272 chunk reads of one 208 MB object — throws `TypeError: Failed to fetch` on
+**all three tiles**, with only its two metadata reads completed. The `l2a-AB`
+arm, the candidate, completes and returns exactly DuckDB's rows. The same
+failure appeared twice in 60 `foot-old` cells on Collection 1's own footer path.
+Chrome gives up on requests queued too long behind the cache lock, and that is
+what `no-store` removes.
+
+## Recommendation, part two
+
+1. **Ship the `search.js` change** (done in this commit): `cache: "no-store"`
+   on every range read, one speculative 64 KiB tail read on the footer path, and
+   a `sidecars` flag the caller sets per collection. Measured **−1.2 s cold and
+   −1.3 s warm on the layout published today**, 2.6× on the warm phase, at zero
+   cost in bytes, objects, CDN load or build time; and it turns a
+   `sentinel-2-l2a` search on a 2024 octant part from a thrown `TypeError`
+   into exactly DuckDB's rows.
+   Nothing else in either part of this document is close.
+2. **The sidecar can be dropped, but only on a small-footer layout.** On V7 it
+   is now worth nothing — one request against one, 84 KiB of JSON against a
+   48 KB footer — and V7 without it is the fastest arm measured. On the year
+   file published today it is still worth 0.9–1.3 s cold, because 6.7 MB of
+   footer and a second of thrift parse are not a request-shaping problem.
+   **Keep publishing it for as long as Collection 1 is one file per year.**
+3. **Repartition Collection 1 to V7 if the fold matters; it now pays for the
+   search too.** The read win over today, with the fixed client on both sides,
+   is **1.7–2.0 s cold and 1.4–1.8 s warm** per search, and 126 KiB fewer bytes.
+   The costs are unchanged from part one: **+1.1–1.6 % bytes**, **~9,500 objects
+   for 2015–2026** against 12, ~380–765 gpio core-minutes per year to build, and
+   a client change in `COLLECTIONS[…].parts(year, tile)` to compute one regex.
+   What it buys beyond latency is the thing today's layout cannot do at all: a
+   **6-second, 1.3 GB fold unit** a GitHub runner runs, against the 83–85 GB a
+   whole-year part peaks at — which would end the RAILS dependency for routine
+   operation. Dropping the sidecar at the same time takes
+   `make_search_sidecar.mjs` out of the fold entirely.
+4. **Do not coalesce ranges**, and do not give each read its own URL. Measured
+   worse than `no-store` on every part, and the second shifts load to the origin.
+5. **Look at `sentinel-2-l2a` next.** Its parts are the worst case for this
+   client — 272 reads, 7.3 MB, 34 admitted groups for one tile — and it is the
+   collection where the layout question is now urgent rather than optional.
+
+## Reproducing part two
+
+```bash
+# A: the four ways to issue the concurrent ranges, one real part at a time
+python3 tools/rails/experiments/parallel_probe.py --reps 5 \
+  --url https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=2024/items.parquet
+
+# the three V7 parts the sweep reads (the RAILS build is build_layout.sbatch)
+python3 tools/rails/experiments/v7_parts_local.py --year 2024 \
+  --prefixes 31U,33U,23K --out /tmp/v7 --upload
+
+# B and C: the client-against-client sweep
+python3 tools/rails/experiments/measure_search.py --year 2024 --reps 5 \
+  --out /tmp/search-2024.jsonl
+python3 tools/rails/experiments/measure_search.py --year 2024 --out /dev/null \
+  --summarise /tmp/search-2024.jsonl
+python3 tools/rails/experiments/ground_truth.py --jsonl /tmp/search-2024.jsonl
+
+# the gate: the real page, both collections, both clients, against DuckDB
+python3 tools/rails/experiments/check_app.py
+
+# afterwards
+AWS_PROFILE=source-coop python3 tools/rails/experiments/clean_experiments.py \
+  --prefix _experiments --yes
+```
+
+The bucket's `_experiments/` prefix was emptied once these numbers were
+recorded (3 objects, 0.03 GB), and every published path was re-checked
+afterwards. **One thing is still outstanding**: the RAILS scratch of the job
+that did not land. Its `ControlMaster` session expired mid-task and re-opening
+it needs an interactive Duo prompt, so whoever next has a session there should
+remove what Slurm job `194221` left on `/u`:
+
+```bash
+ssh rails 'rm -rf /u/cholmes/s2-c1/layout && rm -f ~/s2-catalog/logs/s2c1-layout-194221.out'
+```
+
+Nothing published depends on it; it is a partial V7 2024 build plus its
+`.stage-V7`, `.gpio-V7` and `.duckdb-tmp-V7` working directories.
+
+## Notes for whoever runs this next
+
+* **`cache: "no-store"` is not `reload` and not a cache-busting query
+  parameter.** It is the only one of the three that changes neither the request
+  the CDN sees nor the cache key. If a future measurement shows the eight reads
+  serialising again, check that nothing has re-added a default-cache `fetch` to
+  the chunk path.
+* **`chrome-headless-shell --disable-gpu` cannot run the explorer.** maplibre
+  throws `Failed to initialize WebGL` inside the `Map` constructor, so the page
+  never builds and nothing downstream of it exists to drive. `--use-gl=angle
+  --use-angle=swiftshader --enable-unsafe-swiftshader` fixes it.
+* **One browser process cannot hold eight loads of this page.** deck.gl, a
+  multi-MB footer and a PMTiles index per load, and fetches start failing;
+  `check_app.py` launches a fresh browser per case.
+* **A measurement whose baseline can fail needs an external oracle.** Diffing
+  the candidate against the committed client proves nothing where the committed
+  client throws — which is exactly the case the change is worth most. That is
+  what `ground_truth.py` is for.
+* **Two harness bugs in `check_app.py` looked exactly like a regression**, and
+  both are worth knowing before writing another page driver:
+  * **Do not nudge the camera to hurry the hit index along.** `hitIndex` fills
+    from the MGRS tileset as deck.gl decodes it, `mgrs.pmtiles` holds one z0
+    tile, and the index keeps only the first zoom it sees — so a
+    `jumpTo({zoom: 5})` meant to bring the tile under the click into view races
+    the z0 request and can leave the index empty for good. Wait for
+    `hitIndex.polys.length > 0` instead.
+  * **`$("run").disabled` is not the signal that a click took.** The click
+    handler sets it false and `runQuery` sets it true again in its own first
+    synchronous statement, so a poller never sees the false; it keeps clicking
+    every 250 ms for the whole search and a dozen overlapping searches pile up.
+    The hint the handler writes (`Tile 31UFT.`) is the signal.
+
+  Both failed for the candidate and not the baseline, purely because the two
+  clients finish their requests at different moments, and neither had anything
+  to do with `search.js`. A driver that fails asymmetrically between two
+  variants is suspect until the asymmetry is explained.
+* **The RAILS job for this part did not land.** Submitted at
+  `--cpus-per-task=64 --mem=300g`, it waited 18 minutes for resources and then
+  spent its whole 2-hour wall limit without reaching the upload step. Part one's
+  note stands — ask for 16 cores and 2 hours, not 64 and 8 — and a measurement
+  that needs three parts should build three parts, not 1,011.
+* **`source-coop` credentials expire mid-task.** The `credential_process`
+  profile went stale (`source-coop login` is interactive); the static
+  `source-coop-uploader` profile in `~/.aws/credentials` still worked, against
+  `s3://us-west-2.opendata.source.coop/…` — note `source.coop`, not
+  `source-coop`, in that bucket name.

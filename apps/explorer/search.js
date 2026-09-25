@@ -9,6 +9,13 @@
 // parallel. On the tile-major C1 parts a search is one admitted group and
 // ~8 parallel GETs (~165 KiB), measured 1.1-1.6 s against the live bucket.
 //
+// Two things about *how* those requests are issued turned out to matter more
+// than the layout they read (docs/c1-layout-experiments.md, sections A and B):
+// every range read is `cache: "no-store"`, so Chrome does not serialise the
+// concurrent reads of one part behind its cache lock (2.1 s -> 0.4 s for the
+// same eight reads), and the footer path resolves in one speculative tail read
+// rather than an 8-byte length read followed by the footer.
+//
 // hyparquet decodes the chunks; hyparquet-compressors carries the zstd the
 // parts are written with. Both are small pure-JS ESM bundles, pinned like
 // the page's other CDN imports.
@@ -25,8 +32,19 @@ const SEARCH_COLUMNS = ["id", "datetime", "eo:cloud_cover",
 // no tile order) from queueing hundreds of streams at once.
 const MAX_IN_FLIGHT = 24;
 
+// Every range read is `cache: "no-store"`, and that is the single biggest
+// lever in this module (docs/c1-layout-experiments.md section A). Chrome
+// serialises concurrent requests for one URL behind its HTTP cache lock —
+// only one of them may write the entry — so the eight column-chunk reads a
+// search issues to one part arrive in a staircase, ~260 ms apiece, 2.1 s for
+// 160 KiB. `no-store` takes the request out of the cache entirely and the
+// same eight reads of the same object finish in 0.40-0.47 s, measured:
+// as good as giving each read its own URL, without making each read its own
+// CDN cache key. It sends no extra request header, so the object, the bytes
+// and the edge cache entry are exactly what they were.
 const rangeGet = async (url, start, len, expectSize) => {
-  const res = await fetch(url, { headers: { Range: `bytes=${start}-${start + len - 1}` } });
+  const res = await fetch(url, { cache: "no-store",
+    headers: { Range: `bytes=${start}-${start + len - 1}` } });
   // 200 means the server ignored the Range header; the whole part must never
   // be pulled to answer a search.
   if (res.status !== 206) throw new Error(`range read of ${url} got HTTP ${res.status}`);
@@ -88,26 +106,43 @@ async function sidecarMeta(url) {
     metadata, groups };
 }
 
-// One metadata fetch per part per session: the sidecar when the part has
-// one, else the footer. On the footer path the 8-byte tail names the footer
-// length, and its Content-Range names the file size; the footer follows as
-// one exact suffix read. ~2 sequential requests, then the parsed metadata
-// (and the file size) are cached for every later search.
+// How much of a part's tail to read speculatively on the footer path. The
+// 8-byte trailer at the very end names the footer's length, so reading only
+// those 8 bytes costs a second request for the footer itself — two sequential
+// round trips where one suffices. 64 KiB holds the trailer *and* the whole
+// footer of every partitioned part measured (13-88 KB), and a footer that
+// does not fit costs exactly the second request the old path always paid.
+const TAIL_BYTES = 64 * 1024;
+
+// One metadata fetch per part per session: the sidecar when the part has one,
+// else one speculative tail read (its Content-Range names the file size, its
+// last 8 bytes the footer length, and the footer is normally already inside
+// it). `sidecars: false` from the caller — a collection that publishes none —
+// drops the 404 probe, leaving a single request on the footer path too. The
+// parsed metadata and the file size are then cached for every later search.
 const metadataCache = new Map();
 const noSidecar = new Set();
-const partMeta = (url) => {
+const partMeta = (url, sidecars = true) => {
   if (!metadataCache.has(url)) {
+    if (!sidecars) noSidecar.add(url);
     metadataCache.set(url, (async () => {
       const sidecar = noSidecar.has(url) ? null
         : await sidecarMeta(url).catch(() => null);
       if (sidecar) return { ...sidecar, fromSidecar: true };
-      const tail = await fetch(url, { headers: { Range: "bytes=-8" } });
+      const tail = await fetch(url, { cache: "no-store",
+        headers: { Range: `bytes=-${TAIL_BYTES}` } });
+      // 200 means the server ignored the Range header, as in rangeGet.
       if (tail.status !== 206) throw new Error(`range read of ${url} got HTTP ${tail.status}`);
       const size = Number(tail.headers.get("content-range")?.split("/")[1]);
       const tailBuf = await tail.arrayBuffer();
-      if (!Number.isFinite(size) || tailBuf.byteLength !== 8) throw new Error(`no usable Content-Range from ${url}`);
-      const footerLen = new DataView(tailBuf).getUint32(0, true) + 8;
-      const footer = await rangeGet(url, size - footerLen, footerLen);
+      if (!Number.isFinite(size) || tailBuf.byteLength < 8) throw new Error(`no usable Content-Range from ${url}`);
+      const footerLen = new DataView(tailBuf).getUint32(tailBuf.byteLength - 8, true) + 8;
+      if (footerLen > size) throw new Error(`${url} names a ${footerLen}-byte footer in ${size} bytes`);
+      const footerOff = size - footerLen;
+      // A part smaller than TAIL_BYTES comes back whole, so this covers it.
+      const footer = footerLen <= tailBuf.byteLength
+        ? tailBuf.slice(tailBuf.byteLength - footerLen)
+        : await rangeGet(url, footerOff, footerLen);
       const metadata = parquetMetadata(footer);
       // Row offset and per-column chunk ranges per group, laid out once.
       let row = 0;
@@ -123,7 +158,7 @@ const partMeta = (url) => {
         row += Number(g.num_rows);
         return out;
       });
-      return { url, size, footerOff: size - footerLen, footer, metadata, groups };
+      return { url, size, footerOff, footer, metadata, groups };
     })());
     // A failed footer read must not poison the cache for the next click.
     metadataCache.get(url).catch(() => metadataCache.delete(url));
@@ -181,8 +216,8 @@ function regionBuffer(url, size, regions, tally, expectSize) {
 // A decode failure on sidecar-built metadata retries once on the footer
 // path, so a stale or malformed sidecar degrades to the slow path instead
 // of failing the search.
-async function searchPart(url, tileColumn, tile, tally) {
-  const meta = await partMeta(url);
+async function searchPart(url, tileColumn, tile, tally, sidecars) {
+  const meta = await partMeta(url, sidecars);
   try {
     return await searchPartWith(meta, url, tileColumn, tile, tally);
   } catch (err) {
@@ -227,10 +262,12 @@ async function searchPartWith(meta, url, tileColumn, tile, tally) {
 // LIMIT 30. Rows come back in the projection runQuery always handled
 // ({id, ts, cloud, thumbnail_url, bbox, baseline}), plus a `plan` the page
 // can print in place of the SQL.
-export async function sceneSearch({ urls, tileColumn, tile, d0, d1, cc, cov }) {
+export async function sceneSearch({ urls, tileColumn, tile, d0, d1, cc, cov,
+                                    sidecars = true }) {
   const tally = { parts: 0, groups: 0, gets: 0, bytes: 0, misses: 0 };
   const t0 = performance.now();
-  const raw = (await Promise.all(urls.map((u) => searchPart(u, tileColumn, tile, tally)))).flat();
+  const raw = (await Promise.all(
+    urls.map((u) => searchPart(u, tileColumn, tile, tally, sidecars)))).flat();
   const lo = new Date(`${d0}T00:00:00Z`);
   const hi = new Date(`${d1}T23:59:59.999Z`);
   const rows = raw
@@ -262,8 +299,8 @@ export async function sceneSearch({ urls, tileColumn, tile, d0, d1, cc, cov }) {
 // (sidecar or footer) in the background and swallow the failure — the
 // search itself will surface it. app.js calls this for the parts of the
 // window on screen, so the first click finds the metadata already cached.
-export function warmPart(url) {
-  partMeta(url).catch(() => {});
+export function warmPart(url, sidecars = true) {
+  partMeta(url, sidecars).catch(() => {});
 }
 
 // The stats reads share the machinery above, so the whole page runs on one
@@ -280,8 +317,9 @@ export function readTable(buf, columns) {
 // column's ranges, the named columns' chunks fetched in parallel, rows
 // filtered to the key. This is timelineFor's per-tile history read over
 // stats/mgrs-monthly.parquet, and it works for any key-sorted table.
-export async function keyedRows({ url, keyColumn, key, columns }) {
-  const meta = await partMeta(url);
+export async function keyedRows({ url, keyColumn, key, columns,
+                                 sidecars = true }) {
+  const meta = await partMeta(url, sidecars);
   const groups = admittedGroups(meta, keyColumn, key);
   if (!groups.length) return [];
   const wanted = [...new Set([keyColumn, ...columns])];

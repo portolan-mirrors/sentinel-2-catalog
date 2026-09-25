@@ -1,5 +1,22 @@
 # Layout experiments
 
+## Done: search-request shape — parallelism, one-request metadata, V7
+
+The follow-on that found the lever the layout sweep only pointed at: Chrome
+serialises concurrent range GETs that share a URL behind its HTTP cache lock,
+and `cache: "no-store"` removes the stall without giving each read its own CDN
+cache key. Results, and the V7 verdict, in the same document's sections A–C:
+[`docs/c1-layout-experiments.md`](../../../docs/c1-layout-experiments.md).
+
+| file | what it does |
+|---|---|
+| `parallel_probe.py` | the four ways to issue a search's concurrent ranges, timed in Chrome against one real part: as issued, `no-store`, coalesced into one range, distinct URLs |
+| `measure_search.py` | the sweep that compares *clients* — git HEAD's `search.js` against the working tree's — over the same objects, with and without a sidecar, on the published layout and on V7 |
+| `search_harness.html` | the page it serves; imports whichever client the cell names and counts every request |
+| `ground_truth.py` | the rows a search must return, from DuckDB over the same part: the only check available for an arm whose baseline cannot finish |
+| `check_app.py` | the gate: the real `apps/explorer/index.html` headless, both collections, committed client against candidate, both against DuckDB |
+| `v7_parts_local.py` | the few V7 grid-zone parts a measurement reads, built from the laptop off the published year part (the fallback for a RAILS job that did not land) |
+
 ## Done: the Collection 1 item-part layout sweep
 
 Eight partitionings and three row-group sizes of a Collection 1 year, built

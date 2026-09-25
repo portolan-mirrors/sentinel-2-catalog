@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>C1 search-speed measurement</title>
+<pre id="log">starting…</pre>
+<script type="module">
+// The measurement page of docs/c1-layout-experiments.md sections A-C
+// (measure_search.py). Same idea as harness.html, one arm wider: a cell names
+// WHICH client module to import, so the committed `search.js` and the working
+// tree's can be measured against each other in the same sweep, under the same
+// network weather.
+//
+//  * `run.client` is "/apps/explorer/search.js" (the candidate) or
+//    "/baseline/search.js" (git HEAD, served from a temp file). The module is
+//    imported dynamically, after the fetch wrapper is installed.
+//  * `run.blockSidecar` rewrites every `<stem>.idx.json` request to a key that
+//    is really absent, so the client gets a REAL 404 over the real path — the
+//    cost a collection that publishes no sidecar pays — without copying a
+//    5.4 GB part to a sidecar-free prefix.
+//  * `run.args.sidecars` is the new client's opt-out; the baseline ignores it.
+//
+// Everything else is harness.html's: a counting fetch wrapper installed before
+// the module loads, and a per-phase cache-busting query parameter (S3 ignores
+// an unknown parameter, so the same object comes back over the same path, but
+// Chrome's disk cache cannot serve a repeat).
+const log = document.getElementById("log");
+const say = (m) => { log.textContent += `\n${m}`; };
+
+const BUCKET = "data.source.coop";
+let token = "cold";
+let counting = false;
+let blockSidecar = false;
+let requests = [];
+const realFetch = globalThis.fetch.bind(globalThis);
+
+globalThis.fetch = async (input, init) => {
+  let url = typeof input === "string" ? input : input.url;
+  const ours = url.includes(BUCKET);
+  // A sidecar the client must not find: `.idx.json.absent` is a key the bucket
+  // really does not hold, so the 404 costs a real round trip on the real path.
+  if (ours && blockSidecar && url.endsWith(".idx.json")) url += ".absent";
+  if (ours) url += (url.includes("?") ? "&" : "?") + "hz=" + token;
+  const t0 = performance.now();
+  let res, err = null;
+  try {
+    res = await realFetch(url, init);
+  } catch (e) {
+    err = String(e);
+    throw e;
+  } finally {
+    if (counting && ours) {
+      const rec = {
+        url: url.split(BUCKET)[1],
+        range: init?.headers?.Range ?? null,
+        cache: init?.cache ?? null,
+        status: err ? 0 : res.status,
+        bytes: err ? 0 : Number(res.headers.get("content-length") ?? 0),
+        encoding: err ? null : res.headers.get("content-encoding"),
+        t0: +t0.toFixed(1), t1: +performance.now().toFixed(1),
+        error: err,
+      };
+      if (!err && !rec.bytes) {
+        rec.decoded = true;
+        res.clone().arrayBuffer().then((b) => { rec.bytes = b.byteLength; },
+                                      () => {});
+      }
+      requests.push(rec);
+    }
+  }
+  return res;
+};
+
+const assign = await realFetch("/assign").then((r) => r.json());
+if (assign.done) {
+  say("plan complete");
+  document.title = "HARNESS-DONE";
+} else {
+  const { run } = assign;
+  say(`${run.arm} ${run.tile} ${run.shape} rep ${run.rep} `
+      + `(${run.index + 1}/${run.total}) via ${run.client}`);
+  const result = { ...run, cold: null, warm: null, error: null };
+  try {
+    blockSidecar = !!run.blockSidecar;
+    const { sceneSearch } = await import(run.client);
+    for (const phase of ["cold", "warm"]) {
+      token = `${run.index}-${phase}`;
+      requests = [];
+      counting = true;
+      const t0 = performance.now();
+      const out = await sceneSearch(run.args);
+      const ms = performance.now() - t0;
+      counting = false;
+      result[phase] = {
+        ms: +ms.toFixed(1),
+        rows: out.rows.length,
+        ids: out.rows.map((r) => r.id),
+        plan: out.plan,
+        requests,
+      };
+      say(`  ${phase}: ${ms.toFixed(0)} ms, ${requests.length} req, `
+          + `${(requests.reduce((a, r) => a + r.bytes, 0) / 1024).toFixed(0)} KiB, `
+          + `${out.rows.length} rows`);
+    }
+  } catch (e) {
+    result.error = `${e}\n${e.stack ?? ""}`;
+    // A phase that threw still has its requests, and they are the evidence:
+    // the committed client fails a search on the other collection by having
+    // Chrome time out range reads queued behind its cache lock.
+    result.failed = { requests, count: requests.length,
+      statuses: requests.reduce((a, r) => ({ ...a, [r.status]: (a[r.status] ?? 0) + 1 }), {}) };
+    say(`  ERROR ${e} after ${requests.length} request(s)`);
+  }
+  await realFetch("/report", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(result),
+  });
+  location.replace(`/run?i=${run.index + 1}`);
+}
+</script>
