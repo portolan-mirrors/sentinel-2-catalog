@@ -57,7 +57,7 @@
         "processor",
         "host"
       ],
-      "url": "https://github.com/portolan-mirrors/sentinel-2-catalog"
+      "url": "https://github.com/taylor-geospatial/s2-stac-geoparquet"
     }
   ],
   "extent": {
@@ -1234,7 +1234,7 @@
     },
     {
       "rel": "preview",
-      "href": "https://portolan-mirrors.github.io/sentinel-2-catalog/",
+      "href": "https://taylor-geospatial.github.io/s2-stac-geoparquet/",
       "type": "text/html",
       "title": "Interactive scene explorer"
     },

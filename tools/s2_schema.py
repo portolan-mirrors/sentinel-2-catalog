@@ -85,7 +85,7 @@ COLUMNS = [
 # s2_fetch, s2_build, make_items and upload_part; this module has no
 # dependencies, so upload_part can import it without pulling duckdb in.
 USER_AGENT = ("sentinel-2-catalog-tools/1.0 "
-              "(+https://github.com/portolan-mirrors/sentinel-2-catalog)")
+              "(+https://github.com/taylor-geospatial/s2-stac-geoparquet)")
 
 # Everything normalize() emits: the two sort helpers are computed at build
 # time, so a chunk parquet carries every column but those.

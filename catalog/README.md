@@ -6,7 +6,7 @@ sits in front of it.
 
 **[Open this catalog in the Portolan browser](https://browser.portolan-sdi.org/#/external/data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json)**
 to explore the collections, or use the
-[scene explorer](https://portolan-mirrors.github.io/sentinel-2-catalog/) to
+[scene explorer](https://taylor-geospatial.github.io/s2-stac-geoparquet/) to
 search scenes on a map and draw any band of a scene from its COGs.
 
 This is a mirror. Earth Search, run by

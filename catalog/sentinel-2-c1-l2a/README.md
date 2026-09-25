@@ -95,7 +95,7 @@ rather than a group per month. Row groups are uniform at a target of 6,000
 rows (6,144 as DuckDB writes them), small enough that a tile lookup fetches
 little beyond its own rows. This is the layout the search-latency
 experiments behind
-[issue #9](https://github.com/portolan-mirrors/sentinel-2-catalog/issues/9)
+[issue #9](https://github.com/taylor-geospatial/s2-stac-geoparquet/issues/9)
 measured as the fastest for tile-window searches (the month-major sort of
 the older `sentinel-2-l2a` parts scatters a tile's year across twelve month
 sections, so a three-month window admits six or seven row groups where

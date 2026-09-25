@@ -13,7 +13,7 @@ carries only the item index and a small set of MGRS-tile aggregates, with
 **no API in front of it**. A client filters the whole archive with HTTP range
 reads against a public bucket: no key, no server, no rate limit.
 
-- **Explore it**: https://portolan-mirrors.github.io/sentinel-2-catalog/, a
+- **Explore it**: https://taylor-geospatial.github.io/s2-stac-geoparquet/, a
   static page that behaves like there is an API behind it. Every query runs
   on [hyparquet](https://github.com/hyparam/hyparquet) range reads plus
   PMTiles — a small pure-JS parquet reader in place of a 36 MB WASM query
@@ -29,7 +29,7 @@ reads against a public bucket: no key, no server, no rate limit.
   [Element 84](https://element84.com/), over the
   [Sentinel-2 L2A COGs](https://registry.opendata.aws/sentinel-2-l2a-cogs/) on
   the AWS Registry of Open Data
-- **Issues and contributions**: https://github.com/portolan-mirrors/sentinel-2-catalog/issues
+- **Issues and contributions**: https://github.com/taylor-geospatial/s2-stac-geoparquet/issues
 
 ## Query it
 
@@ -297,7 +297,7 @@ without a matching row there.
 
 Wrong metadata, a query that should be cheaper, a column that needs
 explaining: open an issue at
-https://github.com/portolan-mirrors/sentinel-2-catalog/issues, or send a pull
+https://github.com/taylor-geospatial/s2-stac-geoparquet/issues, or send a pull
 request against `catalog/`. CI runs the gates above on it.
 
 ## License

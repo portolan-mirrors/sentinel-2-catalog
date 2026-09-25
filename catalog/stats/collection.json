@@ -47,7 +47,7 @@
         "processor",
         "host"
       ],
-      "url": "https://github.com/portolan-mirrors/sentinel-2-catalog"
+      "url": "https://github.com/taylor-geospatial/s2-stac-geoparquet"
     }
   ],
   "extent": {
