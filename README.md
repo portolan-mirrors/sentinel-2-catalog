@@ -13,16 +13,17 @@ carries only the item index and a small set of MGRS-tile aggregates, with
 **no API in front of it**. A client filters the whole archive with HTTP range
 reads against a public bucket: no key, no server, no rate limit.
 
-- **Explore it**: https://taylor-geospatial.github.io/s2-stac-geoparquet/, a
+- **Explore it**: https://research.taylorgeospatial.org/s2-stac-geoparquet/, a
   static page that behaves like there is an API behind it. Every query runs
   on [hyparquet](https://github.com/hyparam/hyparquet) range reads plus
   PMTiles — a small pure-JS parquet reader in place of a 36 MB WASM query
   engine. Any band, composite, NDVI/NDWI or the
   SCL classes of a scene are drawn on the map straight from its COGs in
   the browser, with histogram-and-handles stretch controls. The page
-  opens on Collection 1 (`sentinel-2-c1-l2a/` and `stats-c1/`); a
-  collection switch in the sidebar (or `?collection=sentinel-2-l2a`)
-  points the same page at the first collection.
+  opens on Collection 1 (`sentinel-2-c1-l2a/` with `stats-c1/`), the
+  uniform reprocessed record and the default. The original
+  `sentinel-2-l2a` index stays available: the collection switch in the
+  sidebar (or `?collection=sentinel-2-l2a`) points the same page at it.
 - **Published catalog**: https://source.coop/portolan-mirrors/sentinel-2-catalog
 - **STAC root**: `https://data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json`
 - **Upstream**: [Earth Search](https://earth-search.aws.element84.com/v1) by

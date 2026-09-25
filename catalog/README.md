@@ -6,8 +6,10 @@ sits in front of it.
 
 **[Open this catalog in the Portolan browser](https://browser.portolan-sdi.org/#/external/data.source.coop/portolan-mirrors/sentinel-2-catalog/catalog.json)**
 to explore the collections, or use the
-[scene explorer](https://taylor-geospatial.github.io/s2-stac-geoparquet/) to
-search scenes on a map and draw any band of a scene from its COGs.
+[scene explorer](https://research.taylorgeospatial.org/s2-stac-geoparquet/) to
+search scenes on a map and draw any band of a scene from its COGs. The
+explorer opens on Collection 1; its sidebar switch (or
+`?collection=sentinel-2-l2a`) shows the original index with the same page.
 
 This is a mirror. Earth Search, run by
 [Element 84](https://element84.com/) on the

@@ -1234,7 +1234,7 @@
     },
     {
       "rel": "preview",
-      "href": "https://taylor-geospatial.github.io/s2-stac-geoparquet/",
+      "href": "https://research.taylorgeospatial.org/s2-stac-geoparquet/",
       "type": "text/html",
       "title": "Interactive scene explorer"
     },
