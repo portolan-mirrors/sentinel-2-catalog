@@ -277,7 +277,15 @@ button.mini:not(:disabled):hover { background: #26457a; }
 #bandbox .bandrow.three select { font-size: 11px; padding: 3px 4px; }
 #bandbox .lbl { color: var(--dim); font-size: 12px; margin-right: 6px; }
 #bandbox label.inline { display: inline; margin: 0 8px 0 0; }
-#bandbox input[type=range] { width: 60%; }
+/* Gamma is the only lone slider in the band box, and it is named here rather
+   than matched as `#bandbox input[type=range]`: that selector carries an id,
+   so it outranks `.dayrange input[type=range] { width: 100% }` and shrank the
+   channel blocks' two stacked handles to 60% of their container. A handle then
+   travelled 60% of the track its own histogram was drawn across — the max
+   handle of a 0.95 stretch rendered at 55%, which is what the bins disagreed
+   with. Naming the one input keeps the rule off every slider built into a
+   .dayrange container inside #bandbox. */
+#bandbox #gamma { width: 60%; }
 #bandbox #bandnote:empty { display: none; }
 #bandbox #bandnote { margin: 6px 0 0; }
 .chan-r { color: #ff8a8a; font-weight: 700; } .chan-g { color: #8ae28a; font-weight: 700; }
