@@ -149,6 +149,48 @@ const say = (msg, isError = false) => {
   el.classList.toggle("error", isError);
 };
 
+// ---------------------------------------------------------------------------
+// The URL hash: the page state, so a view can be shared or returned to.
+// The hash is `&`-separated key=value pairs — the camera (map=zoom/lat/lng),
+// the year, the window (d=), the three sliders, the metric, the sort, the
+// tile and the shown scene. Only a value that is not the default is written,
+// so the hash of a page nobody has touched is one `map=` pair.
+//
+// The hash is read once, here, into WANT. A hash comes from a link somebody
+// else wrote, so every value is checked before it is used and a value this
+// page cannot use is dropped in silence — a shared link must never leave the
+// page in a state its own controls cannot reach. The tile is held raw
+// because TILE_RE is declared with the scene query, below this line.
+// ?collection= stays a query parameter: the switcher rebuilds the URL from
+// location.href, which carries the fragment, so the hash survives its reload.
+// ---------------------------------------------------------------------------
+const HASH_IN = new URLSearchParams(location.hash.replace(/^#/, ""));
+const hashInt = (key, lo, hi) => {
+  if (!HASH_IN.has(key)) return null;
+  const n = Number(HASH_IN.get(key));
+  return Number.isInteger(n) && n >= lo && n <= hi ? n : null;
+};
+const WANT = {
+  map: (() => {
+    const m = (HASH_IN.get("map") ?? "").split("/").map(Number);
+    return m.length === 3 && m.every(Number.isFinite) && m[0] >= 0 && m[0] <= 24
+      && Math.abs(m[1]) <= 90 && Math.abs(m[2]) <= 180
+      ? { zoom: m[0], center: [m[2], m[1]] } : null;
+  })(),
+  year: hashInt("year", 1970, 3000),
+  // "YYYY-MM-DD..YYYY-MM-DD". The two days are checked against the restored
+  // year later, by restoreControls, which is the only place that knows it.
+  d: /^\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}$/.test(HASH_IN.get("d") ?? "")
+    ? HASH_IN.get("d").split("..") : null,
+  cloud: hashInt("cloud", 0, 100),
+  cover: hashInt("cover", 0, 100),
+  scenes: hashInt("scenes", 0, 10000),
+  metric: METRICS.has(HASH_IN.get("metric")) ? HASH_IN.get("metric") : null,
+  sort: SORTS[HASH_IN.get("sort")] ? HASH_IN.get("sort") : null,
+  tile: HASH_IN.get("tile"),
+  scene: HASH_IN.get("scene"),
+};
+
 // The sidebar's collection switch. The select shows the loaded collection;
 // a change reloads the page with ?collection= set (the other parameters
 // kept), which is how every piece of per-collection state — the cached
@@ -315,6 +357,11 @@ const DIMMED = [70, 78, 96, 70];                  // clearest scene over the sli
 const HOVER_LINE = [232, 240, 255, 255];          // #e8f0ff
 
 await mapReady;
+
+// The camera a shared link asked for. jumpTo, not flyTo: the link names the
+// view the reader wants, not a trip to it. The choropleth does not read the
+// camera, so nothing else in the boot changes.
+if (WANT.map) map.jumpTo({ center: WANT.map.center, zoom: WANT.map.zoom });
 
 // ---------------------------------------------------------------------------
 // The MGRS choropleth. The fills are drawn by deck.gl: the footprints come
@@ -503,6 +550,69 @@ const S = {
   detachedAt: 0,              // its last known position in the view
 };
 
+// ---------------------------------------------------------------------------
+// The other half of the hash: writing it. One serializer over `map` and `S`,
+// called on a 400 ms trailing debounce from the end of applyNow (every state
+// mutator funnels through it) and from the map's moveend. The one history
+// entry is replaced, never added to: a slider drag must keep the URL current
+// without filling the Back button with a step per frame.
+//
+// No write happens before finishRestore(): a boot writes the defaults
+// through applyNow several times, and those writes would erase an incoming
+// hash before it was read.
+// ---------------------------------------------------------------------------
+let hashRestored = false;
+let hashWritten = null;       // the last hash this page wrote (see hashchange)
+let hashTimer = 0;
+
+// URLSearchParams.toString() percent-encodes the slashes of `map=`, so the
+// pairs are joined by hand. Only the two values that come from data — the
+// tile and the scene id — are escaped; the rest are digits and names.
+function hashOfState() {
+  const parts = [];
+  const put = (k, v) => parts.push(`${k}=${v}`);
+  const c = map.getCenter();
+  put("map", `${map.getZoom().toFixed(2)}/${c.lat.toFixed(4)}/${c.lng.toFixed(4)}`);
+  if (S.year !== null) put("year", S.year);
+  if (S.from && S.to && !(S.from === `${S.year}-01-01` && S.to === `${S.year}-12-31`)) {
+    put("d", `${S.from}..${S.to}`);
+  }
+  if (S.maxCloud !== 100) put("cloud", S.maxCloud);
+  if (S.minCoverage !== 10) put("cover", S.minCoverage);
+  if (S.minScenes !== 0) put("scenes", S.minScenes);
+  if ($("metric").value !== "min_cloud_cover") put("metric", $("metric").value);
+  if (S.sort !== "cloud") put("sort", S.sort);
+  if (S.tile) put("tile", encodeURIComponent(S.tile));
+  if (S.displayedId) put("scene", encodeURIComponent(S.displayedId));
+  return `#${parts.join("&")}`;
+}
+function writeHash() {
+  clearTimeout(hashTimer);
+  hashTimer = 0;
+  if (!hashRestored) return;
+  const h = hashOfState();
+  if (h === location.hash) return;
+  hashWritten = h;
+  // A page served where the history API is refused keeps the URL it has;
+  // that is a URL that cannot be shared, not a page that cannot be used.
+  try { history.replaceState(null, "", h); } catch { /* left as it stands */ }
+}
+function scheduleHashWrite() {
+  if (!hashRestored || hashTimer) return;
+  hashTimer = setTimeout(writeHash, 400);
+}
+map.on("moveend", scheduleHashWrite);
+
+// A hash the page did not write is one somebody pasted or edited. Re-running
+// the restore over a live UI has too many possible orders to be safe, so the
+// page loads again and restores the new hash the one order that is certainly
+// right. A replaced history entry fires no hashchange, so writeHash cannot
+// land here; the compare only guards a browser that reports one anyway.
+addEventListener("hashchange", () => {
+  if (location.hash === hashWritten) return;
+  location.reload();
+});
+
 // All three sliders AND together in one accessor; a NULL metric is "unknown"
 // rather than "over/under the slider" and is never dimmed for that reason
 // (the Task 20 rule, extended to coverage and scene count).
@@ -607,6 +717,8 @@ function applyNow() {
     syncNavButtons();
   }
   updateFilterStatus();
+  // Every state mutator ends here, so this one call keeps the URL current.
+  scheduleHashWrite();
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,6 +1238,92 @@ function warmWindowParts() {
   }
 }
 
+// The first half of the restore: the year, the window, the sliders, the
+// metric and the sort. Both boot paths call it once, after the year select
+// holds its options (a year outside them is not restorable) and before the
+// first paintWindow, which reads the window and the metric. With no hash it
+// does exactly what the two lines and the buildDateSlider call it replaced
+// did.
+//
+// A day is only taken if it is in the restored year and it is a day that
+// exists: the shape check on `d=` admits 2023-99-99 and 2023-02-31, and an
+// <input type="date"> answers an impossible day with an empty value, which
+// would leave the page with no window at all.
+function restoreControls(defaultYear) {
+  const goodDay = (s, year) => {
+    const t = Date.parse(`${s}T00:00:00Z`);
+    return s.slice(0, 4) === String(year) && !Number.isNaN(t)
+      && new Date(t).toISOString().slice(0, 10) === s;
+  };
+  const year = WANT.year !== null
+    && [...$("year").options].some((o) => o.value === String(WANT.year))
+    ? WANT.year : defaultYear;
+  S.year = year;
+  $("year").value = String(year);
+  if (WANT.metric) { $("metric").value = WANT.metric; updateLegend(); }
+  if (WANT.sort) { S.sort = WANT.sort; $("sort").value = WANT.sort; }
+  // The scene-count slider's bound follows the window (updateScenesBound),
+  // and it starts at 1: raise it far enough to hold the asked value, or the
+  // input would clamp it away and the slider and S would then disagree. The
+  // first paint re-bounds it, and clamps S itself if the window is quieter
+  // than the link. Each value is read back from the input, never from the
+  // hash, so a clamp of any kind reaches S as well.
+  if (WANT.scenes !== null) {
+    $("minscenes").max = String(Math.max(Number($("minscenes").max), WANT.scenes));
+    $("minscenes").value = String(WANT.scenes);
+  }
+  if (WANT.cloud !== null) $("maxcloud").value = String(WANT.cloud);
+  if (WANT.cover !== null) $("mincoverage").value = String(WANT.cover);
+  S.maxCloud = Number($("maxcloud").value);
+  S.minCoverage = Number($("mincoverage").value);
+  S.minScenes = Number($("minscenes").value);
+  $("maxcloud-out").textContent = $("maxcloud").value;
+  $("mincoverage-out").textContent = $("mincoverage").value;
+  $("minscenes-out").textContent = $("minscenes").value;
+  buildDateSlider(`${year}-01-01`, `${year}-12-31`);
+  // A window inside the restored year only. set() clamps to the slider's
+  // bounds and writes the clamped days back, and its onChange is what puts
+  // them in S; the two reads below just say so out loud.
+  const [d0, d1] = WANT.d ?? [];
+  if (d0 && goodDay(d0, year) && goodDay(d1, year) && d0 <= d1) {
+    dateRange.set(d0, d1);
+    S.from = $("date0").value;
+    S.to = $("date1").value;
+  }
+}
+
+// The second half: the tile search and the shown scene, which both need the
+// network. One shot, and the user has the last word. Any search that already
+// ran is a tile the user clicked while the stats were loading, and it stands;
+// a click during the await below takes a higher searchSeq, and the scene
+// restore then stands down. Nothing re-applies WANT after this returns.
+async function restoreSearch() {
+  if (searchSeq > 0 || !WANT.tile || !TILE_RE.test(WANT.tile)) return;
+  const seq = searchSeq + 1;            // the number selectTile's search takes
+  await selectTile(WANT.tile);
+  if (seq !== searchSeq || !S.search || !WANT.scene) return;
+  // The id is matched inside the rows, so the view lookup can use the row's
+  // own id and no id type has to be assumed.
+  const row = S.search.rows.find((r) => String(r.id) === WANT.scene);
+  if (!row) return;                     // not in this tile-year: say nothing
+  const at = indexOfId(currentView(), row.id);
+  if (at >= 0) { showIndex(at, true); return; }
+  // The scene is in the tile-year but the filters hide it. The link asked
+  // for it, so it goes on the map anyway, and the scrub bar reports it as
+  // detached the same way a filter change that hides the shown scene does.
+  S.displayedId = row.id;
+  showOnMap(row, null, ui.preset);
+  scheduleApply({ cards: true, nav: true });
+}
+
+// The restore is over, whichever way the boot went: from here the URL
+// follows the page. A link that came in is written back once, so the URL
+// holds what the page actually settled on and not what was asked for.
+function finishRestore() {
+  hashRestored = true;
+  if (location.hash) writeHash();
+}
+
 async function init() {
   updateLegend();
   $("metric").addEventListener("change", () => { updateLegend(); paintWindow(); });
@@ -1183,12 +1381,12 @@ async function init() {
   const y0 = Number(span.oldest.slice(0, 4));
   const y1 = Math.max(newestYear, statsYear);
   for (let y = y0; y <= y1; y++) $("year").append(new Option(String(y), String(y)));
-  S.year = statsYear;
-  $("year").value = String(statsYear);
   // Open on the newest month the stats have, expanded to its whole year:
   // the year is the unit now, and the newest year is partly empty ahead of
-  // the backfill, which paintWindow tolerates month by month.
-  buildDateSlider(`${statsYear}-01-01`, `${statsYear}-12-31`);
+  // the backfill, which paintWindow tolerates month by month. A hash that
+  // names another year, another window or other filters is seeded here
+  // instead, before the paint that reads them.
+  restoreControls(statsYear);
   await Promise.all([paintWindow(), timelineFor(null)]);
   // paintWindow() already calls markActiveBars() (the same call the timeline
   // bar's own onclick makes), but it can run before timelineFor() has
@@ -1196,6 +1394,7 @@ async function init() {
   // exist, so this just guarantees the default window's bars end up
   // highlighted regardless of which promise settles first.
   markActiveBars();
+  await restoreSearch();
 }
 
 // The page without stats (a 404 on the collection's timeline): the year
@@ -1212,9 +1411,9 @@ async function init() {
 async function initWithoutStats() {
   statsMissing = true;
   for (let y = COL.since; y <= CURRENT_YEAR; y++) $("year").append(new Option(String(y), String(y)));
-  S.year = CURRENT_YEAR;
-  $("year").value = String(CURRENT_YEAR);
-  buildDateSlider(`${CURRENT_YEAR}-01-01`, `${CURRENT_YEAR}-12-31`);
+  // A hash can still name a year in COL.since..CURRENT_YEAR, a window and
+  // the filters here; there is only no paint for them to change.
+  restoreControls(CURRENT_YEAR);
   await timelineFor(null);
   let newestYear = null;
   for (let y = CURRENT_YEAR; y >= COL.since && newestYear === null; y--) {
@@ -1228,6 +1427,9 @@ async function initWithoutStats() {
       : "No year parts are published yet either; a search will say so.")
     + collectionNote;
   say(statsNote);
+  // A hash's tile still searches: startSearch says it itself when the year
+  // has no published parts.
+  await restoreSearch();
 }
 
 // init() runs at the end of the module: it probes the item years with the
@@ -1323,7 +1525,10 @@ function selectTile(tile) {
   const year = Number(d0.slice(0, 4));
   if (year !== S.year) { S.year = year; $("year").value = String(year); }
   $("query").querySelector(".hint").textContent = `Tile ${tile}.`;
-  startSearch(tile, year);
+  // The search is returned, not only started, so the hash restore can wait
+  // for the rows before it looks for its scene. A click ignores the promise,
+  // the way it always has.
+  return startSearch(tile, year);
 }
 
 // The zone parts of a year: [file stem, first zone, last zone], mirrored
@@ -2296,6 +2501,9 @@ $("cog-clear").addEventListener("click", () => {
   cogPreview = null;
   render();
   hideImagePanel();
+  // The one state change that does not go through applyNow. Without this the
+  // URL would keep a scene the page no longer shows.
+  scheduleHashWrite();
 });
 
 // The panel's controls. A band select under a preset switches it to Custom
@@ -2556,3 +2764,6 @@ function renderMore(box, total) {
 }
 
 await init();
+// Every boot path ends here, the ones that gave up early included, so the
+// URL starts following the page whether or not a restore ran.
+finishRestore();
