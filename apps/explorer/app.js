@@ -2587,6 +2587,8 @@ function thumbnail(r) {
   img.alt = `Preview of ${r.id}`;
   img.crossOrigin = "anonymous";
   img.addEventListener("load", () => {
+    // The white base waits for the pixels.
+    img.classList.add("loaded");
     // Once: the keyed PNG's own load must not be keyed again, and the plain
     // (no-CORS) fallback cannot be read back at all.
     if (img.dataset.keyed || img.crossOrigin === null) return;
