@@ -35,6 +35,14 @@ h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
 /* The collection switch sits between the title and its blurb. */
 .switch { margin: 2px 0 10px; }
 .hint { margin: 6px 0 0; color: var(--dim); font-size: 12px; }
+.secthead { display: flex; align-items: center; gap: 6px; }
+.secthead h2 { margin: 0; }
+.info { width: 18px; height: 18px; border-radius: 50%; padding: 0;
+  font: 600 11px/16px system-ui, sans-serif; font-style: italic;
+  background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); cursor: pointer; }
+.tip { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+  padding: 8px 10px; margin: 6px 0; }
+.tip p { margin: 4px 0; font-size: 12px; color: var(--dim); }
 .status {
   margin: 0 0 14px; padding: 8px 10px; font-size: 12.5px;
   background: var(--panel-2); border-left: 3px solid var(--accent);

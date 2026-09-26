@@ -82,23 +82,29 @@
     </div>
   </section>
   <section id="query">
-    <h2>Find scenes</h2>
+    <div class="secthead"><h2>Find scenes</h2>
+      <button type="button" class="info" id="query-info" aria-expanded="false"
+        aria-label="How the filters work">i</button></div>
+    <div class="tip" id="query-tip" hidden>
+      <p><b>Max cloud</b>: tiles whose clearest scene in the window is cloudier go grey.</p>
+      <p><b>Min coverage</b>: tiles whose fullest scene fills less of the tile go grey.</p>
+      <p><b>Min scenes</b>: tiles imaged fewer times across the window go grey.
+        The scene list below is not gated by this slider.</p>
+      <p><b>Dates</b>: drag either handle; the calendars follow. The map recolors
+        by whole months; the scene list follows to the day.</p>
+    </div>
     <p class="hint">Click the map to pick an MGRS tile.</p>
     <div class="dates">
       <label>From <input type="date" id="date0"></label>
       <label>To <input type="date" id="date1"></label>
     </div>
-    <div id="dayrange" class="dayrange" title="Drag either handle; the calendars follow"></div>
+    <div id="dayrange" class="dayrange"></div>
     <label>Max cloud % <input type="range" id="maxcloud" min="0" max="100" value="100">
       <output id="maxcloud-out">100</output></label>
-    <p class="hint">Tiles whose clearest scene is cloudier than this go grey on the map.</p>
     <label>Min coverage % <input type="range" id="mincoverage" min="0" max="100" value="10">
       <output id="mincoverage-out">10</output></label>
-    <p class="hint">Tiles whose fullest scene this month fills less of the tile than this go grey on the map.</p>
-    <label>Min scenes <input type="range" id="minscenes" min="0" max="1" value="0" step="1"
-        title="Tiles with fewer scenes this month go grey on the map. The scene search below is not gated by this slider: a search window's scene count can differ from the whole month's.">
+    <label>Min scenes <input type="range" id="minscenes" min="0" max="1" value="0" step="1">
       <output id="minscenes-out">0</output></label>
-    <p class="hint">Tiles imaged fewer times this month than this go grey on the map.</p>
     <button id="run" disabled>Search scenes</button>
   </section>
   <section id="timeline"><h2>Monthly scenes</h2><div id="bars"></div>

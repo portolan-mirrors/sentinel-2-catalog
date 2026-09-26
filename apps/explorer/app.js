@@ -158,6 +158,18 @@ const say = (msg, isError = false) => {
     + "is a range read against static GeoParquet on Source Cooperative; there is no API.";
 }
 
+// The filter help: a hover shows it, a click pins it (touch has no hover).
+{
+  const info = $("query-info"), tip = $("query-tip");
+  let pinned = false;
+  const show = (on) => { tip.hidden = !on; info.setAttribute("aria-expanded", String(on)); };
+  info.addEventListener("click", () => { pinned = !pinned; show(pinned); });
+  if (matchMedia("(hover: hover)").matches) {
+    info.addEventListener("mouseenter", () => show(true));
+    info.addEventListener("mouseleave", () => { if (!pinned) show(false); });
+  }
+}
+
 const protocol = new Protocol();
 maplibregl.addProtocol("pmtiles", protocol.tile);
 const map = new maplibregl.Map({
