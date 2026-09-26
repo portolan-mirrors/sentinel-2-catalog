@@ -93,6 +93,42 @@ input, select, button {
   border: 1px solid var(--line); border-radius: 4px; padding: 5px 7px;
 }
 input[type=month], input[type=date], select { width: 100%; margin-top: 3px; }
+/* Customizable select (every #collection/#year/#metric/#sort/#preset/
+   #sel-r/g/b/#nodata select matches the bare element selector below, so
+   no per-id styling is needed for coverage). appearance: base-select opts
+   a <select> and its ::picker(select) popover into a styleable render path;
+   Chromium paints the dropdown list to match the panel. Firefox/Safari
+   don't parse the base-select value or the ::picker() pseudo-element, so
+   they drop these declarations/rules and keep the native OS picker — the
+   select element itself, and its closed-button look above, are unchanged
+   either way. The opt-in for `select` is its own rule (a plain element
+   selector, always valid) separate from the ::picker(select) rule (a
+   pseudo-element selector some engines don't know): a comma-joined
+   `select, ::picker(select) { appearance: base-select; }` would let an
+   unrecognized ::picker(select) invalidate the WHOLE selector list in a
+   non-forgiving engine, dropping the `select` opt-in too. Keeping them
+   separate means each engine drops only what it doesn't understand. */
+select { appearance: base-select; }
+::picker(select) {
+  appearance: base-select;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.45);
+  padding: 4px;
+}
+select option {
+  padding: 5px 10px 5px 10px;
+  border-radius: 5px;
+  color: var(--ink);
+  background: transparent;
+}
+select option:hover, select option:focus { background: var(--line); }
+select option:checked { font-weight: 600; }
+/* ::checkmark is the spec pseudo-element for the tick base-select draws on
+   the selected option; an engine that doesn't know it drops this rule and
+   nothing else needs to change. */
+select option::checkmark { color: var(--accent); }
 input[type=range] { width: 74%; vertical-align: middle; padding: 0; border: 0;
                     background: none; accent-color: var(--accent); }
 .dates { display: flex; gap: 8px; align-items: flex-end; }
