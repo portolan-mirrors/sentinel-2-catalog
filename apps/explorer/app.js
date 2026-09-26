@@ -306,8 +306,11 @@ let hideTipFor = () => {};
   // A scroll under a shown tip is simplest read as "take it down": the box
   // is position: fixed, so it would not follow the panel it came from, and
   // no filter row scrolls far enough for the anchor to need re-finding.
-  $("panel").addEventListener("scroll", hide, { passive: true });
-  $("imgpanel").addEventListener("scroll", hide, { passive: true });
+  // It unpins rather than merely hiding: a hide leaves `pinned` on the
+  // anchor, and the next click on that "?" reads as a toggle-off and looks
+  // dead — two clicks to reopen a box the scroll already closed.
+  $("panel").addEventListener("scroll", unpin, { passive: true });
+  $("imgpanel").addEventListener("scroll", unpin, { passive: true });
 
   // A disabled button gets no mouseleave, so a caption change or a step to
   // the sort order's edge (syncNavButtons, via setTip) must close its tip
@@ -555,8 +558,11 @@ const S = {
 
 // ---------------------------------------------------------------------------
 // The other half of the hash: writing it. One serializer over `map` and `S`,
-// called on a 400 ms trailing debounce from the end of applyNow (every state
-// mutator funnels through it) and from the map's moveend. The one history
+// called on a 400 ms throttle from the end of applyNow (every state mutator
+// funnels through it) and from the map's moveend. A throttle, not a debounce:
+// the first call arms the timer and later ones inside the window ride it, so
+// a long drag keeps writing every 400 ms instead of waiting for its end. The
+// one history
 // entry is replaced, never added to: a slider drag must keep the URL current
 // without filling the Back button with a step per frame.
 //
@@ -753,7 +759,7 @@ const loadTimeline = async () => {
 // stays unpainted, the timeline empty, and the month and tile-history reads
 // that would only 404 are not attempted. The scene search is untouched —
 // the year parts are their own files. `statsNote` is the status line that
-// says so, repeated whenever a month change would otherwise paint.
+// says so, repeated whenever a window change would otherwise paint.
 let statsMissing = false;
 let statsNote = "";
 
@@ -762,12 +768,18 @@ let statsNote = "";
 // callers for the same month share one fetch and a revisit costs nothing. A
 // failed fetch is forgotten so the next attempt retries rather than
 // replaying the error.
+// Capped like the year cache, and for the same reason: a long session
+// scrubbing the timeline would otherwise hold every month it ever painted.
+// Three years of slices stay warm, which covers any window the user moves
+// back and forth over; the oldest insert goes first.
+const MONTH_CACHE_MAX = 36;
 const monthFiles = new Map();
 function monthFile(ym) {
   if (!monthFiles.has(ym)) {
     const p = fetchParquet(monthUrl(ym))
       .catch((err) => { monthFiles.delete(ym); throw err; });
     monthFiles.set(ym, p);
+    if (monthFiles.size > MONTH_CACHE_MAX) monthFiles.delete(monthFiles.keys().next().value);
   }
   return monthFiles.get(ym);
 }
@@ -800,6 +812,7 @@ function monthStatsFor(ym) {
         med: r.median_cloud_cover == null ? null : Number(r.median_cloud_cover) }));
     })());
     monthStats.get(ym).catch(() => monthStats.delete(ym));
+    if (monthStats.size > MONTH_CACHE_MAX) monthStats.delete(monthStats.keys().next().value);
   }
   return monthStats.get(ym);
 }
@@ -2273,9 +2286,11 @@ $("imgscrub").addEventListener("change", () => {
 // The scrubber's position and range follow the view. When the shown scene
 // no longer passes the filters the thumb detaches: the image stays on the
 // map, the label says why, and prev/next step in from the last position.
-// The label doubles as the Task 10 hover title, so the non-detached branch
-// hides it only when the detached branch was the one that last wrote it
-// (the data-detached marker), never clobbering an unrelated hover label.
+// One label serves two writers: this function's detached notice and
+// previewIndex's "N of M · day · cloud" while a scrub drag is in flight. The
+// non-detached branch therefore hides it only when the detached branch was
+// the one that last wrote it (the data-detached marker), so a re-render mid
+// drag never blanks the position the user is reading.
 function renderScrubber() {
   const view = currentView();
   const scrub = $("imgscrub");
@@ -2769,6 +2784,15 @@ function renderResultsNow() {
   const view = currentView();
   for (const n of [...box.children]) if (!n.classList.contains("scene")) n.remove();
   if (!view.length) {
+    // "0 of 0 scenes pass" reads as a filter the user set too tight, and the
+    // widen button promises a wider window would find something. Neither is
+    // true of a tile-year the parts hold no scenes for: nothing to widen to.
+    if (!S.search.rows.length) {
+      box.replaceChildren(el("p", "hint",
+        `No ${S.search.tile} scenes are published for ${S.search.year}. `
+        + "Pick another year or another tile."));
+      return;
+    }
     box.replaceChildren(el("p", "hint",
       `0 of ${S.search.rows.length} scenes pass — widen a slider or the date window.`));
     const b = widenButton();

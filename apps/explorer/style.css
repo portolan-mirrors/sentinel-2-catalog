@@ -67,6 +67,10 @@ h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
   align-items: center; gap: 6px; margin: 4px 0; }
 .filter label { white-space: nowrap; }
 .filter output { text-align: right; font-variant-numeric: tabular-nums; }
+/* The grid's middle track is already the slider's share of the row, so the
+   base 74% only left a quarter of it empty before the value column. Filling
+   the track is the whole point of giving it one. */
+.filter input[type=range] { width: 100%; }
 /* The dates header holds only a label — no slider, no value — so its row
    collapses to that one column instead of leaving two tracks empty. */
 .dates-head { grid-template-columns: 1fr; }
