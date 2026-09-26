@@ -1888,3 +1888,25 @@ def test_months_that_hold_no_row_write_nothing():
         assert proc.returncode == 1
         assert "no rows matched" in proc.stderr
         assert not (out / "year=2026").exists()
+
+
+def test_the_workflows_ask_the_builder_for_every_part_name():
+    """No workflow types a part file name into its YAML. The stats
+    enumeration (publish-stats.yml) and the Collection 1 refresh both call
+    archive_part_names() and live_part_names() with the collection's config,
+    so a rename in tools/s2_build.py reaches them. Comments may spell the
+    names out for a reader; nothing that runs may."""
+    wf = ROOT / ".github" / "workflows"
+    stats = (wf / "publish-stats.yml").read_text()
+    refresh = (wf / "refresh-daily.yml").read_text()
+    for text in (stats, refresh):
+        assert "archive_part_names" in text and "live_part_names" in text
+    # The stats build probes the twelve monthly names of a Collection 1 year
+    # through that list, and the refresh names one month per build.
+    assert 'for NAME in $LIVE_NAMES; do' in stats
+    assert '--months "$M" \\' in refresh
+    for path in sorted(wf.glob("*.yml")):
+        code = "\n".join(line for line in path.read_text().splitlines()
+                         if not line.lstrip().startswith("#"))
+        for month in range(1, 13):
+            assert live_month_name(month) not in code, (path.name, month)
