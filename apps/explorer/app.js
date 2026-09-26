@@ -32,7 +32,7 @@ import { PMTiles, Protocol } from "https://esm.sh/pmtiles@3.2.0";
 import { parse } from "https://esm.sh/@loaders.gl/core@4.5.1";
 import { MVTLoader } from "https://esm.sh/@loaders.gl/mvt@4.5.1";
 import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOverviews,
-  sceneIndexStats, bandPreviewImage, bandTileLayer, bandHref } from "./cog.js";
+  sceneIndexStats, bandPreviewImage, bandTileLayer } from "./cog.js";
 import { BANDS, MASK_BANDS, bandInfo, bandTitle, fixedRange, INDICES, SCL_CLASSES, PRESETS,
   bandsOf, HIST_BINS } from "./bands.js";
 import { dayRange, valueRange } from "./rangeslider.js";
@@ -1317,8 +1317,6 @@ function sceneDirOf(r) {
   u.search = ""; u.hash = "";
   return u.href;
 }
-// The same, or null, for a card's download links.
-const sceneDirOrNull = (r) => { try { return sceneDirOf(r); } catch { return null; } };
 
 // The BOA offset an index must subtract (bands.js): 1000 from processing
 // baseline 04.00 on, 0 before, null when the row does not say.
@@ -2036,7 +2034,7 @@ async function showTci(me, spec, serial) {
   }
 }
 
-// "Show on map" and the card's band chips: fly to the scene's footprint,
+// "Show on map" button: fly to the scene's footprint,
 // remember the scene, set the panel to the asked preset and apply it.
 // `button` is the control to disable while the read runs. It is null when
 // the page itself asks for a scene (showIndex), because no control was hit.
@@ -2214,27 +2212,7 @@ function buildCard(r) {
   show.title = "Fly to the footprint and draw the visual COG on the map";
   show.addEventListener("click", () => showOnMap(r, show));
   actions.append(show);
-  // The band chips: each draws that band (TCI as true colour, B04/B08 as a
-  // single band, SCL as the classes) and carries a small link to the COG
-  // itself, derived from the thumbnail's directory like the map's reads.
-  const chips = el("span", "chips");
-  const dir = sceneDirOrNull(r);
-  for (const [band, preset, single] of [["TCI", "tci"], ["B04", "single", "B04"],
-    ["B08", "single", "B08"], ["SCL", "scl"]]) {
-    const chip = el("button", "mini", band);
-    chip.type = "button";
-    chip.title = `Show ${band} on the map`;
-    chip.addEventListener("click", () => showOnMap(r, chip, preset, single ?? null));
-    chips.append(chip);
-    if (!dir) continue;
-    const a = el("a", null, "↗");
-    a.href = bandHref(dir, band);
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-    a.title = `Download ${band}.tif — ${a.href}`;
-    chips.append(a);
-  }
-  cap.append(actions, chips);
+  cap.append(actions);
   card.append(cap);
   return card;
 }

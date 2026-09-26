@@ -212,9 +212,6 @@ button.mini:not(:disabled):hover { background: #26457a; }
 #scl-legend span::before { content: ""; display: inline-block; width: 10px; height: 10px;
                             margin-right: 5px; vertical-align: -1px; border-radius: 2px;
                             background: var(--sw); border: 1px solid #0b1020; }
-.scene .chips { display: inline-flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
-.scene .chips button.mini { padding: 1px 6px; font-size: 11px; }
-.scene .chips a { margin: 0 4px 0 -2px; font-size: 11px; }
 
 .scene.best { position: relative; }
 .scene.best::before {
