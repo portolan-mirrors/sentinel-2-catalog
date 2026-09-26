@@ -177,14 +177,26 @@ def test_build_year_adds_every_catchup_slice_to_the_sources():
     assert "12 month slice(s), 2 catch-up slice(s)" in out
 
 
+# The live part names the script asks s2_build for (live_part_names): the
+# file the collection published before the monthly tail, then the twelve
+# months. The PATH shims below answer that one call with this list and
+# every other python3 call with a row count.
+LIVE_NAMES = " ".join(["live.parquet"]
+                      + [f"live-{m:02d}.parquet" for m in range(1, 13)])
+NAMES_SHIM = (f'case " $* " in *live_part_names*) echo "{LIVE_NAMES}"; '
+              'exit 0;; esac\n')
+
+
 def test_fold_live_enumerates_years_with_rows_in_live_when_years_is_unset():
     """YEARS unset: the year list comes from the bucket (a python3 probe
     over s2_build.published_part and published_rows, shimmed here), and
-    a probe that cannot answer stops the job before any download."""
+    a probe that cannot answer stops the job before any download. Every
+    live name of the year is probed, and each one with rows is folded."""
     with tempfile.TemporaryDirectory() as td:
         shim = Path(td) / "bin"; shim.mkdir()
         (shim / "python3").write_text(
             "#!/bin/bash\n"
+            + NAMES_SHIM +
             "if [ \"$1\" = - ]; then echo \"$FAKE_YEARS\"; exit \"${FAKE_EXIT:-0}\"; fi\n"
             "echo 5\n")
         (shim / "python3").chmod(0o755)
@@ -199,7 +211,9 @@ def test_fold_live_enumerates_years_with_rows_in_live_when_years_is_unset():
         proc = _bash(RAILS / "fold_live.sbatch", env)
         assert "YEARS unset; folding every year with rows in live: 2022,2026" in proc.stdout
         assert "year=2022: live.parquet holds 5 row(s)" in proc.stdout
+        assert "year=2022: live-09.parquet holds 5 row(s)" in proc.stdout
         assert Path(td, "publish/fold/in/year=2022/live.parquet").exists()
+        assert Path(td, "publish/fold/in/year=2022/live-09.parquet").exists()
         # No year with rows: a green no-op.
         env["FAKE_YEARS"] = ""
         proc = _bash(RAILS / "fold_live.sbatch", env)
@@ -226,7 +240,8 @@ def test_fold_live_refuses_a_live_only_fold_of_a_fetched_year():
             " if [[ $last == *live.parquet ]]; then echo -n 200; else echo -n 404; fi; exit 0;; esac\n"
             "for ((i=1;i<=$#;i++)); do if [[ ${!i} == -o ]]; then j=$((i+1)); echo x > \"${!j}\"; fi; done\n")
         (shim / "curl").chmod(0o755)
-        (shim / "python3").write_text("#!/bin/bash\necho 5\n"); (shim / "python3").chmod(0o755)
+        (shim / "python3").write_text("#!/bin/bash\n" + NAMES_SHIM + "echo 5\n")
+        (shim / "python3").chmod(0o755)
         slices = Path(td) / "slices"; slices.mkdir()
         (slices / "2026-01.parquet").write_bytes(b"x")
         env = _dry_env(YEARS="2026", SLICES=str(slices), PUBLISH=f"{td}/publish",
@@ -243,12 +258,16 @@ def test_audit_smoke_audits_the_smoke_month_only():
     assert "--months 2017-07 " in out and "2017-08" not in out
 
 
-def test_fold_live_uploads_parts_before_live_with_force():
+def test_fold_live_uploads_the_year_file_before_every_emptied_live_part():
+    """The year file first, then one put per live part folded -- here the
+    whole candidate list, because a dry run assumes every probe answers 200.
+    A reader that sees the new year file and an old live part sees some
+    scenes twice; one that saw an emptied part first would see a hole."""
     out = _bash(RAILS / "fold_live.sbatch", _dry_env(YEARS="2026")).stdout
     puts = [line for line in out.splitlines() if "upload.py" in line]
-    assert len(puts) == 2
+    assert len(puts) == 1 + 13
     assert puts[0].endswith("--force sentinel-2-c1-l2a/year=2026/items.parquet")
-    assert puts[1].endswith("--force sentinel-2-c1-l2a/year=2026/live.parquet")
+    assert [p.split("/")[-1] for p in puts[1:]] == LIVE_NAMES.split()
     assert out.index("s2_build.py") < out.index("upload.py")
     assert "make_items.py --collection sentinel-2-c1-l2a" in out
 
