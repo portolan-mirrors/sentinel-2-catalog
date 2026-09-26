@@ -1818,12 +1818,8 @@ function setTip(el, text) {
   if (text) el.dataset.tip = text; else delete el.dataset.tip;
 }
 
-// The scrub preview is the scene's thumbnail, unwarped, stretched flat over
-// its footprint bbox as a BitmapLayer: one ~40 KB JPEG per step, no COG
-// read. It is approximate by design — the real, warped preview (cog.js's
-// previewLayer, also `_imageCoordinateSystem: "lnglat"`) replaces it once
-// the committed scene lands. The full showOnMap path runs only on release.
-// Bitmaps cache so a back-and-forth is free.
+// The thumbnail bitmap alone, decoded once per scene id and cached: the
+// warp builder below needs it, and so does the neighbour prefetch.
 const thumbBitmaps = new Map();
 const THUMB_BITMAPS_MAX = 40;
 function thumbBitmapFor(row) {
@@ -1836,6 +1832,41 @@ function thumbBitmapFor(row) {
   return thumbBitmaps.get(row.id);
 }
 
+// The scrub preview is the same warped image the committed scene shows
+// (cog.js's previewImage, over the scene's UTM grid via previewLayer): a
+// partial granule registers exactly instead of stretching flat over the
+// full footprint square, and nodata is masked the same way. The map below
+// caches the warp per scene id, so the cost — one ~64 KiB TCI header read —
+// falls once per scene the user pauses on, not once per drag frame.
+const scrubPreviews = new Map();
+const SCRUB_PREVIEWS_MAX = 20;
+function scrubPreviewFor(row) {
+  const id = String(row.id);
+  if (!scrubPreviews.has(id)) {
+    scrubPreviews.set(id, (async () => {
+      try {
+        const scene = openScene(id, sceneDirOf(row));
+        const cog = await sceneCog(scene, "TCI");
+        const bitmap = await thumbBitmapFor(row);
+        if (!bitmap) return null;
+        const white = /\/thumbnail\.jpg$/i.test(new URL(row.thumbnail_url).pathname);
+        const img = previewImage(cog, bitmap, { white });
+        return img ? { img, cog } : null;
+      } catch {
+        // A missing/odd thumbnail_url (sceneDirOf) or a failed header read
+        // (sceneCog) resolves to null rather than rejecting, so an awaiter
+        // never sees an unhandled rejection — just no preview this time.
+        return null;
+      }
+    })());
+    scrubPreviews.get(id).catch(() => scrubPreviews.delete(id));
+    if (scrubPreviews.size > SCRUB_PREVIEWS_MAX) {
+      scrubPreviews.delete(scrubPreviews.keys().next().value);
+    }
+  }
+  return scrubPreviews.get(id);
+}
+
 let scrubSeq = 0;
 async function previewIndex(i) {
   const view = currentView();
@@ -1846,12 +1877,12 @@ async function previewIndex(i) {
   $("imgnav-label").textContent =
     `${i + 1} of ${view.length} · ${row.day} · ${row.cloud.toFixed(1)}% cloud`;
   for (const [id, card] of cardNodes) card.classList.toggle("peek", id === row.id);
-  const b = bboxOf(row);
-  const bitmap = b ? await thumbBitmapFor(row) : null;
+  const p = await scrubPreviewFor(row);
   if (seq !== scrubSeq) return;
-  scrubLayer = bitmap ? new window.deck.BitmapLayer({
-    id: "scrub-preview", image: bitmap, bounds: [b[0], b[1], b[2], b[3]],
-    _imageCoordinateSystem: "lnglat" }) : null;
+  // A null build (no thumbnail, a CORS failure, a COG open failure) leaves
+  // whatever the scrub layer already shows — never a raw, unwarped bitmap;
+  // that mismatch is the jitter this warp exists to remove.
+  if (p) scrubLayer = previewLayer(p.img, p.cog, "scrub-preview");
   render();
 }
 $("imgscrub").addEventListener("input", () => previewIndex(Number($("imgscrub").value)));
@@ -2139,7 +2170,9 @@ async function showTci(me, spec, serial) {
 // remember the scene, set the panel to the asked preset and apply it.
 // `button` is the control to disable while the read runs. It is null when
 // the page itself asks for a scene (showIndex), because no control was hit.
-async function showOnMap(r, button, preset = "tci", band = null) {
+// `fly` frames the footprint; a step or a scrub release leaves the camera
+// where it stands and lets "Zoom to" (syncZoomTo) re-frame on demand.
+async function showOnMap(r, button, preset = "tci", band = null, fly = true) {
   const id = String(r.id);
   // A chip on the scene already shown keeps what it has read and set.
   const prev = shown?.id === id ? shown : null;
@@ -2148,7 +2181,7 @@ async function showOnMap(r, button, preset = "tci", band = null) {
     offset: offsetOf(r), scene: prev?.scene ?? null, bitmapP: prev?.bitmapP ?? null,
     loading: false, eventsFor: null };
   const bbox = bboxOf(r);
-  if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 1200 });
+  if (fly && bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 1200 });
   if (button) button.disabled = true;
   // A scene already on the map comes off now, not when this one is ready:
   // the bar names this scene from here on and the map must not contradict it.
@@ -2380,7 +2413,7 @@ async function startSearch(tile, year) {
   scheduleApply({ nav: true });
   const view = currentView();
   if (view.length) {
-    showIndex(0);
+    showIndex(0, true);
     if (snap !== "peek") box.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 }
@@ -2391,14 +2424,16 @@ async function startSearch(tile, year) {
 // renders that card set now (not on the next frame, so the outline and
 // the scroll land together), and scrolls the target card into view —
 // except in peek, where the sheet is collapsed and there is nothing to see.
-function showIndex(i) {
+// `fly` only frames the camera for the first result after a search; a step
+// or a scrub commit leaves the camera where the user left it (feedback 4).
+function showIndex(i, fly = false) {
   const view = currentView();
   const row = view[i];
   if (!row) return;
   if (i >= S.shown) S.shown = Math.ceil((i + 1) / 15) * 15;
   S.displayedId = row.id;
   S.detachedAt = i;
-  showOnMap(row, null, ui.preset);
+  showOnMap(row, null, ui.preset, null, fly);
   renderResultsNow();
   scheduleApply({ nav: true });
   if (snap !== "peek") {
@@ -2407,7 +2442,7 @@ function showIndex(i) {
   const view2 = currentView();
   const at2 = indexOfId(view2, row.id);
   (window.requestIdleCallback ?? setTimeout)(() => {
-    for (const n of [view2[at2 - 1], view2[at2 + 1]]) if (n) thumbBitmapFor(n);
+    for (const n of [view2[at2 - 1], view2[at2 + 1]]) if (n) scrubPreviewFor(n);
   });
 }
 

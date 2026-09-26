@@ -141,7 +141,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   width: 96px; height: 96px; object-fit: cover; flex: 0 0 96px;
   border-radius: 4px;
   /* The preview JPEGs' white nodata is keyed to transparent in app.js
-     (thumbnail()), so the swath sits straight on the panel. */
+     (thumbnail()), so the swath sits straight on the panel. A white
+     background under that transparency matches the map's own white
+     nodata, so a snowy scene still reads as snow, not as a hole. */
+  background: #fff;
 }
 .scene div { font-size: 12px; color: var(--dim); min-width: 0; word-break: break-word; }
 .scene b { color: var(--ink); font-weight: 600; }
