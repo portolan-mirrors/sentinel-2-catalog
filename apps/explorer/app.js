@@ -1442,6 +1442,9 @@ function hideImagePanel() {
   $("imgnav").hidden = true;
   $("imgnav-label").hidden = true;
   $("bandbox").hidden = true;
+  // No scene is left to bridge to — Clear and a failed load both call this,
+  // so the scrub thumbnail (if one is still up) comes off the map too.
+  if (scrubLayer) { scrubLayer = null; render(); }
   // peek exists to show the "Showing …" line; with no scene there is nothing
   // to peek at, so the sheet goes back to what a fresh page shows.
   if (snap === "peek") setSnap("half");
@@ -1629,6 +1632,7 @@ function tilesSettled() {
   if (map.isMoving() || !cogLayer.isLoaded) return;
   shown.settled = true;
   cogPreview = null;
+  scrubLayer = null;
   render();
   const { id, spec, missing } = shown;
   const read = spec.bands.filter((b) => !missing.includes(b));
@@ -1715,9 +1719,12 @@ for (const id of ["imgprev", "imgnext"]) {
   $(id).addEventListener("pointerleave", () => { $("imgnav-label").hidden = true; });
 }
 
-// The scrub preview is the scene's thumbnail as a flat BitmapLayer over
-// its bbox: one ~40 KB JPEG per step, no COG read. The full showOnMap
-// path runs only on release. Bitmaps cache so a back-and-forth is free.
+// The scrub preview is the scene's thumbnail, unwarped, stretched flat over
+// its footprint bbox as a BitmapLayer: one ~40 KB JPEG per step, no COG
+// read. It is approximate by design — the real, warped preview (cog.js's
+// previewLayer, also `_imageCoordinateSystem: "lnglat"`) replaces it once
+// the committed scene lands. The full showOnMap path runs only on release.
+// Bitmaps cache so a back-and-forth is free.
 const thumbBitmaps = new Map();
 const THUMB_BITMAPS_MAX = 40;
 function thumbBitmapFor(row) {
@@ -1744,25 +1751,76 @@ async function previewIndex(i) {
   const bitmap = b ? await thumbBitmapFor(row) : null;
   if (seq !== scrubSeq) return;
   scrubLayer = bitmap ? new window.deck.BitmapLayer({
-    id: "scrub-preview", image: bitmap, bounds: [b[0], b[1], b[2], b[3]] }) : null;
+    id: "scrub-preview", image: bitmap, bounds: [b[0], b[1], b[2], b[3]],
+    _imageCoordinateSystem: "lnglat" }) : null;
   render();
 }
 $("imgscrub").addEventListener("input", () => previewIndex(Number($("imgscrub").value)));
-$("imgscrub").addEventListener("change", () => {
+
+// A gesture ends one of two ways: "change" commits it (release, or once per
+// keypress on a held arrow key), or nothing fires at all — a drag back to
+// the start value, Esc mid-drag (Firefox rolls the value back with no
+// change), a cancelled touch. Either way the preview, the card outline and
+// the label must not outlive the gesture.
+let scrubCommitting = false;
+function clearScrubPreview() {
   scrubSeq += 1;
   scrubLayer = null;
   render();
   for (const card of cardNodes.values()) card.classList.remove("peek");
   $("imgnav-label").hidden = true;
-  showIndex(Number($("imgscrub").value));
+  delete $("imgnav-label").dataset.detached;
+}
+function endScrubGesture() {
+  // A "change" for a real commit fires, and sets scrubCommitting, before
+  // the matching pointerup settles — so the deferred check below always
+  // sees the flag a commit already raised, and never strips the bridging
+  // layer a commit is waiting to hand off (finding 2c).
+  setTimeout(() => { if (!scrubCommitting) clearScrubPreview(); }, 0);
+}
+$("imgscrub").addEventListener("pointerup", endScrubGesture);
+$("imgscrub").addEventListener("pointercancel", endScrubGesture);
+$("imgscrub").addEventListener("blur", () => { if (!scrubCommitting) clearScrubPreview(); });
+$("imgscrub").addEventListener("keydown", (e) => { if (e.key === "Escape") clearScrubPreview(); });
+
+// The release itself: scrubSeq bumps at once, so no in-flight bitmap can
+// draw after this point no matter how the heavy part below is scheduled.
+// That heavy part — the card/label cleanup and the load — waits out a
+// 200 ms trailing debounce, so a held arrow key settles into one commit
+// instead of stacking a full COG load per keypress. scrubLayer is left
+// alone here: showTci, showBandsLoaded and tilesSettled drop it once the
+// new scene's preview or tiles actually land, so the old thumbnail
+// bridges the fly-and-load gap instead of the map going blank.
+let commitTimer = 0;
+function commitScrub() {
+  scrubCommitting = false;
+  for (const card of cardNodes.values()) card.classList.remove("peek");
+  $("imgnav-label").hidden = true;
+  delete $("imgnav-label").dataset.detached;
+  const i = Number($("imgscrub").value);
+  const row = currentView()[i];
+  // Already the shown scene: a track click at the current position must
+  // not re-fly the camera or reload it, so the bridge comes down at once.
+  if (!row || row.id === S.displayedId) { scrubLayer = null; render(); return; }
+  showIndex(i);
+}
+$("imgscrub").addEventListener("change", () => {
+  scrubCommitting = true;
+  scrubSeq += 1;
+  clearTimeout(commitTimer);
+  commitTimer = setTimeout(commitScrub, 200);
 });
 
 // The scrubber's position and range follow the view. When the shown scene
 // no longer passes the filters the thumb detaches: the image stays on the
 // map, the label says why, and prev/next step in from the last position.
+// The label doubles as the Task 10 hover title, so the non-detached branch
+// hides it only when the detached branch was the one that last wrote it
+// (the data-detached marker), never clobbering an unrelated hover label.
 function renderScrubber() {
   const view = currentView();
   const scrub = $("imgscrub");
+  const label = $("imgnav-label");
   scrub.max = String(Math.max(0, view.length - 1));
   scrub.disabled = !shown || view.length < 2;
   const at = shown ? indexOfId(view, S.displayedId) : -1;
@@ -1771,8 +1829,12 @@ function renderScrubber() {
   const detached = !!shown && view.length > 0 && at < 0;
   scrub.toggleAttribute("data-detached", detached);
   if (detached) {
-    $("imgnav-label").hidden = false;
-    $("imgnav-label").textContent = `${shown.id} · outside the current filters`;
+    label.hidden = false;
+    label.textContent = `${shown.id} · outside the current filters`;
+    label.dataset.detached = "";
+  } else if (label.dataset.detached !== undefined) {
+    label.hidden = true;
+    delete label.dataset.detached;
   }
 }
 
@@ -1867,6 +1929,9 @@ async function showBandsLoaded(me, spec, serial, failed) {
   const preview = bandPreviewImage(me.scene, spec);
   cogLayer = bandTileLayer(me.scene, spec, styleKeyOf(spec), `cog-${id}-${me.bandsKey}`, me.eventsFor(me.bandsKey));
   cogPreview = preview ? previewLayer(preview, me.scene, `cog-preview-${id}`) : null;
+  // The real bands are on the map now; the flat scrub thumbnail that
+  // bridged the release has done its job.
+  scrubLayer = null;
   render();
   cogbar(id, "loading", preview ? "Preview shown — loading full resolution…" : "Loading full resolution…");
   debug(`[cog] ${id} ${me.bandsKey} preview shown at ${(performance.now() - me.t0).toFixed(0)} ms`);
@@ -1906,6 +1971,9 @@ async function showTci(me, spec, serial) {
   const cog = await sceneCog(me.scene, "TCI");
   if (stale(me, serial)) return;
   cogLayer = cogTileLayer(cog, `cog-${id}-TCI`, me.eventsFor("TCI"));
+  // The real tiles are registered; the flat scrub thumbnail that bridged
+  // the release has done its job.
+  scrubLayer = null;
   render();
   cogbar(id, "loading", "Loading full resolution…");
   const bitmap = await me.bitmapP;
@@ -1919,6 +1987,7 @@ async function showTci(me, spec, serial) {
   // keeps it, as the bar says.
   if (preview && !me.settled) {
     cogPreview = previewLayer(preview, cog, `cog-preview-${id}`);
+    scrubLayer = null;
     render();
     if (!me.failed) cogbar(id, "loading", "Preview shown — loading full resolution…");
     debug(`[cog] ${id} preview shown at ${(performance.now() - me.t0).toFixed(0)} ms`);
