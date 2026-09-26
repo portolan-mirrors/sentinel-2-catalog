@@ -898,7 +898,9 @@ because only 15 cards render at first.
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
 
----### Task 7: keyed card reconcile and lazy thumbnails
+---
+
+### Task 7: keyed card reconcile and lazy thumbnails
 
 **Files:**
 - Modify: `apps/explorer/app.js` (`sceneCard` 1721-1757 → `buildCard` + `cardFor`; `thumbnail` 1693-1719; `renderResults` from Task 6)
