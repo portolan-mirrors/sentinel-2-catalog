@@ -41,14 +41,15 @@ h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
 /* The collection switch sits between the title and its blurb. */
 .switch { margin: 2px 0 10px; }
 .hint { margin: 6px 0 0; color: var(--dim); font-size: 12px; }
-/* #query only (Task 20): the "Click the map…" hint sits between the section
-   head and the dates row. Only its top margin is trimmed here — the bottom
+/* #query only, from the panel tightening: the "Click the map…" hint sits
+   between the section head and the dates row. Only its top margin is
+   trimmed here — the bottom
    is already 0, so the gap it leaves before the dates row comes entirely
    from that row's own top margin, trimmed below on .filter. Scoped to
    #query so #bars, #bandnote, and the image-nav caption keep the wider
    .hint spacing they already had. */
 #query .hint { margin: 4px 0 0; }
-/* The "?" glyph (Task 20) sits inline at the end of its label's text
+/* The "?" glyph sits inline at the end of its label's text
    instead of in its own grid column, so it is sized to sit on the text
    baseline rather than centered on a row. */
 .info { width: 14px; height: 14px; border-radius: 50%; padding: 0;
@@ -56,7 +57,7 @@ h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
   background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); cursor: pointer;
   vertical-align: text-bottom; margin-left: 4px; }
 /* One filter row, one grid line: label, slider, value. The label carries
-   its own "?" button inline now (Task 20), so the grid needs only three
+   its own "?" button inline now, so the grid needs only three
    tracks — dropping the old fixed icon column gives the slider the rest.
    The first column is a fixed width, not max-content — each .filter is its
    own grid, so max-content would size every row from its own label alone
@@ -74,7 +75,7 @@ h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
 /* The dates header holds only a label — no slider, no value — so its row
    collapses to that one column instead of leaving two tracks empty. */
 .dates-head { grid-template-columns: 1fr; }
-/* The shared info/hover popover (Task 15): a box fixed to the viewport, so
+/* The shared info/hover popover: a box fixed to the viewport, so
    it sits on top of the sheet and the image panel instead of pushing them
    open. app.js sets its left/top next to whichever button raised it. */
 #tip {
@@ -138,10 +139,10 @@ input[type=range] { width: 74%; vertical-align: middle; padding: 0; border: 0;
 .dates { display: flex; gap: 8px; align-items: flex-end; }
 /* A flex item's own margin sets its height in the row (flex items never
    collapse margins), so the base label's 9px bottom margin was the real
-   floor under From/To. Trimmed here (Task 20) without touching the base
-   rule, which other labels outside #query still rely on. */
+   floor under From/To. Trimmed here, by the panel tightening, without
+   touching the base rule, which other labels outside #query still rely on. */
 .dates label { flex: 1 1 0; min-width: 0; margin-bottom: 3px; }
-/* The month-lock chip (Task 9): sits beside the From/To labels, shown only
+/* The month-lock chip: sits beside the From/To labels, shown only
    while a bar click has clamped the slider to one month. */
 .chip {
   display: inline-flex; align-items: center; gap: 4px;
@@ -311,8 +312,8 @@ button.mini:not(:disabled):hover { background: #26457a; }
   letter-spacing: .05em; text-transform: uppercase; padding: 1px 5px;
   border-radius: 3px;
 }
-/* Which card the map shows now (.current) and, from Task 11, which one a
-   hover or key press previews without changing what is shown (.peek). */
+/* Which card the map shows now (.current) and, from the scrub preview, which
+   one a hover or key press previews without changing what is shown (.peek). */
 .scene.current { outline: 2px solid #6ea8ff; outline-offset: -2px; }
 .scene.peek { outline: 2px dashed #6ea8ff; outline-offset: -2px; }
 

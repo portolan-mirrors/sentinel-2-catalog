@@ -219,11 +219,12 @@ const WANT = {
 // stub only guards a call that somehow lands before that.
 let hideTipFor = () => {};
 
-// The shared info/hover popover (Task 15). One #tip element serves every
-// `button.info` and the image nav's prev/next caption, instead of Task 5's
-// one tip per section. It is position: fixed on body, so it covers the map
-// and the panels instead of pushing them open, and app.js only ever moves
-// it and fills its text — the box itself never moves in the DOM.
+// The shared info/hover popover. One #tip element serves every
+// `button.info` and the image nav's prev/next caption, instead of the one
+// tip per section the filter tips started out with. It is position: fixed on
+// body, so it covers the map and the panels instead of pushing them open,
+// and app.js only ever moves it and fills its text — the box itself never
+// moves in the DOM.
 // A hover shows it (skipped on touch, which has no hover); a click on a
 // pinnable anchor (the .info buttons) pins it open until a click outside
 // any .info button, or Escape, takes it down. imgprev/imgnext wire in the
@@ -285,8 +286,9 @@ let hideTipFor = () => {};
     }
     if (pinnable) {
       anchor.addEventListener("click", (e) => {
-        // Task 20 moved the "?" button inside its label's text, so a click
-        // on it now bubbles toward a <label for=…> around a range input.
+        // The panel tightening moved the "?" button inside its label's text,
+        // so a click on it now bubbles toward a <label for=…> around a range
+        // input.
         // Stopped here so the label never also forwards the click to the
         // slider it wraps — this button only ever toggles the tip.
         e.stopPropagation();
@@ -562,9 +564,8 @@ const S = {
 // funnels through it) and from the map's moveend. A throttle, not a debounce:
 // the first call arms the timer and later ones inside the window ride it, so
 // a long drag keeps writing every 400 ms instead of waiting for its end. The
-// one history
-// entry is replaced, never added to: a slider drag must keep the URL current
-// without filling the Back button with a step per frame.
+// one history entry is replaced, never added to: a slider drag must keep the
+// URL current without filling the Back button with a step per frame.
 //
 // No write happens before finishRestore(): a boot writes the defaults
 // through applyNow several times, and those writes would erase an incoming
@@ -1255,6 +1256,12 @@ function warmWindowParts() {
   }
 }
 
+// True once restoreControls has run. init()'s early returns (an unreadable
+// timeline, a timeline with no rows) reach finishRestore without it, and a
+// link the boot could not apply must stay in the URL rather than be written
+// back as the defaults it never got to replace.
+let restoredControls = false;
+
 // The first half of the restore: the year, the window, the sliders, the
 // metric and the sort. Both boot paths call it once, after the year select
 // holds its options (a year outside them is not restorable) and before the
@@ -1266,12 +1273,6 @@ function warmWindowParts() {
 // exists: the shape check on `d=` admits 2023-99-99 and 2023-02-31, and an
 // <input type="date"> answers an impossible day with an empty value, which
 // would leave the page with no window at all.
-// True once restoreControls has run. init()'s early returns (an unreadable
-// timeline, a timeline with no rows) reach finishRestore without it, and a
-// link the boot could not apply must stay in the URL rather than be written
-// back as the defaults it never got to replace.
-let restoredControls = false;
-
 function restoreControls(defaultYear) {
   restoredControls = true;
   const goodDay = (s, year) => {
@@ -1366,8 +1367,8 @@ async function init() {
   $("maxcloud").addEventListener("input", onSlider);
   $("mincoverage").addEventListener("input", onSlider);
   $("minscenes").addEventListener("input", onSlider);
-  // Populate and wire the result sort control (Task 8). Reset the shown
-  // card count on every sort change to restart pagination at card 1.
+  // Populate and wire the result sort control. Reset the shown card count on
+  // every sort change to restart pagination at card 1.
   for (const [key, s] of Object.entries(SORTS)) $("sort").append(new Option(s.label, key));
   $("sort").value = S.sort;
   function setSort(key) {
@@ -2046,7 +2047,7 @@ function tilesSettled() {
 }
 map.on("moveend", tilesSettled);
 
-// The nav strip's zoom-to (Task 10): re-frame the shown scene's footprint.
+// The image nav strip's zoom-to: re-frame the shown scene's footprint.
 // A separate listener from tilesSettled — this one only reads the camera,
 // it never touches the tile layer.
 function flyToImage(bbox) {
@@ -2084,9 +2085,9 @@ $("zoomto").addEventListener("click", () => {
   if (b) flyToImage(b);
 });
 
-// Step through the current sort order (Task 10). stepImage moves from
-// where the map stands, not from the scrub bar, so a click after a manual
-// pan still steps from the shown scene.
+// Step through the current sort order, from the image nav strip. stepImage
+// moves from where the map stands, not from the scrub bar, so a click after
+// a manual pan still steps from the shown scene.
 function stepImage(delta) {
   const view = currentView();
   if (!view.length) return;

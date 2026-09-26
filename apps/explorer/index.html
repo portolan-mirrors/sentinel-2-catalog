@@ -27,9 +27,9 @@
   <div id="cogbar" hidden>Showing <b id="cog-id"></b> on the map
     <span id="cog-state" data-state="loading" role="status"></span>
     <button id="cog-clear" class="mini" type="button">Clear</button></div>
-  <!-- The nav strip (Task 10): step through the current sort order and
-       zoom to the shown scene's footprint. Hidden with no scene shown;
-       the scrub bar is wired in a later task. -->
+  <!-- The image nav strip: step through the current sort order, scrub
+       across it, and zoom to the shown scene's footprint. Hidden with no
+       scene shown. -->
   <div id="imgnav" hidden>
     <button id="imgprev" class="mini" type="button" aria-label="Previous scene">‹</button>
     <input type="range" id="imgscrub" min="0" max="0" step="1" value="0"
@@ -146,7 +146,7 @@
 </aside>
   </div>
 </div>
-<!-- The shared info/hover popover (Task 15): one box for every info button
+<!-- The shared info/hover popover: one box for every info button
      and the image nav's prev/next caption, positioned by app.js next to
      whichever one is active. A direct child of body, not of #sheet or
      #imgpanel, so it can sit on top of either and is never clipped by
