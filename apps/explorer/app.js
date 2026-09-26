@@ -947,6 +947,16 @@ async function init() {
   $("maxcloud").addEventListener("input", onSlider);
   $("mincoverage").addEventListener("input", onSlider);
   $("minscenes").addEventListener("input", onSlider);
+  // Populate and wire the result sort control (Task 8). Reset the shown
+  // card count on every sort change to restart pagination at card 1.
+  for (const [key, s] of Object.entries(SORTS)) $("sort").append(new Option(s.label, key));
+  $("sort").value = S.sort;
+  function setSort(key) {
+    S.sort = key;
+    S.shown = 15;
+    scheduleApply({ cards: true, nav: true });
+  }
+  $("sort").addEventListener("change", () => setSort($("sort").value));
   say("Reading the stats timeline…");
   let span, found;
   try {
