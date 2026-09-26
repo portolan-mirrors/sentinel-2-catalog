@@ -411,19 +411,23 @@ def staged_c1_year(directory: Path, year: int = 2026) -> Path:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     year_dir = out / f"year={year}"
     assert (year_dir / "items.parquet").is_file()
-    # The tail: the same rows built again under the tail's name.
+    # The tail: the same rows built again as the live part of one month.
     tail = directory / "tail"
-    proc = _build_c1(tail, chunks, ["--name", "live.parquet"], years=str(year))
+    proc = _build_c1(tail, chunks, ["--months", "3", "--name", "live-03.parquet"],
+                     years=str(year))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    (tail / f"year={year}" / "live.parquet").rename(year_dir / "live.parquet")
+    (tail / f"year={year}" / "live-03.parquet").rename(year_dir / "live-03.parquet")
     return year_dir
 
 
-def test_c1_parts_are_the_year_file_and_the_tail():
-    """No zone split, so a Collection 1 year has two candidates -- and the
-    first collection keeps its fourteen, PARTS being that list."""
+def test_c1_parts_are_the_year_file_and_the_monthly_tail():
+    """No zone split, so a Collection 1 year has the year file, the twelve
+    monthly live parts and the single live.parquet it published before
+    those existed -- and the first collection keeps its fourteen, PARTS
+    being that list."""
     assert [(key, name) for key, name, _, _ in parts_for(C1)] == [
-        ("data", "items.parquet"), ("live", "live.parquet")]
+        ("data", "items.parquet"), ("live", "live.parquet"),
+        *((f"live-{m:02d}", f"live-{m:02d}.parquet") for m in range(1, 13))]
     assert parts_for(FIRST) == PARTS and len(PARTS) == 14
     assert parts_for() == PARTS
 
@@ -442,37 +446,78 @@ def test_c1_discover_probes_the_c1_base_and_only_two_names():
         year_dir.mkdir()
         parts = discover(year_dir, 2026, True, None, probe, config=C1)
     assert asked == [f"{C1.public_base}/year=2026/items.parquet",
-                     f"{C1.public_base}/year=2026/live.parquet"]
+                     f"{C1.public_base}/year=2026/live.parquet",
+                     *(f"{C1.public_base}/year=2026/live-{m:02d}.parquet"
+                       for m in range(1, 13))]
+    assert not any("z01-20" in url for url in asked)
     assert C1.public_base.endswith("/sentinel-2-c1-l2a")
     assert [(p["key"], p["source"]) for p in parts] == [
-        ("data", "remote"), ("live", "remote")]
+        ("data", "remote"), ("live", "remote"),
+        *((f"live-{m:02d}", "remote") for m in range(1, 13))]
 
 
-def test_c1_year_item_links_items_and_live_only():
+def test_c1_year_item_links_items_and_the_months_that_exist():
     with tempfile.TemporaryDirectory() as td:
         year_dir = staged_c1_year(Path(td))
         parts = discover(year_dir, 2026, False, None, config=C1)
+        # Only the month that is staged: the other eleven and the
+        # pre-monthly live.parquet are not there, and nothing probes for
+        # them without --remote-baseline.
         assert [(p["key"], p["source"]) for p in parts] == [
-            ("data", "local"), ("live", "local")]
+            ("data", "local"), ("live-03", "local")]
         item = build_item(connect(), 2026, parts, None, config=C1)
 
     assert item["collection"] == "sentinel-2-c1-l2a"
     assert item["id"] == "2026"
     assert item["properties"]["title"] == "Sentinel-2 Collection 1 L2A scenes, 2026"
     assert [a["href"] for a in item["assets"].values()] == [
-        "./items.parquet", "./live.parquet"]
+        "./items.parquet", "./live-03.parquet"]
     assert item["assets"]["data"]["title"] == "2026 scenes, GeoParquet 2.0"
-    # Collection 1's tail is merged by the fold on RAILS, not consolidated.
-    assert item["assets"]["live"]["title"] == "Rolling tail since the last fold, refreshed daily"
+    # Collection 1's tail is one file per month, merged by the fold on
+    # RAILS, not consolidated.
+    assert item["assets"]["live-03"]["title"] == (
+        "March 2026 tail, refreshed daily since the last fold")
     assert PARTS[-1][2] == "Rolling tail since the last consolidation, refreshed daily"
     assert item["assets"]["data"]["table:row_count"] == 300
-    assert item["properties"]["table:row_count"] == 600
+    # The year file holds every month; the tail holds March alone, so the
+    # year's total is the sum of the parts that exist.
+    assert item["assets"]["live-03"]["table:row_count"] == 100
+    assert item["properties"]["table:row_count"] == 400
     assert item["properties"]["start_datetime"].startswith("2026-01-01T")
     assert item["properties"]["end_datetime"].startswith("2026-03-")
     assert item["properties"]["s2:platforms"] == ["sentinel-2b"]
     assert all(link["rel"] != "self" for link in item["links"])
     parent = next(l for l in item["links"] if l["rel"] == "parent")
     assert parent["title"] == "Sentinel-2 Collection 1 L2A scenes (item index)"
+
+
+def test_c1_year_item_sums_over_whatever_months_exist():
+    """The year's row count and extent sum over the monthly live parts that
+    are there. Two staged months plus the year file, with the other ten
+    months and the pre-monthly live.parquet answering 404: every month
+    present is its own asset, the absent ones are left out, and the totals
+    are the sum."""
+    with tempfile.TemporaryDirectory() as td:
+        year_dir = staged_c1_year(Path(td))
+        sys.path.insert(0, str(ROOT / "tests"))
+        from test_build import _build_c1
+        second = Path(td) / "tail2"
+        proc = _build_c1(second, Path(td) / "chunks" / "api",
+                         ["--months", "2", "--name", "live-02.parquet"],
+                         years="2026")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        (second / "year=2026" / "live-02.parquet").rename(
+            year_dir / "live-02.parquet")
+        parts = discover(year_dir, 2026, True, None, prober(ABSENT),
+                         config=C1)
+        assert [(p["key"], p["source"]) for p in parts] == [
+            ("data", "local"), ("live-02", "local"), ("live-03", "local")]
+        item = build_item(connect(), 2026, parts, None, config=C1)
+    assert item["properties"]["table:row_count"] == 300 + 100 + 100
+    assert [a["table:row_count"] for a in item["assets"].values()] == [300, 100, 100]
+    assert item["assets"]["live-02"]["start_datetime"].startswith("2026-02-")
+    assert item["assets"]["live-03"]["start_datetime"].startswith("2026-03-")
+    assert item["properties"]["start_datetime"].startswith("2026-01-01T")
 
 
 def test_c1_collection_json_comes_from_the_config():
@@ -498,7 +543,7 @@ def test_c1_collection_json_comes_from_the_config():
     assert coll["partition:glob"].endswith("/sentinel-2-c1-l2a/year=*/*.parquet")
     assert "sentinel-2-l2a/" not in coll["partition:glob"]
     assert coll["partition:file_count"] == 2
-    assert coll["table:row_count"] == 600
+    assert coll["table:row_count"] == 400
     assert coll["extent"]["temporal"]["interval"][0][0].startswith("2026-01-01T")
     assert all(link["rel"] != "self" for link in coll["links"])
     canonical = next(l for l in coll["links"] if l["rel"] == "canonical")
@@ -524,7 +569,8 @@ def test_c1_collection_json_comes_from_the_config():
     assert "one contiguous run" in desc
     assert "uniform row groups of about 6,000 rows" in desc
     assert "month-aligned" not in desc and "Hilbert" not in desc
-    assert "live.parquet" in desc and "z01-20" not in desc
+    assert "live-01.parquet to live-12.parquet" in desc and "z01-20" not in desc
+    assert "the live part of the month each scene was acquired in" in desc
     # The one mention of the first collection's tile column is the negation.
     assert desc.count("s2:mgrs_tile") == 1 and "no `s2:mgrs_tile`" in desc
     key_text = coll["partition:keys"][0]["description"]
