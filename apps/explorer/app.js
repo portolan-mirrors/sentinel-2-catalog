@@ -717,6 +717,12 @@ function scheduleApply(flags = {}) {
   applyFlags = { ...(applyFlags ?? {}), ...flags };
   if (first) requestAnimationFrame(applyNow);
 }
+// Mirrors currentView's own memo key (viewKey, declared with currentView
+// below): a filter or sort edit changes which scenes and positions the
+// scrub queue should be warming, so a change here restarts prefetchScrubStack
+// from the view's now-current shape. Cheap to check every frame — it is a
+// string compare, not a recompute.
+let lastPrefetchViewKey = "";
 function applyNow() {
   const f = applyFlags ?? {};
   applyFlags = null;
@@ -725,6 +731,11 @@ function applyNow() {
   if (f.nav) {
     renderScrubber();
     syncNavButtons();
+  }
+  currentView();
+  if (viewKey !== lastPrefetchViewKey) {
+    lastPrefetchViewKey = viewKey;
+    prefetchScrubStack();
   }
   updateFilterStatus();
   // Every state mutator ends here, so this one call keeps the URL current.
@@ -2144,7 +2155,12 @@ function thumbBitmapFor(row) {
 // caches the warp per scene id, so the cost — one ~64 KiB TCI header read —
 // falls once per scene the user pauses on, not once per drag frame.
 const scrubPreviews = new Map();
-const SCRUB_PREVIEWS_MAX = 20;
+// Settled builds only — a cache entry can be a promise still in flight, and
+// that is not "ready" for the track coloring below. Ids are stable, so this
+// is never cleared on its own; it loses an id only when scrubPreviews evicts
+// that same id (the cap below), keeping the two maps' membership aligned.
+const scrubReady = new Set();
+const SCRUB_PREVIEWS_MAX = 120;
 function scrubPreviewFor(row) {
   const id = String(row.id);
   if (!scrubPreviews.has(id)) {
@@ -2156,6 +2172,7 @@ function scrubPreviewFor(row) {
         if (!bitmap) return null;
         const white = /\/thumbnail\.jpg$/i.test(new URL(row.thumbnail_url).pathname);
         const img = previewImage(cog, bitmap, { white });
+        if (img) scrubReady.add(id);
         return img ? { img, cog } : null;
       } catch {
         // A missing/odd thumbnail_url (sceneDirOf) or a failed header read
@@ -2166,10 +2183,87 @@ function scrubPreviewFor(row) {
     })());
     scrubPreviews.get(id).catch(() => scrubPreviews.delete(id));
     if (scrubPreviews.size > SCRUB_PREVIEWS_MAX) {
-      scrubPreviews.delete(scrubPreviews.keys().next().value);
+      const evicted = scrubPreviews.keys().next().value;
+      scrubPreviews.delete(evicted);
+      scrubReady.delete(evicted);
     }
   }
   return scrubPreviews.get(id);
+}
+
+// The track fill: a hard-stop linear-gradient over the current view, one
+// segment per contiguous run of loaded/unloaded positions, each boundary at
+// (i / (view.length - 1)) * 100%, where i is the first index of the run
+// following the boundary (or 100% when a run reaches the last index) — so
+// consecutive runs share the exact same stop percentage and the gradient
+// cuts there instead of interpolating across it. i / (view.length - 1) is
+// also the fraction the native thumb uses for index i (scrub.max is
+// view.length - 1), so the cut lines up with the position it describes.
+// Applied as the --scrub-fill custom property
+// (see style.css) rather than a direct background, because #imgscrub is not
+// -webkit-appearance:none: its thumb stays native (accent-colored), and only
+// the track pseudo-element's own background needs to change. Throttled to
+// once per frame like onSlider — the prefetch queue below repaints after
+// every settled preview, and a raw per-item repaint would fight the frame
+// budget for no visible benefit.
+let scrubTrackFrame = 0;
+function paintScrubTrack() {
+  if (scrubTrackFrame) return;
+  scrubTrackFrame = requestAnimationFrame(() => {
+    scrubTrackFrame = 0;
+    const scrub = $("imgscrub");
+    const view = currentView();
+    if (!view.length) { scrub.style.setProperty("--scrub-fill", "none"); return; }
+    if (view.length === 1) {
+      scrub.style.setProperty("--scrub-fill",
+        scrubReady.has(String(view[0].id)) ? "var(--scrub-loaded)" : "none");
+      return;
+    }
+    const loaded = view.map((r) => scrubReady.has(String(r.id)));
+    const stops = [];
+    for (let start = 0; start < view.length;) {
+      let end = start;
+      while (end + 1 < view.length && loaded[end + 1] === loaded[start]) end++;
+      const color = loaded[start] ? "var(--scrub-loaded)" : "transparent";
+      const from = (start / (view.length - 1)) * 100;
+      const to = end === view.length - 1 ? 100 : ((end + 1) / (view.length - 1)) * 100;
+      stops.push(`${color} ${from}%`, `${color} ${to}%`);
+      start = end + 1;
+    }
+    scrub.style.setProperty("--scrub-fill", `linear-gradient(to right, ${stops.join(", ")})`);
+  });
+}
+
+// Preload the scrub previews for the whole view, three at a time, outward
+// from the shown position. paintScrubTrack shows which positions are ready
+// as it goes. A new search bumps prefetchSeq (both here and at startSearch's
+// first lines, so a dead search's queue stops within one await even if the
+// search never reaches a success path to start a fresh one) and drops the
+// old queue. The order is fixed at the moment this runs — a scrub drag
+// mid-queue does not reprioritize around the drag position; the next search
+// or view-key change (applyNow) starts a fresh queue from wherever the view
+// sits then.
+let prefetchSeq = 0;
+async function prefetchScrubStack() {
+  const seq = ++prefetchSeq;
+  const view = currentView();
+  if (!view.length || !S.search) return;
+  const at = Math.max(0, indexOfId(view, S.displayedId));
+  const order = [];
+  for (let d = 0; d < view.length; d++) {   // at, at+1, at-1, at+2, …
+    const i = d % 2 ? at - ((d + 1) >> 1) : at + (d >> 1);
+    if (i >= 0 && i < view.length) order.push(view[i]);
+  }
+  let next = 0;
+  await Promise.all([0, 1, 2].map(async () => {
+    while (next < order.length && next < SCRUB_PREVIEWS_MAX) {
+      const row = order[next++];
+      if (seq !== prefetchSeq) return;
+      await scrubPreviewFor(row).catch(() => null);
+      if (seq !== prefetchSeq) return;
+      paintScrubTrack();
+    }
+  }));
 }
 
 let scrubSeq = 0;
@@ -2187,7 +2281,10 @@ async function previewIndex(i) {
   // A null build (no thumbnail, a CORS failure, a COG open failure) leaves
   // whatever the scrub layer already shows — never a raw, unwarped bitmap;
   // that mismatch is the jitter this warp exists to remove.
-  if (p) scrubLayer = previewLayer(p.img, p.cog, "scrub-preview");
+  if (p) {
+    scrubLayer = previewLayer(p.img, p.cog, "scrub-preview");
+    scrubReady.add(String(row.id));
+  }
   render();
 }
 $("imgscrub").addEventListener("input", () => previewIndex(Number($("imgscrub").value)));
@@ -2311,6 +2408,9 @@ function renderScrubber() {
     label.hidden = true;
     delete label.dataset.detached;
   }
+  // View/sort changes remap which index each id sits at; recolor so the
+  // same ready ids light up their new positions.
+  paintScrubTrack();
 }
 
 const stale = (me, serial) => me !== shown || serial !== me.serial;
@@ -2705,6 +2805,10 @@ async function startSearch(tile, year, { flyFirst = true } = {}) {
   // on a null search, currentView is empty, and the status line falls back
   // to the map's own filter sentence.
   S.search = null;
+  // A dead search's prefetch queue must stop within one await even if this
+  // run never reaches the success path below to start a fresh one (a query
+  // error or an empty year both return early with no rows to warm).
+  prefetchSeq++;
   box.replaceChildren(el("p", "hint", "Reading the item parts…"));
   $("sql").textContent = "Range-reading…";
   // The mirror while the read runs. updateFilterStatus keeps it current from
@@ -2731,6 +2835,9 @@ async function startSearch(tile, year, { flyFirst = true } = {}) {
   }
   $("sql").textContent = got.plan;
   cardNodes = new Map();
+  scrubPreviews.clear();
+  scrubReady.clear();
+  paintScrubTrack();
   S.search = { tile, year, rows: got.rows, at: Date.now() };
   S.shown = 15;
   S.displayedId = null;
@@ -2742,6 +2849,9 @@ async function startSearch(tile, year, { flyFirst = true } = {}) {
     showIndex(0, flyFirst);
     if (snap !== "peek") box.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
+  // Fire-and-forget: warms the scrub stack outward from the shown scene.
+  // Its own seq guard makes this safe to leave unawaited.
+  prefetchScrubStack();
 }
 
 // Commit the view's position i to the map: the auto-show of the best
@@ -2765,11 +2875,8 @@ function showIndex(i, fly = false) {
   if (snap !== "peek") {
     cardNodes.get(row.id)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
-  const view2 = currentView();
-  const at2 = indexOfId(view2, row.id);
-  (window.requestIdleCallback ?? setTimeout)(() => {
-    for (const n of [view2[at2 - 1], view2[at2 + 1]]) if (n) scrubPreviewFor(n);
-  });
+  // No neighbour-only prefetch here: prefetchScrubStack already covers the
+  // whole view (order fixed at its own start — see its comment above).
 }
 
 // A slider drag re-renders on a short trailing debounce; the map repaint

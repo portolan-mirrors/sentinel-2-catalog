@@ -5,6 +5,9 @@
   --dim: #93a2c0;
   --line: #24304d;
   --accent: #6ea8ff;
+  /* The scrub track's "loaded" fill (Task 23): a subdued accent so the
+     ready/not-ready read comes from coverage, not from a bright new hue. */
+  --scrub-loaded: color-mix(in srgb, var(--accent) 45%, transparent);
   /* A .dayrange thumb's rendered box, both engines. A thumb's CENTER travels
      between half this width and (track width − half this width), never the
      track's own edges, so anything drawn to line up with a handle — the
@@ -263,6 +266,16 @@ button.mini:not(:disabled):hover { background: #26457a; }
 /* A dashed-thumb style per engine is not portable; reduced opacity says
    "detached" everywhere: the shown scene sits outside the current filters. */
 #imgscrub[data-detached] { opacity: 0.5; }
+/* app.js's paintScrubTrack sets --scrub-fill to a hard-stop gradient over
+   the view's loaded/unloaded ranges. #imgscrub keeps the plain input rule's
+   native thumb (it is not -webkit-appearance:none, so accent-color still
+   colors the thumb) — only the track pseudo-element's background changes,
+   per engine. The custom property, not a direct background on #imgscrub
+   itself, is the mechanism because the general `input[type=range]` rule
+   above sets `background: none` on the element and only the track pseudo
+   actually paints the fill either engine renders. */
+#imgscrub::-webkit-slider-runnable-track { background: var(--scrub-fill, none); }
+#imgscrub::-moz-range-track { background: var(--scrub-fill, none); }
 /* The band mapper: a compact block under the cogbar. */
 #bandbox:not([hidden]) {
   margin: 8px 0 0; padding: 6px 10px 8px; font-size: 12px; border-radius: 3px;
