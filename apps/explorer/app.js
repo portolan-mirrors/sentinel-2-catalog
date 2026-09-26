@@ -2191,21 +2191,28 @@ function scrubPreviewFor(row) {
   return scrubPreviews.get(id);
 }
 
-// The track fill: a hard-stop linear-gradient over the current view, one
-// segment per contiguous run of loaded/unloaded positions, each boundary at
-// (i / (view.length - 1)) * 100%, where i is the first index of the run
-// following the boundary (or 100% when a run reaches the last index) — so
-// consecutive runs share the exact same stop percentage and the gradient
-// cuts there instead of interpolating across it. i / (view.length - 1) is
-// also the fraction the native thumb uses for index i (scrub.max is
-// view.length - 1), so the cut lines up with the position it describes.
-// Applied as the --scrub-fill custom property
-// (see style.css) rather than a direct background, because #imgscrub is not
-// -webkit-appearance:none: its thumb stays native (accent-colored), and only
-// the track pseudo-element's own background needs to change. Throttled to
-// once per frame like onSlider — the prefetch queue below repaints after
-// every settled preview, and a raw per-item repaint would fight the frame
-// budget for no visible benefit.
+// The track fill: a hard-stop linear-gradient over the current view. Index i
+// owns the half-open span [i/len*100%, (i+1)/len*100%] of the track — a
+// position-count division (len positions splitting the track into len equal
+// spans), not a (len-1) fencepost tied to the thumb's own value fraction.
+// The fencepost version (boundary at i/(len-1)*100%) collapses any run that
+// contains index len-1 to zero width whenever that run is a singleton: its
+// "from" and the forced "to" of 100% are then the same value
+// ((len-1)/(len-1) = 1), so a lone loaded scene at the end of the view (or
+// any lone scene whose run reaches the last index) painted nothing. Runs of
+// equal loadedness merge into one segment, [start/len*100%, (end+1)/len*100%]
+// — the last run always reaches exactly 100%, singletons anywhere get a real
+// 1/len-wide span, and adjacent runs share the same stop percentage so the
+// gradient cuts hard there instead of interpolating across it. (This shifts
+// color edges half a position off the thumb's own i/(len-1) fractions —
+// accepted, since it is the standard way to color a discrete track and it is
+// the only version that gives every index a visible span.) Applied as the
+// --scrub-fill custom property (see style.css) rather than a direct
+// background, because #imgscrub is not -webkit-appearance:none: its thumb
+// stays native (accent-colored), and only the track pseudo-element's own
+// background needs to change. Throttled to once per frame like onSlider —
+// the prefetch queue below repaints after every settled preview, and a raw
+// per-item repaint would fight the frame budget for no visible benefit.
 let scrubTrackFrame = 0;
 function paintScrubTrack() {
   if (scrubTrackFrame) return;
@@ -2214,19 +2221,15 @@ function paintScrubTrack() {
     const scrub = $("imgscrub");
     const view = currentView();
     if (!view.length) { scrub.style.setProperty("--scrub-fill", "none"); return; }
-    if (view.length === 1) {
-      scrub.style.setProperty("--scrub-fill",
-        scrubReady.has(String(view[0].id)) ? "var(--scrub-loaded)" : "none");
-      return;
-    }
+    const len = view.length;
     const loaded = view.map((r) => scrubReady.has(String(r.id)));
     const stops = [];
-    for (let start = 0; start < view.length;) {
+    for (let start = 0; start < len;) {
       let end = start;
-      while (end + 1 < view.length && loaded[end + 1] === loaded[start]) end++;
+      while (end + 1 < len && loaded[end + 1] === loaded[start]) end++;
       const color = loaded[start] ? "var(--scrub-loaded)" : "transparent";
-      const from = (start / (view.length - 1)) * 100;
-      const to = end === view.length - 1 ? 100 : ((end + 1) / (view.length - 1)) * 100;
+      const from = (start / len) * 100;
+      const to = ((end + 1) / len) * 100;
       stops.push(`${color} ${from}%`, `${color} ${to}%`);
       start = end + 1;
     }
