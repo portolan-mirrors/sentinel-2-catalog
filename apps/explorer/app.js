@@ -895,6 +895,18 @@ function setWindow(from0, to0) {
   scheduleApply({ paint: true, cards: true, nav: true });
 }
 
+// Switch the whole page to a different year: clear any bar-click month lock,
+// rebound the date slider to Jan 1 - Dec 31, and repaint. From Task 6 on,
+// it also re-runs the scene search for the selected tile.
+function setYear(year) {
+  S.year = year;
+  S.monthLock = null;
+  $("datelock")?.toggleAttribute("hidden", true);
+  $("year").value = String(year);
+  setWindow(`${year}-01-01`, `${year}-12-31`);
+  if (S.tile && S.search) startSearch(S.tile, year);   // no-op until Task 6
+}
+
 // Warm the window's parts the moment the window is known, for the
 // collections whose parts hold every tile (prefetchParts). The metadata —
 // sidecar or footer — then sits in the session cache while the user is
@@ -915,8 +927,7 @@ function warmWindowParts() {
 async function init() {
   updateLegend();
   $("metric").addEventListener("change", () => { updateLegend(); paintWindow(); });
-  $("month").addEventListener("change", () =>
-    setWindow(`${$("month").value}-01`, lastDayOfMonth($("month").value)));
+  $("year").addEventListener("change", () => setYear(Number($("year").value)));
   $("maxcloud").addEventListener("input", onSlider);
   $("mincoverage").addEventListener("input", onSlider);
   $("minscenes").addEventListener("input", onSlider);
@@ -943,30 +954,29 @@ async function init() {
     await timelineFor(null);
     return;
   }
-  const month = $("month");
   // The stats can lag the item parts (they are rebuilt on their own
   // schedule, one cached HEAD per year past the stats to find how far
-  // publishing has gone, the same probe the search uses): the default
-  // month is always span.newest, the newest month the timeline actually
-  // has a row for (computed in newestMonth() above with year/month cast to
-  // INT before the year*100+month arithmetic — SMALLINT overflows past
-  // year 327). Never default to a month the stats haven't reached yet,
-  // which would paint an all-grey map with nothing to click. The picker
-  // itself still opens as far as the newest published item year (month.max
-  // below) so the user can browse ahead of the stats on purpose.
+  // publishing has gone, the same probe the search uses). Never default to
+  // a year the stats haven't reached yet, which would paint an all-grey map
+  // with nothing to click; the select itself still lists years through the
+  // newest published item year so the user can browse ahead on purpose.
   const statsYear = Number(span.newest.slice(0, 4));
   const newestYear = await newestPublishedYear(statsYear);
-  const defaultMonth = span.newest;
   if (newestYear > statsYear) {
     lagNote = `Stats reach ${span.newest}; scenes are published through ${newestYear} `
       + "— the choropleth updates when the stats rebuild lands.";
   }
-  // Said with the lag note, once, on the first painted month.
+  // Said with the lag note, once, on the first painted year.
   lagNote = (lagNote + collectionNote).trim();
-  month.min = span.oldest;
-  month.max = newestYear > statsYear ? `${newestYear}-12` : span.newest;
-  month.value = defaultMonth;
-  buildDateSlider(`${defaultMonth}-01`, lastDayOfMonth(defaultMonth));
+  const y0 = Number(span.oldest.slice(0, 4));
+  const y1 = Math.max(newestYear, statsYear);
+  for (let y = y0; y <= y1; y++) $("year").append(new Option(String(y), String(y)));
+  S.year = statsYear;
+  $("year").value = String(statsYear);
+  // Open on the newest month the stats have, expanded to its whole year:
+  // the year is the unit now, and the newest year is partly empty ahead of
+  // the backfill, which paintWindow tolerates month by month.
+  buildDateSlider(`${statsYear}-01-01`, `${statsYear}-12-31`);
   await Promise.all([paintWindow(), timelineFor(null)]);
   // paintWindow() already calls markActiveBars() (the same call the timeline
   // bar's own onclick makes), but it can run before timelineFor() has
@@ -976,8 +986,8 @@ async function init() {
   markActiveBars();
 }
 
-// The page without stats (a 404 on the collection's timeline): the month
-// picker opens on the current month over the collection's whole span so
+// The page without stats (a 404 on the collection's timeline): the year
+// select opens on the current year over the collection's whole span so
 // the search window can be set, the timeline says why it is empty, and the
 // status line says what is and is not published. The year parts are
 // probed from the current year downward and the walk stops at the first
@@ -989,12 +999,10 @@ async function init() {
 // without stats.
 async function initWithoutStats() {
   statsMissing = true;
-  const month = $("month");
-  const now = new Date().toISOString().slice(0, 7);
-  month.min = `${COL.since}-01`;
-  month.max = now;
-  month.value = now;
-  buildDateSlider(`${now}-01`, lastDayOfMonth(now));
+  for (let y = COL.since; y <= CURRENT_YEAR; y++) $("year").append(new Option(String(y), String(y)));
+  S.year = CURRENT_YEAR;
+  $("year").value = String(CURRENT_YEAR);
+  buildDateSlider(`${CURRENT_YEAR}-01-01`, `${CURRENT_YEAR}-12-31`);
   await timelineFor(null);
   let newestYear = null;
   for (let y = CURRENT_YEAR; y >= COL.since && newestYear === null; y--) {
