@@ -173,6 +173,9 @@ button.mini:not(:disabled):hover { background: #26457a; }
 /* The nav strip: prev/next and zoom-to beside the scrub bar, one row. */
 #imgnav { display: flex; align-items: center; gap: 6px; }
 #imgnav input[type=range] { flex: 1; min-width: 60px; }
+/* A dashed-thumb style per engine is not portable; reduced opacity says
+   "detached" everywhere: the shown scene sits outside the current filters. */
+#imgscrub[data-detached] { opacity: 0.5; }
 /* The band mapper: a compact block under the cogbar. */
 #bandbox:not([hidden]) {
   margin: 8px 0 0; padding: 6px 10px 8px; font-size: 12px; border-radius: 3px;

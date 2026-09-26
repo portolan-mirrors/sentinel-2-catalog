@@ -382,6 +382,7 @@ let paintKey = 0;
 let hovered = null;          // the hovered feature (GeoJSON, WGS84) or null
 let cogLayer = null;         // the shown scene's TileLayer, or null
 let cogPreview = null;       // its thumbnail warp, beneath the tiles until they load
+let scrubLayer = null;       // the scrub bar's live thumbnail preview, or null
 
 // The one state object. Every mutator writes here and calls scheduleApply;
 // every renderer reads from here. Nothing else holds filter or search state.
@@ -449,6 +450,7 @@ function render() {
     }),
     cogPreview,
     cogLayer,
+    scrubLayer,
     new GeoJsonLayer({
       id: "mgrs-hover",
       data: hovered ? [hovered] : [],
@@ -487,8 +489,6 @@ render();
 
 // One coalesced apply per animation frame: a slider drag asks for a paint
 // and a card render, and both run once, in order, on the next frame.
-// renderScrubber and syncNavButtons arrive in later tasks; the typeof
-// guards keep this file loadable in between.
 let applyFlags = null;
 function scheduleApply(flags = {}) {
   const first = !applyFlags;
@@ -499,10 +499,10 @@ function applyNow() {
   const f = applyFlags ?? {};
   applyFlags = null;
   if (f.paint) paintWindow();
-  if (f.cards) typeof renderResults === "function" && renderResults();
+  if (f.cards) renderResults();
   if (f.nav) {
-    typeof renderScrubber === "function" && renderScrubber();
-    typeof syncNavButtons === "function" && syncNavButtons();
+    renderScrubber();
+    syncNavButtons();
   }
   updateFilterStatus();
 }
@@ -1715,6 +1715,67 @@ for (const id of ["imgprev", "imgnext"]) {
   $(id).addEventListener("pointerleave", () => { $("imgnav-label").hidden = true; });
 }
 
+// The scrub preview is the scene's thumbnail as a flat BitmapLayer over
+// its bbox: one ~40 KB JPEG per step, no COG read. The full showOnMap
+// path runs only on release. Bitmaps cache so a back-and-forth is free.
+const thumbBitmaps = new Map();
+const THUMB_BITMAPS_MAX = 40;
+function thumbBitmapFor(row) {
+  if (!thumbBitmaps.has(row.id)) {
+    thumbBitmaps.set(row.id, thumbnailBitmap(row.thumbnail_url));
+    if (thumbBitmaps.size > THUMB_BITMAPS_MAX) {
+      thumbBitmaps.delete(thumbBitmaps.keys().next().value);
+    }
+  }
+  return thumbBitmaps.get(row.id);
+}
+
+let scrubSeq = 0;
+async function previewIndex(i) {
+  const view = currentView();
+  const row = view[i];
+  if (!row) return;
+  const seq = ++scrubSeq;
+  $("imgnav-label").hidden = false;
+  $("imgnav-label").textContent =
+    `${i + 1} of ${view.length} · ${row.day} · ${row.cloud.toFixed(1)}% cloud`;
+  for (const [id, card] of cardNodes) card.classList.toggle("peek", id === row.id);
+  const b = bboxOf(row);
+  const bitmap = b ? await thumbBitmapFor(row) : null;
+  if (seq !== scrubSeq) return;
+  scrubLayer = bitmap ? new window.deck.BitmapLayer({
+    id: "scrub-preview", image: bitmap, bounds: [b[0], b[1], b[2], b[3]] }) : null;
+  render();
+}
+$("imgscrub").addEventListener("input", () => previewIndex(Number($("imgscrub").value)));
+$("imgscrub").addEventListener("change", () => {
+  scrubSeq += 1;
+  scrubLayer = null;
+  render();
+  for (const card of cardNodes.values()) card.classList.remove("peek");
+  $("imgnav-label").hidden = true;
+  showIndex(Number($("imgscrub").value));
+});
+
+// The scrubber's position and range follow the view. When the shown scene
+// no longer passes the filters the thumb detaches: the image stays on the
+// map, the label says why, and prev/next step in from the last position.
+function renderScrubber() {
+  const view = currentView();
+  const scrub = $("imgscrub");
+  scrub.max = String(Math.max(0, view.length - 1));
+  scrub.disabled = !shown || view.length < 2;
+  const at = shown ? indexOfId(view, S.displayedId) : -1;
+  if (at >= 0) S.detachedAt = at;
+  scrub.value = String(at >= 0 ? at : Math.max(0, clampIndex(view, S.detachedAt)));
+  const detached = !!shown && view.length > 0 && at < 0;
+  scrub.toggleAttribute("data-detached", detached);
+  if (detached) {
+    $("imgnav-label").hidden = false;
+    $("imgnav-label").textContent = `${shown.id} · outside the current filters`;
+  }
+}
+
 const stale = (me, serial) => me !== shown || serial !== me.serial;
 
 // Put the panel's spec on the map for the shown scene: the TCI path (Task
@@ -2157,6 +2218,11 @@ function showIndex(i) {
   if (snap !== "peek") {
     cardNodes.get(row.id)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
+  const view2 = currentView();
+  const at2 = indexOfId(view2, row.id);
+  (window.requestIdleCallback ?? setTimeout)(() => {
+    for (const n of [view2[at2 - 1], view2[at2 + 1]]) if (n) thumbBitmapFor(n);
+  });
 }
 
 // A slider drag re-renders on a short trailing debounce; the map repaint
