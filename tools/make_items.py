@@ -414,8 +414,14 @@ def build_item(con: duckdb.DuckDBPyConnection, year: int, parts: list[dict],
             "type": "application/vnd.apache.parquet",
             "title": part["title"].format(year=year),
             "roles": part["roles"],
-            "start_datetime": st["t0"],
-            "end_datetime": st["t1"],
+            # A part with no rows has no time range, and the pair is left
+            # out rather than written as null: null is not a string, and
+            # STAC 1.1.0 structural validation rejects the item for it
+            # (rashid PTL-STR-001, stac-check). An emptied live part is
+            # that case -- what a fold, a consolidation, or the day the
+            # year file already held every staged row leaves behind.
+            **({"start_datetime": st["t0"], "end_datetime": st["t1"]}
+               if st["t0"] and st["t1"] else {}),
             "table:row_count": st["rows"],
             **({"file:size": part["size"]} if part["size"] else {}),
         }

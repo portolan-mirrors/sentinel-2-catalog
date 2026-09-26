@@ -520,6 +520,36 @@ def test_c1_year_item_sums_over_whatever_months_exist():
     assert item["properties"]["start_datetime"].startswith("2026-01-01T")
 
 
+def test_an_emptied_part_states_no_time_range_at_all():
+    """The migration to the monthly tail publishes a zero-row live.parquet
+    over the file whose rows it folded into the months, and every fold and
+    consolidation empties a part the same way. A part with no rows has no
+    time range: the asset must leave start_datetime and end_datetime out,
+    not write them as null. Null is not a string, and an item carrying one
+    fails STAC 1.1.0 structural validation (rashid PTL-STR-001,
+    stac-check), which is the gate every workflow runs before it uploads --
+    so the whole run would stop on the day a part went empty."""
+    with tempfile.TemporaryDirectory() as td:
+        year_dir = staged_c1_year(Path(td))
+        sys.path.insert(0, str(ROOT / "tools"))
+        from s2_build import connect as build_connect, write_empty_part
+        tmp = Path(td) / "duckdb-tmp"
+        tmp.mkdir()
+        write_empty_part(build_connect("2GB", tmp),
+                         year_dir / "live-03.parquet",
+                         year_dir / "live.parquet", 2026)
+        parts = discover(year_dir, 2026, False, None, config=C1)
+        assert [p["key"] for p in parts] == ["data", "live", "live-03"]
+        item = build_item(connect(), 2026, parts, None, config=C1)
+    empty = item["assets"]["live"]
+    assert empty["table:row_count"] == 0
+    assert "start_datetime" not in empty and "end_datetime" not in empty
+    assert json.dumps(item).count("null") == 1   # properties.datetime alone
+    # The year is still the sum of the parts, and the empty one adds nothing.
+    assert item["properties"]["table:row_count"] == 400
+    assert item["properties"]["end_datetime"].startswith("2026-03-")
+
+
 def test_c1_collection_json_comes_from_the_config():
     """make_collection --collection sentinel-2-c1-l2a on a staged year with
     no committed items: the collection's id, glob, canonical link,
