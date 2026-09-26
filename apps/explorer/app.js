@@ -1883,8 +1883,12 @@ function ensureThumbObserver() {
 matchMedia("(max-width: 760px)").addEventListener("change", () => {
   thumbObserver?.disconnect();
   thumbObserver = null;
-  for (const img of document.querySelectorAll("#results img[data-src]:not([src])")) {
-    ensureThumbObserver().observe(img);
+  // Read the live card set from cardNodes, not from #results: a card the
+  // filter has removed from #results is still a real card, and a DOM query
+  // would miss it and drop it from observation for good.
+  for (const card of cardNodes.values()) {
+    const img = card.querySelector("img[data-src]:not([src])");
+    if (img) ensureThumbObserver().observe(img);
   }
 });
 
