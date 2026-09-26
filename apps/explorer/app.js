@@ -1133,6 +1133,89 @@ async function thumbnailBitmap(url) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The bottom sheet. On a phone (style.css, max-width 760px) the map
+// fills the viewport and one sheet holds the image controls and the search
+// controls. The sheet has three heights: "peek" is the handle plus one line,
+// "half" is what a fresh page shows, "full" is nearly the screen. style.css
+// owns the heights, in dvh, so they follow the iOS URL bar; this code only
+// says which stop is current, in data-snap, and sets a pixel height while a
+// finger is on the handle. On a desktop the handle is display: none and the
+// heights are not in that media query, so every call below is a no-op.
+// ---------------------------------------------------------------------------
+const SNAPS = ["peek", "half", "full"];
+// The same three heights as style.css, for picking the nearest stop on
+// release. The safe-area inset is left out: it shifts all three equally.
+const snapHeight = (name) =>
+  ({ peek: 110, half: 0.5 * innerHeight, full: 0.88 * innerHeight })[name];
+let snap = "half";
+// A sheet only on a phone: on a desktop #sheet is display: contents and has
+// no height to snap. Asking the style, not the viewport width, keeps the one
+// breakpoint in style.css where it can be read.
+const isSheet = () => getComputedStyle($("sheet")).display !== "contents";
+function setSnap(name) {
+  if (!isSheet()) return;
+  snap = name;
+  const sheet = $("sheet");
+  sheet.style.height = "";              // back to the CSS height for the stop
+  sheet.dataset.snap = name;
+  // peek shows the top of the sheet and nothing else, so the top must be the
+  // part in view — otherwise a scrolled sheet peeks at the middle of itself.
+  if (name === "peek") $("sheetbody").scrollTop = 0;
+}
+setSnap("half");
+{
+  const grip = $("grip");
+  const cycle = () => setSnap(SNAPS[(SNAPS.indexOf(snap) + 1) % SNAPS.length]);
+  // A pointer gesture settles itself on pointerup: a move of a few pixels is
+  // a drag and snaps to the nearest stop, anything shorter is a tap and
+  // cycles. The click that a browser sends after that would cycle a second
+  // time, so it is swallowed once. A click with no pointer gesture before it
+  // is the keyboard (Enter or Space on the handle), and that cycles too.
+  let swallowClick = false;
+  grip.addEventListener("pointerdown", (e) => {
+    // Never take a drag that belongs to a control. The handle holds nothing
+    // today; the sliders, selects and buttons of the sheet are all below it
+    // and must keep their own pointer events, and this keeps that true if
+    // anything is ever put in the handle.
+    if (e.target.closest("input, select, a, summary")) return;
+    const sheet = $("sheet");
+    const h0 = sheet.getBoundingClientRect().height;
+    const y0 = e.clientY;
+    let moved = 0;
+    e.preventDefault();
+    sheet.dataset.drag = "";
+    grip.setPointerCapture(e.pointerId);
+    const move = (ev) => {
+      const dy = ev.clientY - y0;
+      moved = Math.max(moved, Math.abs(dy));
+      sheet.style.height =
+        `${Math.min(0.88 * innerHeight, Math.max(56, h0 - dy))}px`;
+    };
+    const up = (ev) => {
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", up);
+      grip.removeEventListener("pointercancel", up);
+      delete sheet.dataset.drag;
+      // A cancelled gesture (the browser took the pointer) is not a gesture:
+      // put the sheet back on its stop and leave the next click alone.
+      if (ev.type !== "pointerup") { setSnap(snap); return; }
+      swallowClick = true;
+      if (moved < 6) { cycle(); return; }                  // a tap, not a drag
+      const h = sheet.getBoundingClientRect().height;
+      setSnap(SNAPS.reduce((a, b) =>
+        Math.abs(snapHeight(b) - h) < Math.abs(snapHeight(a) - h) ? b : a));
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up);
+    grip.addEventListener("pointercancel", up);
+  });
+  grip.addEventListener("click", () => {
+    if (swallowClick) { swallowClick = false; return; }
+    cycle();
+  });
+}
+
 // The cogbar's states: "loading" spins until every tile in view has loaded,
 // "full" is the tiles alone, "partial" keeps the preview under tiles that
 // failed, or says which band is missing. The spinner is CSS on data-state.
@@ -1149,6 +1232,9 @@ function hideImagePanel() {
   $("imgpanel").hidden = true;
   $("cogbar").hidden = true;
   $("bandbox").hidden = true;
+  // peek exists to show the "Showing …" line; with no scene there is nothing
+  // to peek at, so the sheet goes back to what a fresh page shows.
+  if (snap === "peek") setSnap("half");
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1602,10 @@ async function showOnMap(r, button, preset = "tci", band = null) {
   // the bar names this scene from here on and the map must not contradict it.
   if (cogLayer || cogPreview) { cogLayer = null; cogPreview = null; render(); }
   cogbar(id, "loading", "Loading preview…");
+  // The user asked to see an image: on a phone the sheet drops to peek, so
+  // the map, and the scene now being drawn on it, is what fills the screen.
+  // The "Showing …" line this cogbar just wrote is what peek still shows.
+  setSnap("peek");
   // The tile events of one layer, bound to its band set: a layer taken off
   // the map for another band set may still fire while its tiles drain,
   // and must not settle or fail the one that replaced it.
@@ -1728,7 +1818,10 @@ async function runQuery() {
     box.querySelector(".scene.best .actions button")?.click();
     // The results sit below the timeline in the panel; without this the hero
     // flow's answer lands off-screen on a short window.
-    box.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    // Not on a phone once the sheet has dropped to peek: the scene the search
+    // just put on the map is the answer there, and this scroll would carry
+    // the "Showing …" line out of the one line peek shows.
+    if (snap !== "peek") box.scrollIntoView({ block: "nearest", behavior: "smooth" });
     // The collection is named only off the default: the default's text is
     // the page as it always read; the API mirror names it either way.
     const parts = COLLECTION_ID === DEFAULT_COLLECTION ? "part" : `${COLLECTION_ID} part`;
