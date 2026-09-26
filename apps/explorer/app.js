@@ -186,7 +186,10 @@ const WANT = {
   cover: hashInt("cover", 0, 100),
   scenes: hashInt("scenes", 0, 10000),
   metric: METRICS.has(HASH_IN.get("metric")) ? HASH_IN.get("metric") : null,
-  sort: SORTS[HASH_IN.get("sort")] ? HASH_IN.get("sort") : null,
+  // hasOwn, not a truthiness test on SORTS[key]: "__proto__", "constructor"
+  // and "toString" all find something on a plain object and would reach the
+  // sort select as a key it has no option for.
+  sort: Object.hasOwn(SORTS, HASH_IN.get("sort") ?? "") ? HASH_IN.get("sort") : null,
   tile: HASH_IN.get("tile"),
   scene: HASH_IN.get("scene"),
 };
@@ -883,10 +886,11 @@ function updateScenesBound(rows) {
   const bound = Math.max(1, Math.round(p99));
   const slider = $("minscenes");
   slider.max = bound;
-  if (Number(slider.value) > bound) {
-    slider.value = bound;
-    S.minScenes = bound;
-  }
+  // A range input re-clamps its own value the moment its max is assigned, so
+  // the value here is already inside the new bound. S takes what the input
+  // now holds — the input is the only source of this number, and a clamp
+  // that S did not hear about would dim the map by a figure no control shows.
+  S.minScenes = Number(slider.value);
   $("minscenes-out").textContent = slider.value;
 }
 
@@ -1264,10 +1268,11 @@ function restoreControls(defaultYear) {
   if (WANT.sort) { S.sort = WANT.sort; $("sort").value = WANT.sort; }
   // The scene-count slider's bound follows the window (updateScenesBound),
   // and it starts at 1: raise it far enough to hold the asked value, or the
-  // input would clamp it away and the slider and S would then disagree. The
-  // first paint re-bounds it, and clamps S itself if the window is quieter
-  // than the link. Each value is read back from the input, never from the
-  // hash, so a clamp of any kind reaches S as well.
+  // input would clamp it away here. The first paint then re-bounds the slider
+  // to the window's own p99, and takes S from the re-clamped input, so a link
+  // that asks for more scenes than the window has settles on the bound. Each
+  // value below is read back from the input, never from the hash, so a clamp
+  // reaches S here as well.
   if (WANT.scenes !== null) {
     $("minscenes").max = String(Math.max(Number($("minscenes").max), WANT.scenes));
     $("minscenes").value = String(WANT.scenes);
