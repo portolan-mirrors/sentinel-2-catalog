@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""Run the real explorer headless and check that a scene search still returns
-the same rows, on both collections, with the committed client and the candidate.
+"""Run the real explorer headless. Check that a scene search still returns
+the same rows. Check both collections. Check the committed client and the
+candidate.
 
     python3 tools/rails/experiments/check_app.py
 
 This is the gate for a change to apps/explorer/search.js. measure_search.py
-drives `sceneSearch` directly; this loads `apps/explorer/index.html` itself in
-chrome-headless-shell, lets it build its map, its stats and its year select,
-and then fires the same map click a user's mouse fires -- the click is the
-search -- so the whole page -- partUrls, the HEAD probes, warmPart,
-startSearch, the result cards -- runs.
+drives `sceneSearch` directly. This script loads `apps/explorer/index.html`
+itself in chrome-headless-shell. It lets the page build its map, its stats,
+and its year select. It then fires the same map click a user's mouse fires.
+The click is the search. The run covers partUrls, the HEAD probes, warmPart,
+startSearch, and the result cards.
 
-Two served variants of the app, from the same repository files:
+Two served variants of the app come from the same repository files.
 
   candidate/  apps/explorer/* exactly as the working tree has it
   baseline/   the same, with `search.js` replaced by git HEAD's
 
 `app.js` has `window.__map =` and `window.__hit =` inserted into its map
-constructor and its hit index in both, because both are module-local consts and
-a headless driver has no mouse. Nothing else is rewritten, and the two
-insertions are identical in both variants.
+constructor and its hit index. Both variants carry these insertions. Both
+are module-local consts. A headless driver has no mouse. Nothing else is
+rewritten. The two insertions are identical in both variants.
 
-Exits non-zero if the candidate's rows differ from DuckDB's for any case, if
-the candidate returns nothing, or if the committed client returns different
-rows (a case the committed client cannot finish at all is reported, not
-excused: it is checked against DuckDB instead).
+The script exits non-zero in three cases. The candidate's rows differ from
+DuckDB's rows for any case. The candidate returns nothing. The committed
+client returns different rows. Sometimes the committed client cannot finish
+a case at all. The script still reports that case. The script checks it
+against DuckDB instead.
 """
 from __future__ import annotations
 
@@ -106,8 +108,8 @@ else {
       }
       throw new Error(`timed out waiting for ${what}`);
     };
-    // The page is ready enough when its map exists; the window comes from
-    // this driver, not from the year select, so the case is deterministic.
+    // The page is ready enough when its map exists. The window comes from
+    // this driver, not the year select. This makes the case deterministic.
     await until("the map", () => w.__map);
     // Wait for the hit index itself, not for a click to happen to land. The
     // app translates a click into an MGRS tile through `hitIndex`, which fills
@@ -128,11 +130,11 @@ else {
       $(id).value = v;
       $(id).dispatchEvent(new w.Event("input", { bubbles: true }));
     }
-    // A tile click IS the search: there is no run button to poll. The app
-    // ignores a click that names no tile, so fire until it takes, and the
-    // signal that it took is the hint the click handler writes ("Tile
-    // 31UFT."). Once the hint names a tile the fire loop below stops, and
-    // the driver waits next on the plan text landing in #sql.
+    // A tile click is the search. There is no run button to poll. The app
+    // ignores a click that names no tile. The loop below fires clicks until
+    // one takes. The signal is the hint the click handler writes (for
+    // example "Tile 31UFT."). Once the hint names a tile, the fire loop
+    // stops. The driver then waits for the plan text in #sql.
     const tileHint = () => $("query").querySelector(".hint")?.textContent || "";
     let fired = 0;
     await until("a tile under the click", () => {
@@ -144,8 +146,8 @@ else {
       return false;
     }, 120000);
     say(`  clicked after ${fired} attempt(s): ${tileHint().trim()}`);
-    // The search writes the plan into #sql when it is done, and the cards
-    // into #results; a search that found nothing writes a .hint instead.
+    // A finished search writes the plan into #sql. It also writes the cards
+    // into #results. A search that finds nothing writes a .hint instead.
     try {
       await until("the search to finish", () =>
         ($("sql").textContent || "").includes("range-read plan")

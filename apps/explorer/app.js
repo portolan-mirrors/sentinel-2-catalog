@@ -14,14 +14,14 @@
 //                                 composite, NDVI/NDWI or the SCL classes,
 //                                 read band by band on demand and stretched
 //                                 in the browser (Task 28, bands.js)
-// The year is the unit: the sidebar's year select picks it, and a click on
-// an MGRS tile reads that year's parts once through sceneRows (search.js),
-// caching the rows in the page. From there the day-range slider and the
-// cloud/coverage/scene-count sliders filter the cached rows and redraw the
-// result cards with no further network read. The map is separate: it never
-// queries the clicked tile-year, it paints from the stats' month slices
-// aggregated over whatever window is selected, so the choropleth and the
-// scene list answer the same window from two different sources.
+// The year is the unit of work. The sidebar's year select picks it. A click
+// on an MGRS tile reads that year's parts once through sceneRows (search.js).
+// The page caches the rows. The day-range slider and the cloud/coverage/
+// scene-count sliders then filter the cached rows. They redraw the result
+// cards. No filter change reads the network again. The map paints on its
+// own. It never queries the clicked tile-year. It paints from the stats'
+// month slices for the current window. The choropleth and the scene list
+// read the same window from two different sources.
 // The same page shows Earth Search's Collection 1 (sentinel-2-c1-l2a, with
 // stats-c1/) under ?collection=: the COLLECTIONS table below is everything
 // that differs — directories, the tile column, which parts a year has, the
@@ -78,9 +78,9 @@ export const BASE = new URLSearchParams(location.search).get("base")
 // year=2019/live.parquet). `apiTile` is how a STAC API is asked for a tile
 // (apiMirror): Collection 1 items have no s2:mgrs_tile, their tile is
 // grid:code "MGRS-31UET". `masks` are the extra single bands its scenes
-// carry (bands.js MASK_BANDS). `since` is the first year with scenes, for
-// the sub-header and the year select's fallback range when no stats say
-// better.
+// carry (bands.js MASK_BANDS). `since` is the first year with scenes. It
+// sets the sub-header text. It also sets the year select's fallback range
+// when the stats are missing.
 // DEFAULT_COLLECTION is what loads without ?collection=. Collection 1 is
 // the default since 2026-09-22, when its backfill and stats were published;
 // ?collection=sentinel-2-l2a opens the first collection.

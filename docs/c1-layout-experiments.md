@@ -878,8 +878,8 @@ Nothing published depends on it; it is a partial V7 2024 build plus its
     synchronous statement, so a poller never sees the false; it keeps clicking
     every 250 ms for the whole search and a dozen overlapping searches pile up.
     The hint the handler writes (`Tile 31UFT.`) is the signal.
-    [The run button was removed in the year redesign; the lesson now applies
-    to the hint/plan predicates `check_app.py` polls instead.]
+    [The year redesign removed the run button. The lesson now applies to
+    the hint and plan predicates that `check_app.py` polls instead.]
 
   Both failed for the candidate and not the baseline, purely because the two
   clients finish their requests at different moments, and neither had anything
