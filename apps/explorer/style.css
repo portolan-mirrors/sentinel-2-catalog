@@ -18,6 +18,11 @@ body {
   color: var(--ink);
 }
 #map { position: absolute; inset: 0 0 0 360px; }
+/* The sheet wrapper (index.html) is only a box on a phone. display: contents
+   takes it out of the layout here, so #imgpanel and #panel are positioned
+   against the viewport exactly as they were before it existed. */
+#sheet, #sheetbody { display: contents; }
+#grip { display: none; }
 #panel {
   position: absolute; inset: 0 auto 0 0; width: 360px;
   overflow-y: auto; padding: 18px 18px 28px;
@@ -209,16 +214,70 @@ button.mini:not(:disabled):hover { background: #26457a; }
 .foot { margin-top: 16px; color: var(--dim); font-size: 11.5px; }
 .foot a { color: var(--accent); }
 
+/* ---------------------------------------------------------------------- *
+ * The phone layout: the map is the page.
+ *
+ * The map fills the viewport and one bottom sheet holds everything else --
+ * the image controls at the top of it, the search controls under them. Two
+ * stacked panels used to leave a 9 vh strip of map between them, which is
+ * the whole reason this block exists.
+ *
+ * Heights are in dvh, not vh, because the iOS URL bar changes vh while it
+ * slides. CSS owns the three snap heights so they follow that; app.js only
+ * names which one is current, in data-snap.
+ * ---------------------------------------------------------------------- */
 @media (max-width: 760px) {
-  #panel { position: static; width: auto; height: 46vh; border-right: 0;
-           border-bottom: 1px solid var(--line); }
-  #map { position: absolute; inset: 46vh 0 0 0; }
-  /* A bottom sheet over the lower map. The map is 54 vh tall here; the
-     height cap keeps 90 px of map free above the sheet so the zoom column
-     (10 px margin + two 29 px buttons) stays clickable on a short screen. */
+  /* The sheet and the map are both fixed to the viewport, so nothing is
+     left to scroll the page itself. */
+  body { overflow: hidden; }
+  #map { inset: 0; }
+  #sheet {
+    display: flex; flex-direction: column;
+    position: fixed; inset: auto 0 0 0; z-index: 4;
+    height: 50dvh;                      /* half: what a fresh page shows */
+    max-height: 88dvh;
+    /* The home indicator must not sit on the controls. */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: var(--panel); border-top: 1px solid var(--line);
+    border-radius: 14px 14px 0 0;
+    box-shadow: 0 -6px 24px rgba(0, 0, 0, .5);
+    transition: height .18s ease;
+  }
+  /* peek is the handle plus one line, so the "Showing …" line a user just
+     asked for stays readable with the whole map above it. */
+  #sheet[data-snap="peek"] { height: calc(110px + env(safe-area-inset-bottom, 0px)); }
+  #sheet[data-snap="half"] { height: 50dvh; }
+  #sheet[data-snap="full"] { height: 88dvh; }
+  /* A drag sets the height in pixels every pointermove; an animation on top
+     of that would lag behind the finger. */
+  #sheet[data-drag] { transition: none; }
+  #grip {
+    display: block; flex: none; width: 100%; height: 30px;
+    margin: 0; padding: 0; border: 0; border-radius: 14px 14px 0 0;
+    background: none; cursor: grab;
+    /* The browser must not scroll or zoom on a drag of the handle. */
+    touch-action: none;
+  }
+  #grip::before {
+    content: ""; display: block; width: 44px; height: 4px; margin: 13px auto 0;
+    background: var(--dim); border-radius: 2px; opacity: .8;
+  }
+  #grip:focus-visible { outline: 2px solid var(--accent); outline-offset: -4px; }
+  /* Everything in the sheet scrolls together, under the handle. */
+  #sheetbody {
+    display: block; flex: 1 1 auto; min-height: 0;
+    overflow-y: auto; overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  #panel {
+    position: static; width: auto; overflow: visible;
+    padding: 2px 14px 22px; border-right: 0;
+  }
+  /* The image controls are the top block of the same sheet here, not a
+     second sheet of their own and not a card over the map. */
   #imgpanel {
-    left: 0; right: 0; bottom: 0; width: auto;
-    max-height: min(45vh, calc(54vh - 90px));
-    border-radius: 6px 6px 0 0; border-width: 1px 0 0;
+    position: static; width: auto; max-height: none; overflow: visible;
+    padding: 2px 14px 0;
+    background: none; border: 0; border-radius: 0; box-shadow: none;
   }
 }

@@ -10,6 +10,15 @@
 </head>
 <body>
 <div id="map"></div>
+<!-- One container for everything that is not the map. On a desktop
+     it is not a box at all: style.css gives #sheet and #sheetbody
+     display: contents, so the image card and the sidebar keep the places
+     they always had. On a phone it is the single bottom sheet over a
+     full-screen map: the grab handle, then the image controls, then the
+     search controls, in one scroller. -->
+<div id="sheet">
+  <button id="grip" type="button" aria-label="Resize the panel: drag, or tap to cycle"></button>
+  <div id="sheetbody">
 <!-- The image controls (Task 29): what is on the map and how it is
      stretched live in this card at the map's lower right, so the sidebar
      is only search. Hidden until a scene is shown; app.js toggles it with
@@ -101,6 +110,8 @@
     <a href="https://source.coop/portolan-mirrors/sentinel-2-catalog">Source Cooperative</a>.
     No server, no API, no database.</footer>
 </aside>
+  </div>
+</div>
 <!-- deck.gl's own bundle, not a CDN ESM transpile: the esm.sh build of
      9.4.0 renders but its picking pass returns nothing (see task-20-report),
      the official dist picks fine. Pinned; a classic script runs before the
