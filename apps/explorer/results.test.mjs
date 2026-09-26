@@ -35,6 +35,12 @@ test("sortRows: cloud ties break on id, coverage sorts nulls last, date is newes
     ["S2A_4", "S2A_3", "S2A_2", "S2A_1"]);
   assert.notEqual(sortRows(rows, "date"), rows); // never mutates its input
   assert.equal(rows[0].id, "S2A_1");
+  // The fallback is an own-property check, not a truthiness test: a key off
+  // the prototype chain finds an object whose .cmp is undefined, and
+  // .sort(undefined) would sort by string instead of falling back to cloud.
+  const cloudOrder = ["S2A_2", "S2A_3", "S2A_1", "S2A_4"];
+  assert.deepEqual(sortRows(rows, "__proto__").map((r) => r.id), cloudOrder);
+  assert.deepEqual(sortRows(rows, "nonsense").map((r) => r.id), cloudOrder);
 });
 
 test("viewOf composes, indexOfId and clampIndex behave at the edges", () => {

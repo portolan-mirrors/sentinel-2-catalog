@@ -1253,7 +1253,14 @@ function warmWindowParts() {
 // exists: the shape check on `d=` admits 2023-99-99 and 2023-02-31, and an
 // <input type="date"> answers an impossible day with an empty value, which
 // would leave the page with no window at all.
+// True once restoreControls has run. init()'s early returns (an unreadable
+// timeline, a timeline with no rows) reach finishRestore without it, and a
+// link the boot could not apply must stay in the URL rather than be written
+// back as the defaults it never got to replace.
+let restoredControls = false;
+
 function restoreControls(defaultYear) {
+  restoredControls = true;
   const goodDay = (s, year) => {
     const t = Date.parse(`${s}T00:00:00Z`);
     return s.slice(0, 4) === String(year) && !Number.isNaN(t)
@@ -1305,14 +1312,17 @@ function restoreControls(defaultYear) {
 async function restoreSearch() {
   if (searchSeq > 0 || !WANT.tile || !TILE_RE.test(WANT.tile)) return;
   const seq = searchSeq + 1;            // the number selectTile's search takes
-  await selectTile(WANT.tile);
+  // A link that named a camera keeps it: neither the auto-show of the best
+  // result nor the scene restore below may fly away from the `map=` the boot
+  // applied. A link without one still gets the framing it always did.
+  await selectTile(WANT.tile, { flyFirst: !WANT.map });
   if (seq !== searchSeq || !S.search || !WANT.scene) return;
   // The id is matched inside the rows, so the view lookup can use the row's
   // own id and no id type has to be assumed.
   const row = S.search.rows.find((r) => String(r.id) === WANT.scene);
   if (!row) return;                     // not in this tile-year: say nothing
   const at = indexOfId(currentView(), row.id);
-  if (at >= 0) { showIndex(at, true); return; }
+  if (at >= 0) { showIndex(at, !WANT.map); return; }
   // The scene is in the tile-year but the filters hide it. The link asked
   // for it, so it goes on the map anyway, and the scrub bar reports it as
   // detached the same way a filter change that hides the shown scene does.
@@ -1323,15 +1333,22 @@ async function restoreSearch() {
 
 // The restore is over, whichever way the boot went: from here the URL
 // follows the page. A link that came in is written back once, so the URL
-// holds what the page actually settled on and not what was asked for.
+// holds what the page actually settled on and not what was asked for — but
+// only when restoreControls ran. A link the boot could not apply stays in the
+// URL: the early-return paths never read it, so writing the page's state back
+// would replace a shared link with the bare `#map=…` of a page that failed.
 function finishRestore() {
   hashRestored = true;
-  if (location.hash) writeHash();
+  if (location.hash && restoredControls) writeHash();
 }
 
 async function init() {
   updateLegend();
-  $("metric").addEventListener("change", () => { updateLegend(); paintWindow(); });
+  $("metric").addEventListener("change", () => {
+    updateLegend();
+    paintWindow();
+    scheduleHashWrite();      // metric= is in the hash, so it must reach it
+  });
   $("year").addEventListener("change", () => setYear(Number($("year").value)));
   $("maxcloud").addEventListener("input", onSlider);
   $("mincoverage").addEventListener("input", onSlider);
@@ -1516,7 +1533,7 @@ map.on("click", (e) => {
 // The click is the search. The date inputs, not S, carry the window here:
 // the headless gate writes their .value directly with no events, and a
 // calendar edit lands the same way.
-function selectTile(tile) {
+function selectTile(tile, opts) {
   S.tile = tile;
   timelineFor(tile);
   const d0 = $("date0").value, d1 = $("date1").value;
@@ -1532,8 +1549,9 @@ function selectTile(tile) {
   $("query").querySelector(".hint").textContent = `Tile ${tile}.`;
   // The search is returned, not only started, so the hash restore can wait
   // for the rows before it looks for its scene. A click ignores the promise,
-  // the way it always has.
-  return startSearch(tile, year);
+  // the way it always has. `opts` only carries the restore's flyFirst: false
+  // through to the auto-show; a click passes nothing and keeps the default.
+  return startSearch(tile, year, opts);
 }
 
 // The zone parts of a year: [file stem, first zone, last zone], mirrored
@@ -2622,7 +2640,17 @@ function buildCard(r) {
   const show = el("button", "mini", "Show on map");
   show.type = "button";
   show.title = "Fly to the footprint and draw the visual COG on the map";
-  show.addEventListener("click", () => showOnMap(r, show));
+  // The card click goes through the nav state so every indicator follows it:
+  // showOnMap alone leaves S.displayedId on the previously shown scene, and
+  // the .current outline, the scrub thumb, the ‹/› steps and the hash's
+  // scene= all keep pointing there. A card click is an explicit "frame this
+  // scene", so it flies. The fallback covers a row that fell out of the view
+  // between the render that built this card and the click on it.
+  show.addEventListener("click", () => {
+    const at = indexOfId(currentView(), r.id);
+    if (at >= 0) showIndex(at, true);
+    else showOnMap(r, show);
+  });
   actions.append(show);
   cap.append(actions);
   card.append(cap);
@@ -2647,7 +2675,11 @@ function cardFor(row) {
 // await to find a newer number leaves the page to the newer run.
 let searchSeq = 0;
 
-async function startSearch(tile, year) {
+// `flyFirst` is how a restore keeps the camera a shared link asked for: the
+// auto-show below frames the best result, which would overwrite the `map=`
+// the boot just applied. Only the restore path passes false; a tile click, a
+// year change and a timeline-bar click all keep the default.
+async function startSearch(tile, year, { flyFirst = true } = {}) {
   const seq = ++searchSeq;
   const box = $("results");
   // The old search dies with the click that replaces it. It must not outlive
@@ -2691,7 +2723,7 @@ async function startSearch(tile, year) {
   scheduleApply({ nav: true });
   const view = currentView();
   if (view.length) {
-    showIndex(0, true);
+    showIndex(0, flyFirst);
     if (snap !== "peek") box.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 }

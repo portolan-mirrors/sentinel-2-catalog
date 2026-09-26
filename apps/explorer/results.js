@@ -20,8 +20,13 @@ export function filterRows(rows, f) {
     && (f.minCoverage <= 0 || r.cover === null || r.cover >= f.minCoverage));
 }
 
+// hasOwn, not `SORTS[key] ?? SORTS.cloud`: "__proto__", "constructor" and
+// "toString" all find something on the prototype chain, so the ?? never
+// fires and `.cmp` comes back undefined — .sort(undefined) is a lexicographic
+// sort by string, not the cloud order the fallback promises.
 export function sortRows(rows, key) {
-  return [...rows].sort((SORTS[key] ?? SORTS.cloud).cmp);
+  const s = Object.hasOwn(SORTS, key) ? SORTS[key] : SORTS.cloud;
+  return [...rows].sort(s.cmp);
 }
 
 export function viewOf(rows, f, key) {

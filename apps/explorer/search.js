@@ -268,6 +268,11 @@ export async function sceneRows({ urls, tileColumn, tile, sidecars = true }) {
     urls.map((u) => searchPart(u, tileColumn, tile, tally, sidecars)))).flat();
   const rows = raw.map((r) => {
     const t = r.datetime instanceof Date ? r.datetime.getTime() : Date.parse(r.datetime);
+    // A null or unparseable datetime makes `t` NaN, and new Date(NaN)
+    // .toISOString() throws a RangeError, which would reject the whole
+    // tile-year over one bad row. Such a row is dropped instead: it has no
+    // place on a timeline and no window can admit it.
+    if (!Number.isFinite(t)) return null;
     const nodata = Number(r["s2:nodata_pixel_percentage"]);
     return {
       id: r.id,
@@ -280,7 +285,8 @@ export async function sceneRows({ urls, tileColumn, tile, sidecars = true }) {
       bbox: Array.from(r.bbox ?? []),
       baseline: r["s2:processing_baseline"],
     };
-  }).sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  }).filter(Boolean)
+    .sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const secs = ((performance.now() - t0) / 1000).toFixed(1);
   const plan = `hyparquet range-read plan (no SQL engine, no API):\n`
     + `  ${tally.parts} part(s) held ${tile}, ${tally.groups} row group(s) admitted by their`
