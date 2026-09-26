@@ -204,14 +204,14 @@ await mapReady;
 // ---------------------------------------------------------------------------
 // The MGRS choropleth. The fills are drawn by deck.gl: the footprints come
 // out of the same PMTiles archive as before, and the colour of each tile is
-// looked up in a Map rebuilt per month from the stats query. A month change,
-// a metric change or a slider drag bumps `paintKey`, and deck.gl recomputes
-// one colour attribute for the 33k polygons and uploads it — no per-feature
-// state, no filter change, no tile re-parse. The outlines stay a MapLibre
-// line layer: nothing ever changes on it, so its tile is parsed once, and a
-// deck.gl PathLayer of the same 33k outlines was measured at 0.5-0.9 s a
-// frame under software GL where MapLibre's lines take a few ms. The fills
-// are slotted beneath it with beforeId.
+// looked up in a Map rebuilt per window from the month slices. A window
+// change, a metric change or a slider drag bumps `paintKey`, and deck.gl
+// recomputes one colour attribute for the 33k polygons and uploads it — no
+// per-feature state, no filter change, no tile re-parse. The outlines stay
+// a MapLibre line layer: nothing ever changes on it, so its tile is parsed
+// once, and a deck.gl PathLayer of the same 33k outlines was measured at
+// 0.5-0.9 s a frame under software GL where MapLibre's lines take a few
+// ms. The fills are slotted beneath it with beforeId.
 // ---------------------------------------------------------------------------
 // The footprints come from the collection's own stats tileset. The grid is
 // the same 33k MGRS tiles whichever collection indexed them, so while a
@@ -362,17 +362,30 @@ const hitIndex = {
   },
 };
 
-// Per-tile stats for the shown month: mgrs_tile -> {v: 0..100 on the ramp,
-// cc: clearest scene's cloud %}. `v` is already rescaled per metric.
+// Per-tile stats for the shown window: mgrs_tile -> {v: 0..100 on the ramp,
+// cc, cover, sc}. `v` is already rescaled per metric.
 let lookup = new Map();
 let paintKey = 0;
-let maxCloud = Number($("maxcloud").value);
-let minCoverage = Number($("mincoverage").value);
-let minScenes = Number($("minscenes").value);
 let hovered = null;          // the hovered feature (GeoJSON, WGS84) or null
 let cogLayer = null;         // the shown scene's TileLayer, or null
 let cogPreview = null;       // its thumbnail warp, beneath the tiles until they load
-let selectedTile = null;
+
+// The one state object. Every mutator writes here and calls scheduleApply;
+// every renderer reads from here. Nothing else holds filter or search state.
+const S = {
+  year: null,                 // int, the #year select
+  maxCloud: Number($("maxcloud").value),
+  minCoverage: Number($("mincoverage").value),
+  minScenes: Number($("minscenes").value),
+  from: null, to: null,       // ISO days, the date slider's window
+  monthLock: null,            // "YYYY-MM" while a bar click clamps the slider
+  tile: null,                 // the selected MGRS tile or null
+  search: null,               // {tile, year, rows, at} or null
+  sort: "cloud",
+  shown: 15,                  // cards rendered
+  displayedId: null,          // the scene on the map — an id, never an index
+  detachedAt: 0,              // its last known position in the view
+};
 
 // All three sliders AND together in one accessor; a NULL metric is "unknown"
 // rather than "over/under the slider" and is never dimmed for that reason
@@ -380,9 +393,9 @@ let selectedTile = null;
 function fillColor(f) {
   const s = lookup.get(f.properties.mgrs_tile);
   if (!s) return UNPAINTED;
-  if (s.cc !== null && s.cc > maxCloud) return DIMMED;
-  if (s.cover !== null && s.cover < minCoverage) return DIMMED;
-  if (s.sc !== null && s.sc < minScenes) return DIMMED;
+  if (s.cc !== null && s.cc > S.maxCloud) return DIMMED;
+  if (s.cover !== null && s.cover < S.minCoverage) return DIMMED;
+  if (s.sc !== null && s.sc < S.minScenes) return DIMMED;
   return RAMP_LUT[Math.round(s.v)];
 }
 
@@ -398,7 +411,8 @@ Object.defineProperties(window.S2, {
   overlay: { value: overlay },
   hitIndex: { value: hitIndex },
   lookup: { get: () => lookup },
-  selectedTile: { get: () => selectedTile },
+  selectedTile: { get: () => S.tile },
+  S: { value: S },
 });
 
 function render() {
@@ -454,6 +468,28 @@ map.on("mouseout", () => { hoverAt = null; setHovered(null); });
 
 function repaint() { paintKey++; render(); }
 render();
+
+// One coalesced apply per animation frame: a slider drag asks for a paint
+// and a card render, and both run once, in order, on the next frame.
+// renderResults, renderScrubber and syncNavButtons arrive in later tasks;
+// the typeof guards keep this file loadable in between.
+let applyFlags = null;
+function scheduleApply(flags = {}) {
+  const first = !applyFlags;
+  applyFlags = { ...(applyFlags ?? {}), ...flags };
+  if (first) requestAnimationFrame(applyNow);
+}
+function applyNow() {
+  const f = applyFlags ?? {};
+  applyFlags = null;
+  if (f.paint) paintWindow();
+  if (f.cards) typeof renderResults === "function" && renderResults();
+  if (f.nav) {
+    typeof renderScrubber === "function" && renderScrubber();
+    typeof syncNavButtons === "function" && syncNavButtons();
+  }
+  if (!f.cards) say(`${filterLine()}.`);
+}
 
 // ---------------------------------------------------------------------------
 // Stats: the choropleth and the timeline.
@@ -513,32 +549,88 @@ function onRamp(metric, raw) {
   return x;
 }
 
-// The month's rows from its slice: [] for a month with no slice. The
-// percent columns are UTINYINT and scene_count USMALLINT; they arrive as JS
-// numbers and Number() in onRamp and paintMonth handles them like any other.
-export async function statsForMonth(y, m) {
-  const metric = $("metric").value;
-  if (!METRICS.has(metric)) throw new Error(`unknown metric ${metric}`);
-  const ym = `${Number(y)}-${String(Number(m)).padStart(2, "0")}`;
-  const buf = await monthFile(ym);
-  if (!buf) return [];
-  const cols = [...new Set(["mgrs_tile", metric, "min_cloud_cover", "scene_count", "max_cover"])];
-  const rows = await readTable(buf, cols);
-  return rows.map((r) => ({ mgrs_tile: r.mgrs_tile, v: r[metric],
-    cc: r.min_cloud_cover, sc: r.scene_count, cover: r.max_cover }));
+// One month slice, decoded once with every paint column, cached. A 404
+// (no slice for that month) caches as null; a failed fetch is forgotten
+// so the next paint retries.
+const monthStats = new Map();
+function monthStatsFor(ym) {
+  if (!monthStats.has(ym)) {
+    monthStats.set(ym, (async () => {
+      const buf = await monthFile(ym);
+      if (!buf) return null;
+      const rows = await readTable(buf, ["mgrs_tile", "min_cloud_cover",
+        "scene_count", "max_cover", "median_cloud_cover"]);
+      return rows.map((r) => ({ tile: r.mgrs_tile,
+        cc: r.min_cloud_cover == null ? null : Number(r.min_cloud_cover),
+        sc: r.scene_count == null ? null : Number(r.scene_count),
+        cover: r.max_cover == null ? null : Number(r.max_cover),
+        med: r.median_cloud_cover == null ? null : Number(r.median_cloud_cover) }));
+    })());
+    monthStats.get(ym).catch(() => monthStats.delete(ym));
+  }
+  return monthStats.get(ym);
+}
+
+// The months the window [from, to] overlaps, as "YYYY-MM". A month partly
+// inside counts wholly: the map quantises to months, the cards do not.
+function monthsIn(from, to) {
+  const out = [];
+  let y = Number(from.slice(0, 4)), m = Number(from.slice(5, 7));
+  const end = Number(to.slice(0, 4)) * 100 + Number(to.slice(5, 7));
+  while (y * 100 + m <= end) {
+    out.push(`${y}-${String(m).padStart(2, "0")}`);
+    if (m === 12) { y += 1; m = 1; } else m += 1;
+  }
+  return out;
+}
+
+// Aggregate the window's months per tile: the clearest scene's cloud is a
+// min, coverage a max, scene count a sum, and the median-cloud metric the
+// best month's median (an approximation; a true median needs the raw
+// scenes). Memoised on the month set and the metric, so a drag inside one
+// month set costs nothing here.
+let aggKey = "";
+let aggLookup = new Map();
+function aggregateMonths(months, metric) {
+  const key = months.map((m) => m.ym).join(",") + "|" + metric;
+  if (key === aggKey) return aggLookup;
+  const acc = new Map();
+  for (const m of months) {
+    if (!m.rows) continue;
+    for (const r of m.rows) {
+      const cur = acc.get(r.tile);
+      if (!cur) { acc.set(r.tile, { cc: r.cc, sc: r.sc, cover: r.cover, med: r.med }); continue; }
+      if (r.cc !== null) cur.cc = cur.cc === null ? r.cc : Math.min(cur.cc, r.cc);
+      if (r.sc !== null) cur.sc = (cur.sc ?? 0) + r.sc;
+      if (r.cover !== null) cur.cover = cur.cover === null ? r.cover : Math.max(cur.cover, r.cover);
+      if (r.med !== null) cur.med = cur.med === null ? r.med : Math.min(cur.med, r.med);
+    }
+  }
+  const next = new Map();
+  for (const [tile, s] of acc) {
+    const raw = metric === "scene_count" ? s.sc
+      : metric === "max_cover" ? s.cover
+      : metric === "median_cloud_cover" ? s.med
+      : s.cc;
+    if (raw == null) continue;
+    next.set(tile, { v: onRamp(metric, raw), cc: s.cc, cover: s.cover, sc: s.sc });
+  }
+  aggKey = key;
+  aggLookup = next;
+  return next;
 }
 
 // The three filter sliders, combined into one sentence for the status line
 // (Task 22): "N of M tiles pass (cloud ≤ x, coverage ≥ y, scenes ≥ z)".
 function fmtFilters() {
-  return `cloud ≤ ${maxCloud}, coverage ≥ ${minCoverage}, scenes ≥ ${minScenes}`;
+  return `cloud ≤ ${S.maxCloud}, coverage ≥ ${S.minCoverage}, scenes ≥ ${S.minScenes}`;
 }
 function passCounts() {
   let n = 0;
   for (const s of lookup.values()) {
-    if (s.cc !== null && s.cc > maxCloud) continue;
-    if (s.cover !== null && s.cover < minCoverage) continue;
-    if (s.sc !== null && s.sc < minScenes) continue;
+    if (s.cc !== null && s.cc > S.maxCloud) continue;
+    if (s.cover !== null && s.cover < S.minCoverage) continue;
+    if (s.sc !== null && s.sc < S.minScenes) continue;
     n++;
   }
   return { n, m: lookup.size };
@@ -548,9 +640,9 @@ function filterLine() {
   return `${n.toLocaleString()} of ${m.toLocaleString()} tiles pass (${fmtFilters()})`;
 }
 
-// The scene-count slider's bounds track the loaded month: 0..p99 of that
-// month's scene_count, integer step, recomputed every time the month
-// changes (a busy month and a quiet one should not share one scale).
+// The scene-count slider's bounds track the shown window: 0..p99 of the
+// window's aggregated scene_count, integer step, recomputed on every window
+// change (a busy window and a quiet one must not share one scale).
 function updateScenesBound(rows) {
   const values = rows.map((r) => Number(r.sc)).filter(Number.isFinite).sort((a, b) => a - b);
   const p99 = values.length
@@ -561,65 +653,41 @@ function updateScenesBound(rows) {
   slider.max = bound;
   if (Number(slider.value) > bound) {
     slider.value = bound;
-    minScenes = bound;
+    S.minScenes = bound;
   }
   $("minscenes-out").textContent = slider.value;
 }
 
-// A month slice is a network fetch now, so two quick month changes can
-// resolve out of order; only the latest call may touch the map or the
-// status line.
+// A month slice is a network fetch, so two quick window changes can resolve
+// out of order; only the latest call may touch the map or the status line.
 let paintSeq = 0;
 
-async function paintMonth() {
-  const [y, m] = ($("month").value || "").split("-").map(Number);
-  if (!y || !m) return;
-  const ym = `${y}-${String(m).padStart(2, "0")}`;
+async function paintWindow() {
+  if (!S.from || !S.to) return;
   if (statsMissing) { say(statsNote); return; }
+  const metric = $("metric").value;
+  if (!METRICS.has(metric)) throw new Error(`unknown metric ${metric}`);
   const seq = ++paintSeq;
-  // Said once, on whichever paintMonth() call happens to be first (the
-  // default-month load), then never again.
   const note = lagNote;
   lagNote = "";
-  say(`Reading ${ym}…`);
-  let rows;
-  try {
-    rows = await statsForMonth(y, m);
-  } catch (err) {
-    if (seq === paintSeq) say(`Could not read ${monthUrl(ym)} — ${err.message}`, true);
-    return;
-  }
+  const yms = monthsIn(S.from, S.to);
+  const settled = await Promise.allSettled(yms.map(monthStatsFor));
   if (seq !== paintSeq) return;
-  updateScenesBound(rows);
-  const metric = $("metric").value;
-  const next = new Map();
-  for (const r of rows) {
-    // A NULL metric (a cover with no nodata property, a NULL cloud cover)
-    // is left unpainted: Number(null) is 0, which would read as "0% filled"
-    // or "0% cloud". A NULL clearest-scene cover, coverage or scene count
-    // is kept as null so no slider ever dims what it cannot judge.
-    if (r.v == null) continue;
-    next.set(r.mgrs_tile, {
-      v: onRamp(metric, r.v),
-      cc: r.cc == null ? null : Number(r.cc),
-      cover: r.cover == null ? null : Number(r.cover),
-      sc: r.sc == null ? null : Number(r.sc),
-    });
-  }
-  lookup = next;
+  const months = yms.map((ym, i) => ({ ym,
+    rows: settled[i].status === "fulfilled" ? settled[i].value : null }));
+  lookup = aggregateMonths(months, metric);
+  updateScenesBound([...lookup.values()]);
   repaint();
-  markActiveBar();
-  if (!rows.length) {
-    say(`No tile-months for ${ym} in the published stats. `
-      + `Pick a month with bars in the timeline below.`
+  markActiveBars();
+  const have = months.filter((m) => m.rows).length;
+  if (!lookup.size) {
+    say(`No tile-months in the published stats for ${S.from} → ${S.to}. `
+      + "Pick a window with bars in the timeline below."
       + (note ? ` ${note}` : ""));
     return;
   }
-  const unpainted = rows.length - next.size;
-  say(`${rows.length.toLocaleString()} MGRS tiles imaged in ${ym} — `
-    + `one small month slice (months/${ym}.parquet), no API call.`
-    + (unpainted ? ` ${unpainted.toLocaleString()} have no ${metric} value and stay grey.` : "")
-    + ` ${filterLine()}.`
+  say(`${lookup.size.toLocaleString()} MGRS tiles imaged in ${S.from} → ${S.to} — `
+    + `${have} month slice${have === 1 ? "" : "s"}, no API call. ${filterLine()}.`
     + (note ? ` ${note}` : ""));
 }
 
@@ -627,7 +695,7 @@ async function paintMonth() {
 // tile: keyedRows (search.js) range-reads mgrs-monthly.parquet — footer
 // once per session, then only the row groups whose mgrs_tile range covers
 // the tile (the table is tile-sorted), aggregated here per month. That is
-// still a network read, so like paintMonth() only the latest call may
+// still a network read, so like paintWindow() only the latest call may
 // touch the bars or the status line: click tile A then B and A's answer,
 // landing last, must not replace B's.
 let timelineSeq = 0;
@@ -705,14 +773,10 @@ export async function timelineFor(tile) {
     d.style.background = rampColor(r.clearest);
     d.title = `${ym}: ${r.n} scenes, clearest ${Number(r.clearest).toFixed(1)}%`;
     d.setAttribute("aria-label", d.title);
-    d.onclick = () => {
-      $("month").value = ym;
-      reboundDateRange(ym);
-      paintMonth();
-    };
+    d.onclick = () => setWindow(`${ym}-01`, lastDayOfMonth(ym));
     bars.append(d);
   }
-  markActiveBar();
+  markActiveBars();
 }
 
 function el(tag, cls, text) {
@@ -722,10 +786,10 @@ function el(tag, cls, text) {
   return n;
 }
 
-function markActiveBar() {
-  const ym = $("month").value;
+function markActiveBars() {
+  const lo = (S.from ?? "").slice(0, 7), hi = (S.to ?? "").slice(0, 7);
   for (const b of $("bars").querySelectorAll(".bar")) {
-    b.classList.toggle("on", b.dataset.ym === ym);
+    b.classList.toggle("on", b.dataset.ym >= lo && b.dataset.ym <= hi);
   }
 }
 
@@ -764,18 +828,26 @@ function onSlider() {
     const cc = Number($("maxcloud").value);
     const cov = Number($("mincoverage").value);
     const sc = Number($("minscenes").value);
-    if (cc === maxCloud && cov === minCoverage && sc === minScenes) return;
-    maxCloud = cc; minCoverage = cov; minScenes = sc;
+    if (cc === S.maxCloud && cov === S.minCoverage && sc === S.minScenes) return;
+    S.maxCloud = cc; S.minCoverage = cov; S.minScenes = sc;
     repaint();
-    say(`${filterLine()}.`);
+    scheduleApply({ cards: true, nav: true });
   });
+}
+
+// The filter state a card or a scene read needs, in one object: the two
+// slider gates and the window as epoch milliseconds, ends included.
+function currentFilters() {
+  return { maxCloud: S.maxCloud, minCoverage: S.minCoverage,
+    t0: Date.parse(`${S.from}T00:00:00Z`),
+    t1: Date.parse(`${S.to}T23:59:59.999Z`) };
 }
 
 let dateRange = null;
 
 // Set once in init() when the stats file lags the newest published item
-// year, and appended to the very next paintMonth() status line so the lag
-// is said once on load, not repeated on every later month switch.
+// year, and appended to the very next paintWindow() status line so the lag
+// is said once on load, not repeated on every later window change.
 let lagNote = "";
 
 function lastDayOfMonth(ym) {
@@ -783,26 +855,33 @@ function lastDayOfMonth(ym) {
   return new Date(Date.UTC(yy, mm, 0)).toISOString().slice(0, 10);
 }
 
-// The scene query's window is scoped to whichever month is on screen (not
-// the whole stats span): re-scoped on every month change so it can never
-// reach outside the selected month, and reset to that month's full range.
-// The two-handle slider and the two calendar inputs stay the same value,
-// either way round.
-function reboundDateRange(ym) {
-  const from0 = `${ym}-01`, to0 = lastDayOfMonth(ym);
-  if (dateRange) {
+// Create the two-handle day slider or move its bounds. onChange fires on
+// every handle drag step and calendar edit, and drives the map paint and
+// the card filter through one apply.
+// dayRange()'s own construction calls fromDates() once, but that no-ops on
+// a fresh page load: the <input type=date> fields start empty, and
+// fromDates() refuses to compute from an empty value. set() writes the
+// values directly, the same way rebound() does on every later call.
+function buildDateSlider(from0, to0) {
+  if (!dateRange) {
+    dateRange = dayRange({ container: $("dayrange"), from: $("date0"), to: $("date1"),
+      min: from0, max: to0,
+      onChange: (d0, d1) => {
+        S.from = d0;
+        S.to = d1;
+        scheduleApply({ paint: true, cards: true, nav: true });
+      } });
+    dateRange.set(from0, to0);
+  } else {
     dateRange.rebound(from0, to0);
-    warmWindowParts();
-    return;
   }
-  // dayRange()'s own construction calls fromDates() once, but that no-ops
-  // on a fresh page load: the <input type=date> fields start empty, and
-  // fromDates() refuses to compute from an empty value. set() writes the
-  // values directly, the same way rebound() does on every later call.
-  dateRange = dayRange({ container: $("dayrange"), from: $("date0"), to: $("date1"),
-    min: from0, max: to0 });
-  dateRange.set(from0, to0);
+  S.from = from0;
+  S.to = to0;
   warmWindowParts();
+}
+function setWindow(from0, to0) {
+  buildDateSlider(from0, to0);
+  scheduleApply({ paint: true, cards: true, nav: true });
 }
 
 // Warm the window's parts the moment the window is known, for the
@@ -824,11 +903,9 @@ function warmWindowParts() {
 
 async function init() {
   updateLegend();
-  $("metric").addEventListener("change", () => { updateLegend(); paintMonth(); });
-  $("month").addEventListener("change", () => {
-    reboundDateRange($("month").value);
-    paintMonth();
-  });
+  $("metric").addEventListener("change", () => { updateLegend(); paintWindow(); });
+  $("month").addEventListener("change", () =>
+    setWindow(`${$("month").value}-01`, lastDayOfMonth($("month").value)));
   $("maxcloud").addEventListener("input", onSlider);
   $("mincoverage").addEventListener("input", onSlider);
   $("minscenes").addEventListener("input", onSlider);
@@ -878,14 +955,14 @@ async function init() {
   month.min = span.oldest;
   month.max = newestYear > statsYear ? `${newestYear}-12` : span.newest;
   month.value = defaultMonth;
-  reboundDateRange(defaultMonth);
-  await Promise.all([paintMonth(), timelineFor(null)]);
-  // paintMonth() already calls markActiveBar() (the same call the timeline
+  buildDateSlider(`${defaultMonth}-01`, lastDayOfMonth(defaultMonth));
+  await Promise.all([paintWindow(), timelineFor(null)]);
+  // paintWindow() already calls markActiveBars() (the same call the timeline
   // bar's own onclick makes), but it can run before timelineFor() has
   // appended the bar buttons; timelineFor() also calls it once its bars
-  // exist, so this just guarantees the default month's bar ends up
+  // exist, so this just guarantees the default window's bars end up
   // highlighted regardless of which promise settles first.
-  markActiveBar();
+  markActiveBars();
 }
 
 // The page without stats (a 404 on the collection's timeline): the month
@@ -906,7 +983,7 @@ async function initWithoutStats() {
   month.min = `${COL.since}-01`;
   month.max = now;
   month.value = now;
-  reboundDateRange(now);
+  buildDateSlider(`${now}-01`, lastDayOfMonth(now));
   await timelineFor(null);
   let newestYear = null;
   for (let y = CURRENT_YEAR; y >= COL.since && newestYear === null; y--) {
@@ -943,7 +1020,7 @@ const CURRENT_YEAR = new Date().getUTCFullYear();
 map.on("click", (e) => {
   const tile = hitIndex.at(e.lngLat.wrap().lng, e.lngLat.lat)?.tile;
   if (!TILE_RE.test(tile ?? "")) return;
-  selectedTile = tile;
+  S.tile = tile;
   $("run").disabled = false;
   timelineFor(tile);
   // The click is the search: picking a tile runs the query for the window
@@ -1767,7 +1844,7 @@ async function runQuery() {
   const d1 = $("date1").value;
   const cc = Number($("maxcloud").value);
   const box = $("results");
-  if (!selectedTile || !TILE_RE.test(selectedTile)) {
+  if (!S.tile || !TILE_RE.test(S.tile)) {
     say("Click an MGRS tile on the map first.", true);
     return;
   }
@@ -1783,7 +1860,7 @@ async function runQuery() {
   box.replaceChildren(el("p", "hint", "Reading the item parts…"));
   try {
     const urls = await partUrls(Number(d0.slice(0, 4)), Number(d1.slice(0, 4)),
-      selectedTile);
+      S.tile);
     if (seq !== searchSeq) return;
     if (!urls.length) {
       $("sql").textContent = "";
@@ -1795,18 +1872,18 @@ async function runQuery() {
       return;
     }
     $("sql").textContent = "Range-reading…";
-    $("api").textContent = apiMirror(selectedTile, d0, d1, cc, minCoverage);
+    $("api").textContent = apiMirror(S.tile, d0, d1, cc, S.minCoverage);
     say(`Range-reading ${urls.length} parquet part`
-      + `${urls.length === 1 ? "" : "s"} for tile ${selectedTile}…`);
+      + `${urls.length === 1 ? "" : "s"} for tile ${S.tile}…`);
     const { rows, plan } = await sceneSearch({ urls, tileColumn: COL.tileColumn,
-      tile: selectedTile, d0, d1, cc, cov: minCoverage,
+      tile: S.tile, d0, d1, cc, cov: S.minCoverage,
       sidecars: COL.sidecars !== false });
     if (seq !== searchSeq) return;
     $("sql").textContent = plan;
     box.replaceChildren();
     if (!rows.length) {
       box.append(el("p", "hint",
-        `No ${selectedTile} scenes under ${cc}% cloud in that window — `
+        `No ${S.tile} scenes under ${cc}% cloud in that window — `
         + "raise the slider or widen the dates."));
       say(`No scenes matched — still no API call.`);
       return;
@@ -1825,7 +1902,7 @@ async function runQuery() {
     // The collection is named only off the default: the default's text is
     // the page as it always read; the API mirror names it either way.
     const parts = COLLECTION_ID === DEFAULT_COLLECTION ? "part" : `${COLLECTION_ID} part`;
-    say(`${rows.length} scene${rows.length === 1 ? "" : "s"} for ${selectedTile}, `
+    say(`${rows.length} scene${rows.length === 1 ? "" : "s"} for ${S.tile}, `
       + `clearest first — ${urls.length} range-read ${parts}`
       + `${urls.length === 1 ? "" : "s"}, no API call.`);
   } catch (err) {
