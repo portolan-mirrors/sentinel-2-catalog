@@ -588,11 +588,13 @@ function monthsIn(from, to) {
 // min, coverage a max, scene count a sum, and the median-cloud metric the
 // best month's median (an approximation; a true median needs the raw
 // scenes). Memoised on the month set and the metric, so a drag inside one
-// month set costs nothing here.
+// month set costs nothing here. A month that failed to read marks its key
+// with "!", so the memo misses once the next paint reads that month, and the
+// recovered month paints.
 let aggKey = "";
 let aggLookup = new Map();
 function aggregateMonths(months, metric) {
-  const key = months.map((m) => m.ym).join(",") + "|" + metric;
+  const key = months.map((m) => (m.rows ? m.ym : `${m.ym}!`)).join(",") + "|" + metric;
   if (key === aggKey) return aggLookup;
   const acc = new Map();
   for (const m of months) {
@@ -668,11 +670,13 @@ async function paintWindow() {
   const metric = $("metric").value;
   if (!METRICS.has(metric)) throw new Error(`unknown metric ${metric}`);
   const seq = ++paintSeq;
-  const note = lagNote;
-  lagNote = "";
   const yms = monthsIn(S.from, S.to);
   const settled = await Promise.allSettled(yms.map(monthStatsFor));
   if (seq !== paintSeq) return;
+  // Only the paint that lands consumes the note. A paint that loses the race
+  // above must leave it for the winner, or the load-time lag note is lost.
+  const note = lagNote;
+  lagNote = "";
   const months = yms.map((ym, i) => ({ ym,
     rows: settled[i].status === "fulfilled" ? settled[i].value : null }));
   lookup = aggregateMonths(months, metric);
@@ -680,15 +684,22 @@ async function paintWindow() {
   repaint();
   markActiveBars();
   const have = months.filter((m) => m.rows).length;
+  // A slice that failed to read leaves its month unpainted, which is by
+  // design, but it must not be silent: the next paint retries the month.
+  const failed = settled.filter((s) => s.status === "rejected").length;
+  const trouble = failed
+    ? ` ${failed} month slice${failed === 1 ? "" : "s"} failed to read — `
+      + "drag a handle to retry."
+    : "";
   if (!lookup.size) {
     say(`No tile-months in the published stats for ${S.from} → ${S.to}. `
       + "Pick a window with bars in the timeline below."
-      + (note ? ` ${note}` : ""));
+      + trouble + (note ? ` ${note}` : ""));
     return;
   }
   say(`${lookup.size.toLocaleString()} MGRS tiles imaged in ${S.from} → ${S.to} — `
     + `${have} month slice${have === 1 ? "" : "s"}, no API call. ${filterLine()}.`
-    + (note ? ` ${note}` : ""));
+    + trouble + (note ? ` ${note}` : ""));
 }
 
 // All tiles: the timeline file, already in memory, one row per month. One
