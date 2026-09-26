@@ -60,13 +60,17 @@ export const BASE = new URLSearchParams(location.search).get("base")
 // shape under another directory. `sidecars` says whether the collection
 // publishes a <stem>.idx.json beside every part; false lets search.js skip
 // the 404 probe that would otherwise precede every footer read.
-// `parts(year, tile)` are the file stems
+// `parts(year, tile, months)` are the file stems
 // that may hold a tile's scenes in that year, each HEAD-probed before it is
 // read (partExists): the first collection is the one zone part of the
 // year's tier plus live.parquet for the current year; Collection 1 is one
-// items.parquet per year plus a live.parquet any year may carry (its
-// refresh appends by `created`, so a reprocessed 2019 scene lands in
-// year=2019/live.parquet). `apiTile` is how a STAC API is asked for a tile
+// items.parquet per year plus the live parts of `months`, the months of
+// that year the window touches (windowMonths). Its tail is one file per
+// month (tools/s2_build.py live_part_names) and its refresh appends by
+// `created`, so a reprocessed 2019 scene lands in year=2019/live-MM.parquet,
+// the month it was acquired in. `live.parquet` stays in the list: the single
+// file this collection published before the monthly parts is still in the
+// bucket, emptied and never deleted. `apiTile` is how a STAC API is asked for a tile
 // (apiMirror): Collection 1 items have no s2:mgrs_tile, their tile is
 // grid:code "MGRS-31UET". `masks` are the extra single bands its scenes
 // carry (bands.js MASK_BANDS). `since` is the first year with scenes, for
@@ -94,9 +98,10 @@ export const COLLECTIONS = {
     label: "Sentinel-2 Collection 1 (Earth Search)", title: "Sentinel-2 Collection 1 L2A",
     since: 2015,
     dir: "sentinel-2-c1-l2a", statsDir: "stats-c1", tileColumn: "_tile",
-    // items.parquet publishes one; live.parquet does not, and pays the probe.
+    // items.parquet publishes one; a live part does not, and pays the probe.
     sidecars: true,
-    parts: () => ["items", "live"],
+    parts: (year, tile, months) => ["items", "live",
+      ...months.map((m) => `live-${String(m).padStart(2, "0")}`)],
     // The parts hold every tile, so they can warm before any tile is picked.
     prefetchParts: true,
     apiTile: (tile) => ({ "grid:code": { eq: `MGRS-${tile}` } }),
@@ -816,7 +821,7 @@ function warmWindowParts() {
   const d1 = $("date1").value;
   if (!d0 || !d1) return;
   for (let y = Number(d0.slice(0, 4)); y <= Number(d1.slice(0, 4)); y++) {
-    for (const url of partUrlsFor(y, "")) {
+    for (const url of partUrlsFor(y, "", d0, d1)) {
       partExists(url).then((ok) => { if (ok) warmPart(url, COL.sidecars !== false); });
     }
   }
@@ -1012,22 +1017,51 @@ const partExists = (url) => {
   return partProbes.get(url);
 };
 
-// The URLs of the parts that may hold `tile` in `year`, per the collection
-// (COLLECTIONS[..].parts). For the first collection that is exactly one
-// archive file -- items.parquet, or the one zone part of the year's tier
-// the tile's zone falls in; the other parts of the year are never probed,
-// let alone read -- plus live.parquet for the current year. For Collection
-// 1 it is items.parquet plus the year's live.parquet. The probe only asks
-// whether the file is published yet.
-const partUrlsFor = (year, tile) =>
-  COL.parts(year, tile).map((stem) => `${BASE}/${COL.dir}/year=${year}/${stem}.parquet`);
+// The months of `year` that the window [d0, d1] touches, as month numbers
+// 1-12. Collection 1's tail is one file per month, so this is how a search
+// asks for the months it needs instead of probing twelve: a window inside
+// one month gives one month, a window that starts before the year starts at
+// January, one that ends after it ends at December, and a year outside the
+// window gives none -- so a December-to-January window asks December of the
+// first year and January of the second.
+function windowMonths(year, d0, d1) {
+  const y0 = Number(d0.slice(0, 4));
+  const y1 = Number(d1.slice(0, 4));
+  if (year < y0 || year > y1) return [];
+  const first = year === y0 ? Number(d0.slice(5, 7)) : 1;
+  const last = year === y1 ? Number(d1.slice(5, 7)) : 12;
+  const months = [];
+  for (let m = first; m <= last; m++) months.push(m);
+  return months;
+}
+
+// The window the callers that ask "is this year published at all?" use, in
+// place of a search window: today. The live part of the current month is the
+// one the refresh rewrites every morning, so it stands for a year whose
+// archive part is not published yet, and the walk still costs two or three
+// HEADs a year rather than fourteen.
+const TODAY = new Date().toISOString().slice(0, 10);
+
+// The URLs of the parts that may hold `tile` in `year` over the day window
+// [d0, d1], per the collection (COLLECTIONS[..].parts). For the first
+// collection that is exactly one archive file -- items.parquet, or the one
+// zone part of the year's tier the tile's zone falls in; the other parts of
+// the year are never probed, let alone read -- plus live.parquet for the
+// current year. For Collection 1 it is items.parquet, the emptied
+// live.parquet, and the live part of each month of the year the window
+// touches. The probe only asks whether the file is published yet.
+const partUrlsFor = (year, tile, d0 = TODAY, d1 = TODAY) =>
+  COL.parts(year, tile, windowMonths(year, d0, d1))
+    .map((stem) => `${BASE}/${COL.dir}/year=${year}/${stem}.parquet`);
 
 // The last year with any published part, from `from` upward: a zone-1
-// tile's parts of each year are probed (a year is published whole, so one
-// part stands for the year; live.parquet where the collection may have
-// one). Years are probed in order and the walk stops at the first
-// unpublished one, so a page load costs one 404 (which Chrome logs), not
-// one per future year.
+// tile's parts of each year are probed with no window, so the candidates
+// are the year's archive part (a year is published whole, so one part
+// stands for the year) plus, where the collection has a tail, live.parquet
+// and the live part of the current month -- which for a year the archive
+// has not reached is the only file there is. Years are probed in order and
+// the walk stops at the first unpublished one, so a page load costs one 404
+// (which Chrome logs), not one per future year.
 async function newestPublishedYear(from) {
   let newest = from;
   for (let y = from + 1; y <= CURRENT_YEAR; y++) {
@@ -1037,9 +1071,11 @@ async function newestPublishedYear(from) {
   return newest;
 }
 
-async function partUrls(y0, y1, tile) {
+async function partUrls(d0, d1, tile) {
   const candidates = [];
-  for (let y = y0; y <= y1; y++) candidates.push(...partUrlsFor(y, tile));
+  for (let y = Number(d0.slice(0, 4)); y <= Number(d1.slice(0, 4)); y++) {
+    candidates.push(...partUrlsFor(y, tile, d0, d1));
+  }
   const present = await Promise.all(candidates.map(partExists));
   return candidates.filter((_, i) => present[i]);
 }
@@ -1782,8 +1818,7 @@ async function runQuery() {
   $("run").disabled = true;
   box.replaceChildren(el("p", "hint", "Reading the item parts…"));
   try {
-    const urls = await partUrls(Number(d0.slice(0, 4)), Number(d1.slice(0, 4)),
-      selectedTile);
+    const urls = await partUrls(d0, d1, selectedTile);
     if (seq !== searchSeq) return;
     if (!urls.length) {
       $("sql").textContent = "";

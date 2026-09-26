@@ -1910,3 +1910,63 @@ def test_the_workflows_ask_the_builder_for_every_part_name():
                          if not line.lstrip().startswith("#"))
         for month in range(1, 13):
             assert live_month_name(month) not in code, (path.name, month)
+
+
+def _app_snippet(name: str, start: str, end: str) -> str:
+    """One expression or function of apps/explorer/app.js, by the text that
+    opens and closes it. The module cannot be imported outside a browser (it
+    reads `location` and the DOM as it loads), so a test of its pure logic
+    lifts the source out and runs that."""
+    js = (ROOT / "apps" / "explorer" / "app.js").read_text()
+    i = js.index(start)
+    j = js.index(end, i) + len(end)
+    assert name in js[i:j], (name, js[i:j][:80])
+    return js[i:j]
+
+
+def test_app_asks_only_for_the_months_the_window_touches():
+    """Collection 1's tail is one file per month, so a search asks for the
+    months of its window and no others: twelve probes a year to read one
+    would undo the layout. The mapping and the part list are lifted out of
+    app.js and run in node. A December-to-January window asks December of
+    the first year and January of the second; a year outside the window is
+    asked for no month at all."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    window_months = _app_snippet(
+        "windowMonths", "function windowMonths(year, d0, d1) {", "\n}\n")
+    c1_parts = _app_snippet(
+        "live-", 'parts: (year, tile, months) => ["items", "live",',
+        '.padStart(2, "0")}`)]')
+    cases = [
+        (2026, "2026-09-01", "2026-09-30", list(range(9, 10))),
+        (2026, "2026-09-14", "2026-09-14", [9]),
+        (2026, "2026-03-15", "2026-06-02", [3, 4, 5, 6]),
+        (2026, "2026-01-01", "2026-12-31", list(range(1, 13))),
+        # The December-to-January window, the case the refresh's own year
+        # loop exists for: one month of each year, not twelve of either.
+        (2025, "2025-12-27", "2026-01-02", [12]),
+        (2026, "2025-12-27", "2026-01-02", [1]),
+        (2024, "2025-12-27", "2026-01-02", []),
+        (2027, "2025-12-27", "2026-01-02", []),
+        # A window inside one month of a year that starts before it.
+        (2026, "2024-05-04", "2026-02-10", [1, 2]),
+    ]
+    script = (
+        window_months
+        + "\nconst parts = (year, tile, months) => "
+        + c1_parts.split("=>", 1)[1]
+        + ";\nconst out = [];\n"
+        + "".join(f"out.push(parts(0, '31UET', windowMonths"
+                  f"({year}, {d0!r}, {d1!r})));\n"
+                  for year, d0, d1, _ in cases)
+        + "console.log(JSON.stringify(out));\n")
+    proc = subprocess.run([node, "--input-type=module", "-e", script],
+                          capture_output=True, text=True, cwd=ROOT)
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(proc.stdout)
+    for (year, d0, d1, months), asked in zip(cases, got):
+        want = ["items", "live"] + [live_month_name(m)[:-len(".parquet")]
+                                    for m in months]
+        assert asked == want, (year, d0, d1, asked)
