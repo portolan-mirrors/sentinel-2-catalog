@@ -257,34 +257,30 @@ async function searchPartWith(meta, url, tileColumn, tile, tally) {
   return parts.flat().filter((r) => r[tileColumn] === tile);
 }
 
-// The full search, shaped exactly like the DuckDB query it replaces:
-// tile, UTC day window, cloud ceiling, coverage floor; ORDER BY cloud, id;
-// LIMIT 30. Rows come back in the projection runQuery always handled
-// ({id, ts, cloud, thumbnail_url, bbox, baseline}), plus a `plan` the page
-// can print in place of the SQL.
-export async function sceneSearch({ urls, tileColumn, tile, d0, d1, cc, cov,
-                                    sidecars = true }) {
+// The raw read: every row of `tile` in the given parts, projected to the
+// card fields, sorted by time. sceneRows applies no date, cloud or
+// coverage filter and no limit; the page filters in memory so a slider
+// drag costs no network read.
+export async function sceneRows({ urls, tileColumn, tile, sidecars = true }) {
   const tally = { parts: 0, groups: 0, gets: 0, bytes: 0, misses: 0 };
   const t0 = performance.now();
   const raw = (await Promise.all(
     urls.map((u) => searchPart(u, tileColumn, tile, tally, sidecars)))).flat();
-  const lo = new Date(`${d0}T00:00:00Z`);
-  const hi = new Date(`${d1}T23:59:59.999Z`);
-  const rows = raw
-    .filter((r) => r.datetime >= lo && r.datetime <= hi
-      && Number(r["eo:cloud_cover"]) <= cc
-      && (cov <= 0 || 100 - Number(r["s2:nodata_pixel_percentage"]) >= cov))
-    .sort((a, b) => Number(a["eo:cloud_cover"]) - Number(b["eo:cloud_cover"])
-      || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-    .slice(0, 30)
-    .map((r) => ({
+  const rows = raw.map((r) => {
+    const t = r.datetime instanceof Date ? r.datetime.getTime() : Date.parse(r.datetime);
+    const nodata = Number(r["s2:nodata_pixel_percentage"]);
+    return {
       id: r.id,
-      ts: r.datetime.toISOString().slice(0, 19) + "Z",
+      ts: new Date(t).toISOString().slice(0, 19) + "Z",
+      day: new Date(t).toISOString().slice(0, 10),
+      t,
       cloud: Number(r["eo:cloud_cover"]),
+      cover: Number.isFinite(nodata) ? 100 - nodata : null,
       thumbnail_url: r.thumbnail_url,
       bbox: Array.from(r.bbox ?? []),
       baseline: r["s2:processing_baseline"],
-    }));
+    };
+  }).sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const secs = ((performance.now() - t0) / 1000).toFixed(1);
   const plan = `hyparquet range-read plan (no SQL engine, no API):\n`
     + `  ${tally.parts} part(s) held ${tile}, ${tally.groups} row group(s) admitted by their`
@@ -292,6 +288,24 @@ export async function sceneSearch({ urls, tileColumn, tile, d0, d1, cc, cov,
     + `  ${tally.gets} parallel range GETs, ${(tally.bytes / 1024).toFixed(0)} KiB`
     + ` (footers cached per session), ${secs} s`
     + (tally.misses ? `\n  ${tally.misses} read(s) fell outside the prefetched chunks` : "");
+  return { rows, plan };
+}
+
+// The full search, shaped exactly like the DuckDB query it replaces:
+// tile, UTC day window, cloud ceiling, coverage floor; ORDER BY cloud, id;
+// LIMIT 30. The harnesses and check_app.py pin this contract.
+export async function sceneSearch({ urls, tileColumn, tile, d0, d1, cc, cov,
+                                    sidecars = true }) {
+  const { rows: all, plan } = await sceneRows({ urls, tileColumn, tile, sidecars });
+  const lo = Date.parse(`${d0}T00:00:00Z`);
+  const hi = Date.parse(`${d1}T23:59:59.999Z`);
+  const rows = all
+    .filter((r) => r.t >= lo && r.t <= hi && r.cloud <= cc
+      && (cov <= 0 || (r.cover !== null && r.cover >= cov)))
+    .sort((a, b) => a.cloud - b.cloud || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .slice(0, 30)
+    .map((r) => ({ id: r.id, ts: r.ts, cloud: r.cloud,
+      thumbnail_url: r.thumbnail_url, bbox: r.bbox, baseline: r.baseline }));
   return { rows, plan };
 }
 
