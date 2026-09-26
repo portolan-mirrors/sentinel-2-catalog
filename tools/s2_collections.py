@@ -40,6 +40,14 @@ class CollectionConfig:
     row_group_size: int | None  # None: s2_build falls back to its ROW_GROUP
     live_zstd_level: int
     lookback_field: str         # "datetime" | "created"
+    # Is the year's live tail cut into one file per month
+    # (live-01.parquet .. live-12.parquet, s2_build.live_part_names) instead
+    # of one live.parquet? The daily refresh rewrites and re-uploads every
+    # live file its lookback touches, so a monthly tail caps that cost at one
+    # month, whatever the year holds. The first collection keeps one
+    # live.parquet: consolidate-month.yml folds it every month, so it never
+    # grows past a month either way.
+    monthly_live: bool = False
 
     @property
     def public_base(self) -> str:
@@ -84,7 +92,11 @@ _C1 = CollectionConfig(
     # groups near 6,000 rows (DuckDB fills them in 2,048-row steps, so
     # 6,144). The month-aligned writer stays behind --row-group-mode.
     sort_key="_tile,datetime", row_group_mode="uniform", row_group_size=6_000,
-    live_zstd_level=3, lookback_field="created")
+    live_zstd_level=3, lookback_field="created",
+    # One live file per month: nothing on GitHub folds this collection, so a
+    # single live.parquet grew by ~15,000 rows (~24 MB) a day and the daily
+    # refresh rewrote and re-uploaded all of it. A month caps that.
+    monthly_live=True)
 
 _ALL = {c.id: c for c in (_FIRST, _C1)}
 NAMES = tuple(_ALL)

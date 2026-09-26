@@ -37,27 +37,36 @@ name: refresh-daily
 # year's first days, before its first consolidation. Any other year
 # with no archive part is a broken catalog and still fails.
 #
-# Collection 1 differs in three ways, and the second job is the first
-# job's loop with those three changes:
+# Collection 1 differs in four ways, and the second job is the first
+# job's loop with those four changes:
 #
 #   - The lookback is on `created`, not `datetime` (s2_fetch --field
 #     created). ESA is still reprocessing old years into Collection 1, so
 #     a scene acquired in 2019 can be created this week; a lookback on
 #     acquisition would never see it. The slice can therefore hold any
 #     year, not only the current one and December's, and every year in it
-#     gets its own live.parquet, the same per-year loop as the first job.
+#     gets its own live parts, the same per-year loop as the first job.
 #   - The archive of a year is one items.parquet (no zone parts), built and
 #     uploaded from RAILS; the exclusion list of a year is that one URL, or
 #     nothing before the year file is published (the new year's first days,
 #     or a year the backfill has not reached). archive_part_names() with the
 #     Collection 1 config says so, the same call as the first job.
+#   - The live tail of a year is one file per month of it,
+#     year=YYYY/live-MM.parquet (config.monthly_live,
+#     s2_build.live_part_names), not one live.parquet. The refresh rewrites
+#     and re-uploads every live file it touches, and nothing on GitHub folds
+#     this collection, so a single live.parquet grew by about 15,000 rows
+#     (24 MB) a day and went back up whole every morning -- 700 MB a day
+#     after a month, 2 GB after three, which is where a runner's 14 GB disk
+#     starts to struggle. A month caps that at the months the lookback
+#     touched, which in steady state is one. The year file stays one object:
+#     the item layout does not change.
 #   - Live is written at zstd 3 (s2_collections live_zstd_level), because it
-#     is rewritten daily and can hold a whole year: nothing on GitHub folds
-#     it. A fold on RAILS (tools/rails/fold_live.sbatch, every month or two)
-#     merges each live into its year file and empties it; until then a glob
-#     over the year reads both files, and the dedupe on id keeps the
-#     reprocessed copy. A live that has grown for a year is a bigger
-#     download and a longer build here, which is what the fold duty bounds.
+#     is rewritten daily: nothing on GitHub folds it. A fold on RAILS
+#     (tools/rails/fold_live.sbatch, every month or two) merges each live
+#     part of a year into its year file and empties it; until then a glob
+#     over the year reads the year file and the months, and the dedupe on
+#     id keeps the reprocessed copy.
 #
 # Each job ends with tools/publish.py, which uploads every changed file under
 # catalog/, so each job restamps both collections and both stats
@@ -389,14 +398,27 @@ jobs:
           END=$(date -u +%F)
           python3 tools/s2_fetch.py --collection "$COLLECTION" --field created \
             --start "$START" --end "$END" --out ./staging-c1/chunks
-      # The first job's plan with the Collection 1 config: the years are
-      # year(datetime) of the slice (a `created` lookback can touch any
-      # year), the archive names come from archive_part_names(config) --
-      # one items.parquet -- and every probe goes through published_part
-      # (retried; a code that is not 200 or 404 stops the run). The plan
-      # also writes the collection's live zstd level from
+      # The first job's plan, with the Collection 1 config and one more
+      # thing to decide: which (year, month) pairs the slice touched. The
+      # pairs are year(datetime), month(datetime) of the slice in the
+      # build's UTC zone (a `created` lookback can touch any year and any
+      # month); the archive names come from archive_part_names(config) --
+      # one items.parquet -- and the live names from live_part_names(config)
+      # -- live-01.parquet .. live-12.parquet plus the single live.parquet
+      # this collection published before those existed. Every probe goes
+      # through published_part (retried; a code that is not 200 or 404 stops
+      # the run). The plan also writes the collection's live zstd level from
       # tools/s2_collections.py, so the build step cannot drift from it.
-      - name: Plan every year in the slice
+      #
+      # Per year the plan writes: `archive.urls` (the exclusion list and the
+      # splice's archive sources), `months` (the months to build: the
+      # slice's, plus every month the pre-monthly live.parquet still holds),
+      # `migrate` (does that file hold rows?), `prev-MM` per published
+      # monthly part, and `splice.urls` (the year's published monthly parts
+      # this run does NOT rebuild). The splice needs that last list because
+      # --merge-years recomputes a year's whole stats table: a year whose
+      # August part is not in the sources would lose August.
+      - name: Plan every year and month in the slice
         if: steps.guard.outputs.published == 'true'
         run: |
           set -euo pipefail
@@ -406,61 +428,121 @@ jobs:
           import duckdb
           sys.path.insert(0, "tools")
           import s2_collections as cols
-          from s2_build import archive_part_names, gather, published_part
+          from s2_build import (archive_part_names, gather, live_part_names,
+                                published_part, published_rows)
           base = os.environ["BASE"]
           config = cols.get(os.environ["COLLECTION"])
+          if not config.monthly_live:
+              raise SystemExit(f"{config.id} has monthly_live=False; this job "
+                               f"builds one live part per month")
           files = gather(["staging-c1/chunks"])
           lst = ",".join(f"'{f}'" for f in files)
           con = duckdb.connect()
-          con.execute("SET TimeZone='UTC';")   # the build's year() zone
-          years = [r[0] for r in con.execute(
-              f"SELECT DISTINCT year(datetime) AS y "
-              f"FROM read_parquet([{lst}], union_by_name=true) ORDER BY y"
-          ).fetchall()]
-          if not years:
+          con.execute("SET TimeZone='UTC';")   # the build's year()/month() zone
+          pairs = con.execute(
+              f"SELECT DISTINCT year(datetime) AS y, month(datetime) AS m "
+              f"FROM read_parquet([{lst}], union_by_name=true) ORDER BY y, m"
+          ).fetchall()
+          if not pairs:
               raise SystemExit("the lookback slice holds no rows")
+          years = sorted({y for y, _ in pairs})
           plan = Path("staging-c1/plan")
           plan.mkdir(parents=True)
           (plan / "years").write_text("".join(f"{y}\n" for y in years))
           (plan / "live-zstd-level").write_text(f"{config.live_zstd_level}\n")
+          con.execute("INSTALL httpfs; LOAD httpfs;")  # the footer reads below
           for y in years:
-              live = published_part(base, y, "live.parquet")
+              ydir = plan / str(y)
+              ydir.mkdir()
               urls = [f"{base}/year={y}/{n}.parquet"
                       for n in archive_part_names(config)
                       if published_part(base, y, f"{n}.parquet")]
-              (plan / str(y)).mkdir()
-              (plan / str(y) / "live").write_text("true" if live else "false")
-              (plan / str(y) / "archive.urls").write_text(
+              (ydir / "archive.urls").write_text(
                   "".join(f"{u}\n" for u in urls))
-              print(f"year={y}: live {'published' if live else 'not published'}; "
-                    f"{len(urls)} archive part(s)")
+              months = {m for yy, m in pairs if yy == y}
+              migrate = False
+              splice = []
+              for stem in live_part_names(config):
+                  name = f"{stem}.parquet"
+                  if not published_part(base, y, name):
+                      continue
+                  url = f"{base}/year={y}/{name}"
+                  if stem == "live":
+                      # The tail this collection published as one file. Once
+                      # it is empty it is done: the catalog never deletes, so
+                      # it stays in the bucket at zero rows and every later
+                      # run reads the same zero here and migrates nothing.
+                      rows = published_rows(con, url)
+                      print(f"year={y}/live.parquet: {rows:,} row(s)")
+                      if not rows:
+                          continue
+                      migrate = True
+                      held = [r[0] for r in con.execute(
+                          "SELECT DISTINCT month(datetime) FROM read_parquet(?) "
+                          "ORDER BY 1", [url]).fetchall()]
+                      print(f"year={y}/live.parquet: month(s) "
+                            f"{', '.join(str(m) for m in held)} to fold into "
+                            f"the monthly parts, then empty it")
+                      months |= set(held)
+                      continue
+                  month = int(stem.split("-")[1])
+                  (ydir / f"prev-{month:02d}").write_text("true\n")
+                  splice.append((month, url))
+              (ydir / "migrate").write_text("true\n" if migrate else "false\n")
+              (ydir / "months").write_text(
+                  "".join(f"{m}\n" for m in sorted(months)))
+              # Every published monthly part outside `months` is a month this
+              # run does not touch: the splice reads it where it is.
+              (ydir / "splice.urls").write_text(
+                  "".join(f"{u}\n" for m, u in splice if m not in months))
+              print(f"year={y}: {len(urls)} archive part(s); building month(s) "
+                    f"{', '.join(str(m) for m in sorted(months))}; "
+                    f"{sum(1 for m, _ in splice if m not in months)} "
+                    f"published month(s) left alone")
               for u in urls:
                   print(f"  {u}")
           EOF
-      # The first job's live loop: previous live (its GET must succeed once
-      # the plan saw it) plus the slice, minus every id the year file holds
-      # at the same or a newer generation (--exclude-ids-from; a reprocessed
-      # scene is newer and stays in live for the next fold). A year with no
-      # year file yet is built from the slice and the previous live alone.
-      # Written at the collection's live level (zstd 3): the file is
-      # rewritten daily and the fold on RAILS re-encodes it at 18.
-      - name: Rebuild the live part of every year in the slice
+      # One live part per (year, month) the plan named, each merged with its
+      # published copy so a fetch gap never truncates it: the plan saw
+      # whether year=Y/live-MM.parquet is published, 404 means the month's
+      # first part and the build starts from the slice alone, 200 means the
+      # GET must succeed and any failure -- a 5xx, a timeout, a body cut
+      # short -- stops the run. The build filters the sources to the one
+      # month (--months M), so the parts of a year partition it and the
+      # dedupe rule resolves a scene fetched twice within the month. The
+      # year file is the floor: every id it holds at the same or a newer
+      # generation is dropped (--exclude-ids-from), so a month's part and
+      # the year file never overlap and a glob over the year reads each
+      # scene once. Written at the collection's live level (zstd 3): a live
+      # part is rewritten daily and the fold on RAILS re-encodes it at 18.
+      #
+      # Migration (the one-off this scheme needs, idempotent by
+      # construction): a year whose pre-monthly live.parquet still holds
+      # rows has those rows in the source list of every month of it, so they
+      # land in the month each scene was acquired in, and the run ends by
+      # staging a zero-row live.parquet over it. The next run reads zero rows
+      # there and does nothing. A run that writes the monthly parts and then
+      # fails before the empty file is published leaves the rows in both
+      # places -- counted twice by a glob until the next run, never lost --
+      # and the next run folds them again, which the dedupe on id makes a
+      # no-op. The upload step keeps that order: monthly parts first, the
+      # emptied live.parquet last.
+      - name: Rebuild the live part of every month in the slice
         if: steps.guard.outputs.published == 'true'
         run: |
           set -euo pipefail
           LEVEL=$(cat staging-c1/plan/live-zstd-level)
           while read -r Y; do
             [ -n "$Y" ] || continue
-            SRC="./staging-c1/chunks"
-            if [ "$(cat "staging-c1/plan/$Y/live")" = "true" ]; then
+            OLD=""
+            if [ "$(cat "staging-c1/plan/$Y/migrate")" = true ]; then
               curl -fSL -o "staging-c1/live-prev-$Y.parquet" "$BASE/year=$Y/live.parquet" || {
                 rm -f "staging-c1/live-prev-$Y.parquet"
-                echo "::error::year=$Y/live.parquet: GET failed after the plan saw it published; a live rebuilt without it would lose every scene since the last fold"
+                echo "::error::year=$Y/live.parquet: GET failed after the plan saw it published with rows; the monthly parts would be short by every scene it holds"
                 exit 1
               }
-              SRC="$SRC staging-c1/live-prev-$Y.parquet"
-            else
-              echo "year=$Y/live.parquet: not published (404); building the year's first live from the slice alone"
+              OLD="staging-c1/live-prev-$Y.parquet"
+              echo "year=$Y/live.parquet: folding its rows into this year's monthly parts, then emptying it"
             fi
             EXCLUDE=()
             if [ -s "staging-c1/plan/$Y/archive.urls" ]; then
@@ -469,22 +551,75 @@ jobs:
             else
               echo "year=$Y/items.parquet: not published (404); nothing to exclude from live"
             fi
-            # $SRC is unquoted on purpose: a word list. EXCLUDE expands to
-            # nothing when the year has no year file yet (the ${a[@]+...}
-            # form, so an empty array is not an unbound variable under -u).
-            python3 tools/s2_build.py --collection "$COLLECTION" \
-              --sources $SRC --years "$Y" \
-              --out "./staging-c1/publish/$COLLECTION" --name live.parquet \
-              --zstd-level "$LEVEL" \
-              ${EXCLUDE[@]+"${EXCLUDE[@]}"}
+            while read -r M; do
+              [ -n "$M" ] || continue
+              MM=$(printf '%02d' "$M")
+              PART="./staging-c1/publish/$COLLECTION/year=$Y/live-$MM.parquet"
+              SRC="./staging-c1/chunks${OLD:+ $OLD}"
+              if [ -f "staging-c1/plan/$Y/prev-$MM" ]; then
+                curl -fSL -o "staging-c1/live-prev-$Y-$MM.parquet" "$BASE/year=$Y/live-$MM.parquet" || {
+                  rm -f "staging-c1/live-prev-$Y-$MM.parquet"
+                  echo "::error::year=$Y/live-$MM.parquet: GET failed after the plan saw it published; a month rebuilt without it would lose every scene since the last fold"
+                  exit 1
+                }
+                SRC="$SRC staging-c1/live-prev-$Y-$MM.parquet"
+              else
+                echo "year=$Y/live-$MM.parquet: not published (404); building the month's first live part from the slice alone"
+              fi
+              # $SRC is unquoted on purpose: a word list. EXCLUDE expands to
+              # nothing when the year has no year file yet (the ${a[@]+...}
+              # form, so an empty array is not an unbound variable under -u).
+              python3 tools/s2_build.py --collection "$COLLECTION" \
+                --sources $SRC --years "$Y" --months "$M" \
+                --out "./staging-c1/publish/$COLLECTION" --name "live-$MM.parquet" \
+                --zstd-level "$LEVEL" \
+                ${EXCLUDE[@]+"${EXCLUDE[@]}"}
+              # The plan only names a month the sources hold rows for, so the
+              # build writes a file for every one of them -- a real part, or
+              # a zero-row part when the year file already holds every staged
+              # row. No file means the plan and the build disagree, and the
+              # splice below would be short a month: stop before anything is
+              # uploaded.
+              [ -f "$PART" ] || {
+                echo "::error::year=$Y/live-$MM.parquet: the build wrote no file for a month the plan says holds rows"
+                exit 1
+              }
+            done < "staging-c1/plan/$Y/months"
+            if [ -n "$OLD" ]; then
+              # The zero-row live.parquet that replaces the pre-monthly file:
+              # its own schema, s2_build.write_empty_part (what the fold and
+              # the monthly consolidation publish), staged beside the monthly
+              # parts and uploaded after them.
+              python3 - "$Y" "$OLD" << 'EOF'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, "tools")
+          from s2_build import connect, write_empty_part
+          year, prev = int(sys.argv[1]), Path(sys.argv[2])
+          year_dir = Path("staging-c1/publish") / os.environ["COLLECTION"] / f"year={year}"
+          year_dir.mkdir(parents=True, exist_ok=True)
+          tmp = Path("staging-c1/.duckdb-tmp")
+          tmp.mkdir(parents=True, exist_ok=True)
+          write_empty_part(connect("2GB", tmp), prev,
+                           year_dir / "live.parquet", year)
+          EOF
+            fi
           done < staging-c1/plan/years
+          echo "staged:"
+          find "staging-c1/publish/$COLLECTION" -name '*.parquet' | sort
       # The first job's splice with --collection: each year from its year
-      # file plus the live just built. A year with no year file is spliced
-      # from live alone only when it is the current calendar year (its
-      # first days, before the first fold); any other year with no year
-      # file means the backfill has not published it, and stats for it
-      # from a five-day slice would replace the year's whole table with a
-      # handful of rows -- it fails, before anything is uploaded.
+      # file plus every live part of it. The parts this run built come from
+      # the staging tree; the year's other published monthly parts come from
+      # the bucket (the plan's splice.urls), because --merge-years replaces
+      # the year's whole table and a month left out of the sources would
+      # vanish from the stats. The pre-monthly live.parquet is never a
+      # source: it holds no rows, or this run has just moved the rows it
+      # held into the monthly parts. A year with no year file is spliced
+      # from its live parts alone only when it is the current calendar year
+      # (its first days, before the first fold); any other year with no year
+      # file means the backfill has not published it, and stats for it from
+      # a five-day slice would replace the year's whole table with a handful
+      # of rows -- it fails, before anything is uploaded.
       - name: Splice every year in the slice into stats
         if: steps.guard.outputs.published == 'true'
         run: |
@@ -498,12 +633,23 @@ jobs:
               mapfile -t URLS < "staging-c1/plan/$Y/archive.urls"
               SRC+=("${URLS[@]}")
             elif [ "$Y" = "$NOW" ]; then
-              echo "::notice::year=$Y: no year file published yet (the year's first fold has not run); splicing it from live alone"
+              echo "::notice::year=$Y: no year file published yet (the year's first fold has not run); splicing it from its live parts alone"
             else
               echo "::error::no year file published under year=$Y, and $Y is not the current year; refusing to splice stats from live alone"
               exit 1
             fi
-            SRC+=("./staging-c1/publish/$COLLECTION/year=$Y/live.parquet")
+            mapfile -t BUILT < <(find "staging-c1/publish/$COLLECTION/year=$Y" \
+              -maxdepth 1 -name 'live-*.parquet' | sort)
+            WANT=$(grep -c . "staging-c1/plan/$Y/months")
+            if [ "${#BUILT[@]}" -ne "$WANT" ]; then
+              echo "::error::year=$Y: the plan named $WANT month(s) but ${#BUILT[@]} monthly live part(s) are staged; refusing to splice a year that is short"
+              exit 1
+            fi
+            SRC+=("${BUILT[@]}")
+            if [ -s "staging-c1/plan/$Y/splice.urls" ]; then
+              mapfile -t OTHERS < "staging-c1/plan/$Y/splice.urls"
+              SRC+=("${OTHERS[@]}")
+            fi
             YEARS="${YEARS:+$YEARS,}$Y"
           done < staging-c1/plan/years
           echo "splicing year(s) $YEARS from:"; printf '  %s\n' "${SRC[@]}"
@@ -552,9 +698,28 @@ jobs:
           role-to-assume: arn:aws:iam::939788573396:role/source-coop-portolan-mirrors
           role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}-c1
           aws-region: us-west-2
+      # Upload order matters on the run that migrates a year (the step
+      # above says why): the monthly parts must land before the zero-row
+      # live.parquet that replaces the file whose rows they now hold. A
+      # reader that sees the new months and the old live sees some scenes
+      # twice, which dedupe on id removes; one that saw the emptied live
+      # before the months would see a hole. upload_data.py without --only
+      # walks the tree on a thread pool, so the walk order guarantees
+      # nothing: every part but live.parquet goes up through --only first,
+      # then one pass over the rest (the emptied live.parquet, the stats
+      # products, and the parts already up, which it skips as unchanged).
+      # The same two passes on a day with nothing to migrate, where there
+      # is no live.parquet to order against.
       - name: Upload data
         if: steps.guard.outputs.published == 'true'
-        run: python3 tools/upload_data.py --confirm --data-dir ./staging-c1/publish
+        run: |
+          set -euo pipefail
+          for f in $(find "staging-c1/publish/$COLLECTION" -mindepth 2 -maxdepth 2 \
+            -name '*.parquet' ! -name 'live.parquet' | sort); do
+            python3 tools/upload_data.py --confirm --data-dir ./staging-c1/publish \
+              --only "${f#staging-c1/publish/}"
+          done
+          python3 tools/upload_data.py --confirm --data-dir ./staging-c1/publish
       - name: Publish catalog metadata
         if: steps.guard.outputs.published == 'true'
         run: python3 tools/publish.py --confirm

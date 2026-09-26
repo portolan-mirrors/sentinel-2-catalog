@@ -131,6 +131,18 @@ const partMeta = (url, sidecars = true) => {
       if (sidecar) return { ...sidecar, fromSidecar: true };
       const tail = await fetch(url, { cache: "no-store",
         headers: { Range: `bytes=-${TAIL_BYTES}` } });
+      // A part that is not there is empty, not an error. The page probes
+      // before it reads (app.js partExists), but the two answers can
+      // disagree: a fold can empty and replace a live part between the
+      // probe and the read, and a monthly live part of a window may never
+      // have existed. An absent part resolves to metadata with no row
+      // group, so the search reads the other parts and returns what they
+      // hold; 403 counts as absent because that is what an object store
+      // answers for a key it will not talk about.
+      if (tail.status === 404 || tail.status === 403) {
+        return { url, absent: true, size: 0, footerOff: 0,
+                 footer: new ArrayBuffer(0), metadata: null, groups: [] };
+      }
       // 200 means the server ignored the Range header, as in rangeGet.
       if (tail.status !== 206) throw new Error(`range read of ${url} got HTTP ${tail.status}`);
       const size = Number(tail.headers.get("content-range")?.split("/")[1]);
@@ -212,12 +224,17 @@ function regionBuffer(url, size, regions, tally, expectSize) {
 }
 
 // The search over one part: admit groups, prefetch the needed chunks, decode
-// each admitted group, keep the tile's rows. Returns raw decoded rows.
-// A decode failure on sidecar-built metadata retries once on the footer
-// path, so a stale or malformed sidecar degrades to the slow path instead
-// of failing the search.
+// each admitted group, keep the tile's rows. Returns raw decoded rows. A
+// part that answered 404 is read as empty (partMeta says so) and counted in
+// the plan, not thrown. A decode failure on sidecar-built metadata retries
+// once on the footer path, so a stale or malformed sidecar degrades to the
+// slow path instead of failing the search.
 async function searchPart(url, tileColumn, tile, tally, sidecars) {
   const meta = await partMeta(url, sidecars);
+  if (meta.absent) {
+    tally.absent += 1;
+    return [];
+  }
   try {
     return await searchPartWith(meta, url, tileColumn, tile, tally);
   } catch (err) {
@@ -262,7 +279,7 @@ async function searchPartWith(meta, url, tileColumn, tile, tally) {
 // coverage filter and no limit; the page filters in memory so a slider
 // drag costs no network read.
 export async function sceneRows({ urls, tileColumn, tile, sidecars = true }) {
-  const tally = { parts: 0, groups: 0, gets: 0, bytes: 0, misses: 0 };
+  const tally = { parts: 0, groups: 0, gets: 0, bytes: 0, misses: 0, absent: 0 };
   const t0 = performance.now();
   const raw = (await Promise.all(
     urls.map((u) => searchPart(u, tileColumn, tile, tally, sidecars)))).flat();
@@ -293,7 +310,8 @@ export async function sceneRows({ urls, tileColumn, tile, sidecars = true }) {
     + ` ${tileColumn} ranges\n`
     + `  ${tally.gets} parallel range GETs, ${(tally.bytes / 1024).toFixed(0)} KiB`
     + ` (footers cached per session), ${secs} s`
-    + (tally.misses ? `\n  ${tally.misses} read(s) fell outside the prefetched chunks` : "");
+    + (tally.misses ? `\n  ${tally.misses} read(s) fell outside the prefetched chunks` : "")
+    + (tally.absent ? `\n  ${tally.absent} part(s) answered 404 and were read as empty` : "");
   return { rows, plan };
 }
 
@@ -340,6 +358,7 @@ export function readTable(buf, columns) {
 export async function keyedRows({ url, keyColumn, key, columns,
                                  sidecars = true }) {
   const meta = await partMeta(url, sidecars);
+  if (meta.absent) return [];   // no file, no rows for the key
   const groups = admittedGroups(meta, keyColumn, key);
   if (!groups.length) return [];
   const wanted = [...new Set([keyColumn, ...columns])];

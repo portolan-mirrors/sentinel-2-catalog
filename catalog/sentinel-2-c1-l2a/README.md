@@ -80,7 +80,8 @@ sentinel-2-c1-l2a/
   year=2016/items.parquet
   …
   year=2026/items.parquet
-  year=2026/live.parquet       rolling tail since the last fold; any year may have one
+  year=2026/live-09.parquet    rolling tail since the last fold, one file per
+  year=2026/live-10.parquet    month of the year; any year may have some
 ```
 
 One directory per year Earth Search holds Collection 1 items for, from 2015
@@ -104,18 +105,26 @@ a Hilbert-range filter still works; they just no longer set the order. The
 files are GeoParquet 2.0 (native `GEOMETRY` column with per-row-group geo
 statistics), zstd level 18.
 
-Any year — not only the current one — may also carry `live.parquet`. ESA's
-reprocessing is still running, so scenes from old years keep appearing with
-recent `created` timestamps; the daily refresh looks back on `created`, not
-`datetime`, and appends what it finds to the live file of whichever year the
-scene belongs to, at zstd level 3 so the daily write stays cheap. A live file
-can hold a whole year's worth of late arrivals. Every month or two, and at
-year end, a fold job merges each live file into its year's `items.parquet`
-(re-sorted by tile and time, zstd 18) and empties it. Between folds, a glob over
-`year=YYYY/*.parquet` reads the archive plus the tail; the two do not overlap
-except for a reprocessed scene, which keeps its id with a newer
-`s2:generation_time` — dedupe on `id` keeping the highest generation time
-and you have the year exactly once.
+Any year — not only the current one — may also carry live files, one per
+month of it: `live-01.parquet` to `live-12.parquet`, where `MM` is the month
+the scene was acquired in. ESA's reprocessing is still running, so scenes
+from old years keep appearing with recent `created` timestamps; the daily
+refresh looks back on `created`, not `datetime`, and appends what it finds to
+the live file of the month and year each scene belongs to, at zstd level 3 so
+the daily write stays cheap. One file per month is what keeps that write
+cheap as the tail grows: a day of refresh rewrites and re-uploads only the
+months it fetched, in steady state one, instead of a single tail file that
+gained about 15,000 rows a day for as long as the next fold took. A year
+refreshed before those files existed may also carry an empty `live.parquet`,
+which held the whole tail as one file; it is kept at zero rows because this
+catalog never deletes a published file.
+
+Every month or two, and at year end, a fold job merges every live file of a
+year into its `items.parquet` (re-sorted by tile and time, zstd 18) and
+empties each one. Between folds, a glob over `year=YYYY/*.parquet` reads the
+archive plus the tail; the parts do not overlap except for a reprocessed
+scene, which keeps its id with a newer `s2:generation_time` — dedupe on `id`
+keeping the highest generation time and you have the year exactly once.
 
 Each `year=YYYY/YYYY.json` item states that year's measured row count, time
 range, footprint bounds and platforms, so a client can choose a year without

@@ -217,7 +217,7 @@ Search stopped publishing them. The
 
 | Workflow | When | Does |
 |---|---|---|
-| `refresh-daily` | daily, 03:42 UTC | Fetches the last five days from Earth Search into `live.parquet` (one per year the window touches, two around New Year), splices those years into the stats table, restamps counts and extents, uploads. Nothing is committed. A second job does the same for `sentinel-2-c1-l2a` on a `created` lookback (any year), into `stats-c1`, while the repository variable `C1_LIVE_ENABLED` is `true`. |
+| `refresh-daily` | daily, 03:42 UTC | Fetches the last five days from Earth Search into `live.parquet` (one per year the window touches, two around New Year), splices those years into the stats table, restamps counts and extents, uploads. Nothing is committed. A second job does the same for `sentinel-2-c1-l2a` on a `created` lookback (any year), into `stats-c1`, while the repository variable `C1_LIVE_ENABLED` is `true`; its tail is one file per month, `year=YYYY/live-MM.parquet`, so a day rewrites only the months it fetched. |
 | `consolidate-month` | the 3rd of each month, 05:17 UTC | Folds `live.parquet` into the year's archive parts for the current year and, while it still has a tail, the previous one, one job per part, deduped by `id`; then empties each folded `live`. |
 | `publish-stats` | manual | Full rebuild of `mgrs-monthly.parquet`, the month slices, `timeline.parquet` and `mgrs.pmtiles` from the published parts, one matrix entry per collection (`stats`, and `stats-c1` while `C1_LIVE_ENABLED` is `true`). |
 | `backfill` and `publish-backfill` | manual | Fetch the whole record one month-slice at a time, then the credentialed year-by-year build and upload. How the archive was seeded; also the repair path. |

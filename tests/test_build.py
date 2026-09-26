@@ -1391,7 +1391,8 @@ import s2_collections as cols  # noqa: E402
 import s2c1_schema  # noqa: E402
 import s2_fetch  # noqa: E402
 from s2_build import (  # noqa: E402
-    DEFAULT_CONFIG, consolidation_plan, month_align, sort_key,
+    DEFAULT_CONFIG, consolidation_plan, live_month_name, live_part_names,
+    month_align, sort_key,
 )
 
 C1 = cols.get("sentinel-2-c1-l2a")
@@ -1772,3 +1773,200 @@ def test_live_zstd_level_flag_reaches_the_file():
         assert "month-aligned row groups" in proc.stdout
         assert all(lo == hi for lo, hi, _ in _month_groups(
             con, out / "year=2026" / "live.parquet"))
+
+
+# ---------------------------------------------------------------------------
+# Monthly live parts (Collection 1): --months, and the one list of live names.
+# ---------------------------------------------------------------------------
+
+def test_live_part_names_are_monthly_only_where_the_config_says_so():
+    """live_part_names() is the single source of the live file stems every
+    workflow probes. The first collection has one; Collection 1 has the
+    twelve monthly stems, with the pre-monthly "live" kept in front because
+    the emptied file stays in the bucket (the catalog never deletes)."""
+    assert live_part_names(DEFAULT_CONFIG) == ("live",)
+    assert DEFAULT_CONFIG.monthly_live is False and C1.monthly_live is True
+    names = live_part_names(C1)
+    assert names[0] == "live"
+    assert list(names[1:]) == [f"live-{m:02d}" for m in range(1, 13)]
+    assert live_month_name(9) == "live-09.parquet"
+    assert live_month_name(12) == "live-12.parquet"
+    for bad in (0, 13):
+        with pytest.raises(SystemExit, match="not a month"):
+            live_month_name(bad)
+
+
+def test_months_builds_one_live_part_per_month():
+    """--months narrows the staging query to those months of the year, so
+    one (year, month) build holds that month's rows and nothing else. The
+    month is month(datetime) in the session's UTC zone, the same rule as
+    the published _month column."""
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_c1_chunk(con, chunks / "a.parquet", rows=1_200, months=12)
+        out = Path(td) / "publish"
+        for month in (8, 9):
+            proc = _build_c1(out, chunks,
+                             ["--months", str(month), "--name",
+                              live_month_name(month)])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        year_dir = out / "year=2026"
+        assert sorted(p.name for p in year_dir.iterdir()) == [
+            "live-08.parquet", "live-09.parquet"]
+        for month in (8, 9):
+            part = year_dir / live_month_name(month)
+            assert con.execute(
+                f"SELECT DISTINCT _month FROM read_parquet('{part}')"
+            ).fetchall() == [(month,)]
+            assert con.execute(
+                f"SELECT DISTINCT month(datetime) FROM read_parquet('{part}')"
+            ).fetchall() == [(month,)]
+        # The twelve months partition the year: no row is in two parts and
+        # none is lost.
+        whole = Path(td) / "whole"
+        assert _build_c1(whole, chunks).returncode == 0
+        total = con.execute("SELECT count(*) FROM read_parquet(?)",
+                            [str(whole / "year=2026" / "items.parquet")]).fetchone()[0]
+        per_month = []
+        for month in range(1, 13):
+            monthly = Path(td) / f"m{month}"
+            assert _build_c1(monthly, chunks, ["--months", str(month), "--name",
+                                               live_month_name(month)]
+                             ).returncode == 0
+            per_month.append(con.execute(
+                "SELECT count(*) FROM read_parquet(?)",
+                [str(monthly / "year=2026" / live_month_name(month))]).fetchone()[0])
+        assert sum(per_month) == total and min(per_month) > 0
+
+
+def test_months_takes_a_list_and_refuses_what_is_not_a_month():
+    """A comma list builds one file holding those months; a month outside
+    1-12, or a --months with --split zones, stops the build."""
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_c1_chunk(con, chunks / "a.parquet", rows=600, months=12)
+        out = Path(td) / "publish"
+        proc = _build_c1(out, chunks, ["--months", "11,12", "--name",
+                                       "live-11.parquet"])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert con.execute(
+            "SELECT DISTINCT _month FROM read_parquet(?) ORDER BY 1",
+            [str(out / "year=2026" / "live-11.parquet")]).fetchall() == [(11,), (12,)]
+        bad = _build_c1(Path(td) / "no", chunks, ["--months", "13"])
+        assert bad.returncode != 0 and "not a month of the year" in bad.stderr
+        empty = _build_c1(Path(td) / "no", chunks, ["--months", " "])
+        assert empty.returncode != 0 and "at least one month" in empty.stderr
+        split = subprocess.run(
+            [sys.executable, "tools/s2_build.py", "--sources", str(chunks.parent),
+             "--years", "2026", "--out", str(Path(td) / "no"),
+             "--split", "zones", "--months", "3"],
+            cwd=ROOT, capture_output=True, text=True)
+        assert split.returncode != 0 and "--months applies to one" in split.stderr
+
+
+def test_months_that_hold_no_row_write_nothing():
+    """A month with no staged row is the same no-op an empty year always
+    was: no file, no empty year directory, exit 1 so the caller sees it."""
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    con.execute("INSTALL spatial; LOAD spatial;")
+    with tempfile.TemporaryDirectory() as td:
+        chunks = Path(td) / "chunks" / "api"
+        chunks.mkdir(parents=True)
+        _mk_c1_chunk(con, chunks / "a.parquet", rows=60, months=2)  # Jan, Feb
+        out = Path(td) / "publish"
+        proc = _build_c1(out, chunks, ["--months", "7", "--name",
+                                       "live-07.parquet"])
+        assert proc.returncode == 1
+        assert "no rows matched" in proc.stderr
+        assert not (out / "year=2026").exists()
+
+
+def test_the_workflows_ask_the_builder_for_every_part_name():
+    """No workflow types a part file name into its YAML. The stats
+    enumeration (publish-stats.yml) and the Collection 1 refresh both call
+    archive_part_names() and live_part_names() with the collection's config,
+    so a rename in tools/s2_build.py reaches them. Comments may spell the
+    names out for a reader; nothing that runs may."""
+    wf = ROOT / ".github" / "workflows"
+    stats = (wf / "publish-stats.yml").read_text()
+    refresh = (wf / "refresh-daily.yml").read_text()
+    for text in (stats, refresh):
+        assert "archive_part_names" in text and "live_part_names" in text
+    # The stats build probes the twelve monthly names of a Collection 1 year
+    # through that list, and the refresh names one month per build.
+    assert 'for NAME in $LIVE_NAMES; do' in stats
+    assert '--months "$M" \\' in refresh
+    for path in sorted(wf.glob("*.yml")):
+        code = "\n".join(line for line in path.read_text().splitlines()
+                         if not line.lstrip().startswith("#"))
+        for month in range(1, 13):
+            assert live_month_name(month) not in code, (path.name, month)
+
+
+def _app_snippet(name: str, start: str, end: str) -> str:
+    """One expression or function of apps/explorer/app.js, by the text that
+    opens and closes it. The module cannot be imported outside a browser (it
+    reads `location` and the DOM as it loads), so a test of its pure logic
+    lifts the source out and runs that."""
+    js = (ROOT / "apps" / "explorer" / "app.js").read_text()
+    i = js.index(start)
+    j = js.index(end, i) + len(end)
+    assert name in js[i:j], (name, js[i:j][:80])
+    return js[i:j]
+
+
+def test_app_asks_only_for_the_months_the_window_touches():
+    """Collection 1's tail is one file per month, so a search asks for the
+    months of its window and no others: twelve probes a year to read one
+    would undo the layout. The mapping and the part list are lifted out of
+    app.js and run in node. A December-to-January window asks December of
+    the first year and January of the second; a year outside the window is
+    asked for no month at all."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    window_months = _app_snippet(
+        "windowMonths", "function windowMonths(year, d0, d1) {", "\n}\n")
+    c1_parts = _app_snippet(
+        "live-", 'parts: (year, tile, months) => ["items", "live",',
+        '.padStart(2, "0")}`)]')
+    cases = [
+        (2026, "2026-09-01", "2026-09-30", list(range(9, 10))),
+        (2026, "2026-09-14", "2026-09-14", [9]),
+        (2026, "2026-03-15", "2026-06-02", [3, 4, 5, 6]),
+        (2026, "2026-01-01", "2026-12-31", list(range(1, 13))),
+        # The December-to-January window, the case the refresh's own year
+        # loop exists for: one month of each year, not twelve of either.
+        (2025, "2025-12-27", "2026-01-02", [12]),
+        (2026, "2025-12-27", "2026-01-02", [1]),
+        (2024, "2025-12-27", "2026-01-02", []),
+        (2027, "2025-12-27", "2026-01-02", []),
+        # A window inside one month of a year that starts before it.
+        (2026, "2024-05-04", "2026-02-10", [1, 2]),
+    ]
+    script = (
+        window_months
+        + "\nconst parts = (year, tile, months) => "
+        + c1_parts.split("=>", 1)[1]
+        + ";\nconst out = [];\n"
+        + "".join(f"out.push(parts(0, '31UET', windowMonths"
+                  f"({year}, {d0!r}, {d1!r})));\n"
+                  for year, d0, d1, _ in cases)
+        + "console.log(JSON.stringify(out));\n")
+    proc = subprocess.run([node, "--input-type=module", "-e", script],
+                          capture_output=True, text=True, cwd=ROOT)
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(proc.stdout)
+    for (year, d0, d1, months), asked in zip(cases, got):
+        want = ["items", "live"] + [live_month_name(m)[:-len(".parquet")]
+                                    for m in months]
+        assert asked == want, (year, d0, d1, asked)
