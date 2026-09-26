@@ -209,6 +209,10 @@ button.mini:not(:disabled):hover { background: #26457a; }
   letter-spacing: .05em; text-transform: uppercase; padding: 1px 5px;
   border-radius: 3px;
 }
+/* Which card the map shows now (.current) and, from Task 11, which one a
+   hover or key press previews without changing what is shown (.peek). */
+.scene.current { outline: 2px solid #6ea8ff; outline-offset: -2px; }
+.scene.peek { outline: 2px dashed #6ea8ff; outline-offset: -2px; }
 
 #apibox { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
 #apibox summary { cursor: pointer; color: var(--dim); font-size: 12px; }

@@ -1864,6 +1864,30 @@ function keyOutWhite(img) {
   img.src = c.toDataURL("image/png");
 }
 
+// Thumbnails load when their card nears the scroll viewport, not when the
+// card is built: a 200-row year would otherwise fetch 200 JPEGs at once.
+// The root is the element that scrolls — the sidebar on a desktop, the
+// sheet body on a phone — and the observer rebuilds when that flips.
+let thumbObserver = null;
+const scrollRoot = () => (isSheet() ? $("sheetbody") : $("panel"));
+function ensureThumbObserver() {
+  thumbObserver ??= new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      thumbObserver.unobserve(e.target);
+      e.target.src = e.target.dataset.src;
+    }
+  }, { root: scrollRoot(), rootMargin: "300px 0px" });
+  return thumbObserver;
+}
+matchMedia("(max-width: 760px)").addEventListener("change", () => {
+  thumbObserver?.disconnect();
+  thumbObserver = null;
+  for (const img of document.querySelectorAll("#results img[data-src]:not([src])")) {
+    ensureThumbObserver().observe(img);
+  }
+});
+
 function thumbnail(r) {
   const img = document.createElement("img");
   img.loading = "lazy";
@@ -1888,11 +1912,12 @@ function thumbnail(r) {
     // A dead preview must not leave a broken-image box in the card.
     img.remove();
   });
-  img.src = r.thumbnail_url;
+  img.dataset.src = r.thumbnail_url;
+  ensureThumbObserver().observe(img);
   return img;
 }
 
-function sceneCard(r) {
+function buildCard(r) {
   const card = el("div", "scene");
   if (typeof r.thumbnail_url === "string" && r.thumbnail_url) card.append(thumbnail(r));
   const cap = document.createElement("div");
@@ -1927,6 +1952,19 @@ function sceneCard(r) {
   }
   cap.append(actions, chips);
   card.append(cap);
+  return card;
+}
+
+// One card per scene id, built once and reused across every re-filter:
+// the thumbnail never reloads and the keyed-white canvas pass never
+// repeats. The map resets with each new search.
+let cardNodes = new Map();
+function cardFor(row) {
+  let card = cardNodes.get(row.id);
+  if (!card) {
+    card = buildCard(row);
+    cardNodes.set(row.id, card);
+  }
   return card;
 }
 
@@ -1970,11 +2008,12 @@ async function startSearch(tile, year) {
     return;
   }
   $("sql").textContent = got.plan;
+  cardNodes = new Map();
   S.search = { tile, year, rows: got.rows, at: Date.now() };
   S.shown = 15;
   S.displayedId = null;
   S.detachedAt = 0;
-  renderResults();
+  renderResultsNow();
   scheduleApply({ nav: true });
   const view = currentView();
   if (view.length) {
@@ -1995,18 +2034,34 @@ function showIndex(i) {
   scheduleApply({ cards: true, nav: true });
 }
 
-// Plain render for now: the visible slice of the view, plus a Show-more
-// footer. Task 7 turns this into a keyed reconcile.
+// A slider drag re-renders on a short trailing debounce; the map repaint
+// stays per-frame. renderResultsNow reconciles the card list in place.
+let cardTimer = 0;
 function renderResults() {
+  clearTimeout(cardTimer);
+  cardTimer = setTimeout(renderResultsNow, 60);
+}
+function renderResultsNow() {
   const box = $("results");
   if (!S.search) return;
   const view = currentView();
+  for (const n of [...box.children]) if (!n.classList.contains("scene")) n.remove();
   if (!view.length) {
     box.replaceChildren(el("p", "hint",
       `0 of ${S.search.rows.length} scenes pass — widen a slider or the date window.`));
     return;
   }
-  box.replaceChildren(...view.slice(0, S.shown).map(sceneCard));
+  const want = view.slice(0, S.shown).map(cardFor);
+  let node = box.firstElementChild;
+  for (const w of want) {
+    if (node === w) { node = node.nextElementSibling; continue; }
+    box.insertBefore(w, node);
+  }
+  while (node) { const next = node.nextElementSibling; node.remove(); node = next; }
+  for (const [i, w] of want.entries()) {
+    w.classList.toggle("best", i === 0 && S.sort === "cloud");
+    w.classList.toggle("current", view[i].id === S.displayedId);
+  }
   renderMore(box, view.length);
 }
 function renderMore(box, total) {
@@ -2015,7 +2070,7 @@ function renderMore(box, total) {
   const b = el("button", "mini", `Show ${Math.min(15, total - S.shown)} more (${total - S.shown} left)`);
   b.id = "more";
   b.type = "button";
-  b.addEventListener("click", () => { S.shown += 15; renderResults(); });
+  b.addEventListener("click", () => { S.shown += 15; renderResultsNow(); });
   box.append(b);
 }
 
