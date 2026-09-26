@@ -1439,6 +1439,8 @@ function cogbar(id, state, text) {
 function hideImagePanel() {
   $("imgpanel").hidden = true;
   $("cogbar").hidden = true;
+  $("imgnav").hidden = true;
+  $("imgnav-label").hidden = true;
   $("bandbox").hidden = true;
   // peek exists to show the "Showing …" line; with no scene there is nothing
   // to peek at, so the sheet goes back to what a fresh page shows.
@@ -1639,6 +1641,79 @@ function tilesSettled() {
     + "No tile server, no API.");
 }
 map.on("moveend", tilesSettled);
+
+// The nav strip's zoom-to (Task 10): re-frame the shown scene's footprint.
+// A separate listener from tilesSettled — this one only reads the camera,
+// it never touches the tile layer.
+function flyToImage(bbox) {
+  map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 800 });
+}
+
+// How much of the shown image's bbox the viewport holds, 0..1. The button
+// enables under 0.5 and disables over 0.65: the gap stops it from
+// flickering while the camera settles.
+function imageFraction() {
+  const b = shown ? bboxOf(shown.r) : null;
+  if (!b) return 1;
+  const mb = map.getBounds();
+  const w = Math.max(0, Math.min(b[2], mb.getEast()) - Math.max(b[0], mb.getWest()));
+  const h = Math.max(0, Math.min(b[3], mb.getNorth()) - Math.max(b[1], mb.getSouth()));
+  const area = (b[2] - b[0]) * (b[3] - b[1]);
+  return area > 0 ? (w * h) / area : 1;
+}
+let zoomtoOn = false;
+function syncZoomTo() {
+  if (!shown) { zoomtoOn = false; $("zoomto").disabled = true; return; }
+  const frac = imageFraction();
+  if (!zoomtoOn && frac < 0.5) zoomtoOn = true;
+  else if (zoomtoOn && frac > 0.65) zoomtoOn = false;
+  $("zoomto").disabled = !zoomtoOn;
+}
+let zoomFrame = 0;
+map.on("move", () => {
+  if (zoomFrame) return;
+  zoomFrame = requestAnimationFrame(() => { zoomFrame = 0; syncZoomTo(); });
+});
+map.on("moveend", syncZoomTo);
+$("zoomto").addEventListener("click", () => {
+  const b = shown ? bboxOf(shown.r) : null;
+  if (b) flyToImage(b);
+});
+
+// Step through the current sort order (Task 10). stepImage moves from
+// where the map stands, not from the scrub bar, so a click after a manual
+// pan still steps from the shown scene.
+function stepImage(delta) {
+  const view = currentView();
+  if (!view.length) return;
+  const at = indexOfId(view, S.displayedId);
+  const next = clampIndex(view, (at >= 0 ? at : S.detachedAt) + delta);
+  if (next < 0 || next === at) return;
+  showIndex(next);
+}
+$("imgprev").addEventListener("click", () => stepImage(-1));
+$("imgnext").addEventListener("click", () => stepImage(1));
+
+function syncNavButtons() {
+  const view = currentView();
+  const at = shown ? indexOfId(view, S.displayedId) : -1;
+  const pos = at >= 0 ? at : clampIndex(view, S.detachedAt);
+  $("imgnav").hidden = !shown;
+  $("imgprev").disabled = !shown || pos <= 0;
+  $("imgnext").disabled = !shown || pos < 0 || pos >= view.length - 1;
+  const cap = (r) => (r ? `${r.day} · ${r.cloud.toFixed(1)}% cloud` : "");
+  $("imgprev").title = pos > 0 ? `← ${cap(view[pos - 1])}` : "";
+  $("imgnext").title = pos >= 0 && pos < view.length - 1 ? `→ ${cap(view[pos + 1])}` : "";
+  syncZoomTo();
+}
+// The native title is slow and invisible on touch; a hover names the
+// target in the label line at once.
+for (const id of ["imgprev", "imgnext"]) {
+  $(id).addEventListener("pointerenter", () => {
+    if ($(id).title) { $("imgnav-label").hidden = false; $("imgnav-label").textContent = $(id).title; }
+  });
+  $(id).addEventListener("pointerleave", () => { $("imgnav-label").hidden = true; });
+}
 
 const stale = (me, serial) => me !== shown || serial !== me.serial;
 
@@ -1853,6 +1928,7 @@ async function showOnMap(r, button, preset = "tci", band = null) {
 
 $("cog-clear").addEventListener("click", () => {
   shown = null;
+  S.displayedId = null;
   cogLayer = null;
   cogPreview = null;
   render();
@@ -2062,16 +2138,25 @@ async function startSearch(tile, year) {
   }
 }
 
-// Commit the view's position i to the map. Task 11 extends this with the
-// card outline scroll; here it is the auto-show of the best result.
+// Commit the view's position i to the map: the auto-show of the best
+// result, and the target of a nav-strip step or a scrub drag. Grows the
+// shown slice so a step past the loaded cards still has one to outline,
+// renders that card set now (not on the next frame, so the outline and
+// the scroll land together), and scrolls the target card into view —
+// except in peek, where the sheet is collapsed and there is nothing to see.
 function showIndex(i) {
   const view = currentView();
   const row = view[i];
   if (!row) return;
+  if (i >= S.shown) S.shown = Math.ceil((i + 1) / 15) * 15;
   S.displayedId = row.id;
   S.detachedAt = i;
   showOnMap(row, null, ui.preset);
-  scheduleApply({ cards: true, nav: true });
+  renderResultsNow();
+  scheduleApply({ nav: true });
+  if (snap !== "peek") {
+    cardNodes.get(row.id)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
 }
 
 // A slider drag re-renders on a short trailing debounce; the map repaint

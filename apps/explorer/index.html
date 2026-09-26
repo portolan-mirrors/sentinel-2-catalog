@@ -27,6 +27,17 @@
   <div id="cogbar" hidden>Showing <b id="cog-id"></b> on the map
     <span id="cog-state" data-state="loading" role="status"></span>
     <button id="cog-clear" class="mini" type="button">Clear</button></div>
+  <!-- The nav strip (Task 10): step through the current sort order and
+       zoom to the shown scene's footprint. Hidden with no scene shown;
+       the scrub bar is wired in a later task. -->
+  <div id="imgnav" hidden>
+    <button id="imgprev" class="mini" type="button" aria-label="Previous scene">‹</button>
+    <input type="range" id="imgscrub" min="0" max="0" step="1" value="0"
+      aria-label="Scrub through the search results" disabled>
+    <button id="imgnext" class="mini" type="button" aria-label="Next scene">›</button>
+    <button id="zoomto" class="mini" type="button" disabled>Zoom to</button>
+  </div>
+  <p id="imgnav-label" class="hint" hidden></p>
   <!-- The band mapper (Task 28): which bands of the shown scene are drawn,
        and how they are stretched. Filled in by app.js from bands.js. -->
   <details id="bandbox" open hidden>
