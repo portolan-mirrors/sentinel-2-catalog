@@ -168,16 +168,73 @@ const say = (msg, isError = false) => {
     + "is a range read against static GeoParquet on Source Cooperative; there is no API.";
 }
 
-// The filter help: a hover shows it, a click pins it (touch has no hover).
+// The shared info/hover popover (Task 15). One #tip element serves every
+// `button.info` and the image nav's prev/next caption, instead of Task 5's
+// one tip per section. It is position: fixed on body, so it covers the map
+// and the panels instead of pushing them open, and app.js only ever moves
+// it and fills its text — the box itself never moves in the DOM.
+// A hover shows it (skipped on touch, which has no hover); a click on a
+// pinnable anchor (the .info buttons) pins it open until a click outside
+// any .info button, or Escape, takes it down. imgprev/imgnext wire in the
+// same way but not pinnable: their own click already steps to a scene, so
+// a second, competing click meaning would be confusing.
 {
-  const info = $("query-info"), tip = $("query-tip");
-  let pinned = false;
-  const show = (on) => { tip.hidden = !on; info.setAttribute("aria-expanded", String(on)); };
-  info.addEventListener("click", () => { pinned = !pinned; show(pinned); });
-  if (matchMedia("(hover: hover)").matches) {
-    info.addEventListener("mouseenter", () => show(true));
-    info.addEventListener("mouseleave", () => { if (!pinned) show(false); });
+  const tip = $("tip");
+  let pinned = null;
+
+  // Put the box beside `anchor`: right first, left if the right edge would
+  // leave the viewport, under the anchor if neither side fits. Measured
+  // after the text is set and the box is shown, so its real size is known.
+  function place(anchor) {
+    const pad = 8;
+    const r = anchor.getBoundingClientRect();
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    let left = r.right + pad;
+    if (left + w > innerWidth - pad) left = r.left - w - pad;
+    let top = r.top;
+    if (left < pad) {
+      left = Math.max(pad, Math.min(r.left, innerWidth - w - pad));
+      top = r.bottom + pad;
+    }
+    top = Math.min(Math.max(top, pad), innerHeight - h - pad);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
   }
+  function show(anchor) {
+    const text = anchor.dataset.tip;
+    if (!text) return;
+    tip.textContent = text;
+    tip.hidden = false;
+    place(anchor);
+  }
+  function hide() { tip.hidden = true; }
+  function unpin() { pinned = null; hide(); }
+
+  function wire(anchor, pinnable) {
+    if (matchMedia("(hover: hover)").matches) {
+      anchor.addEventListener("mouseenter", () => show(anchor));
+      anchor.addEventListener("mouseleave", () => { if (pinned !== anchor) hide(); });
+    }
+    if (pinnable) {
+      anchor.addEventListener("click", () => {
+        if (pinned === anchor) { unpin(); return; }
+        pinned = anchor;
+        show(anchor);
+      });
+    }
+  }
+  for (const btn of document.querySelectorAll("button.info[data-tip]")) wire(btn, true);
+  for (const id of ["imgprev", "imgnext"]) wire($(id), false);
+
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") unpin(); });
+  document.addEventListener("click", (e) => {
+    if (pinned && !e.target.closest(".info")) unpin();
+  });
+  // A scroll under a shown tip is simplest read as "take it down": the box
+  // is position: fixed, so it would not follow the panel it came from, and
+  // no filter row scrolls far enough for the anchor to need re-finding.
+  $("panel").addEventListener("scroll", hide, { passive: true });
+  $("imgpanel").addEventListener("scroll", hide, { passive: true });
 }
 
 const protocol = new Protocol();
@@ -1714,17 +1771,15 @@ function syncNavButtons() {
   $("imgprev").disabled = !shown || pos <= 0;
   $("imgnext").disabled = !shown || pos < 0 || pos >= view.length - 1;
   const cap = (r) => (r ? `${r.day} · ${r.cloud.toFixed(1)}% cloud` : "");
-  $("imgprev").title = pos > 0 ? `← ${cap(view[pos - 1])}` : "";
-  $("imgnext").title = pos >= 0 && pos < view.length - 1 ? `→ ${cap(view[pos + 1])}` : "";
+  setTip($("imgprev"), pos > 0 ? `← ${cap(view[pos - 1])}` : "");
+  setTip($("imgnext"), pos >= 0 && pos < view.length - 1 ? `→ ${cap(view[pos + 1])}` : "");
   syncZoomTo();
 }
-// The native title is slow and invisible on touch; a hover names the
-// target in the label line at once.
-for (const id of ["imgprev", "imgnext"]) {
-  $(id).addEventListener("pointerenter", () => {
-    if ($(id).title) { $("imgnav-label").hidden = false; $("imgnav-label").textContent = $(id).title; }
-  });
-  $(id).addEventListener("pointerleave", () => { $("imgnav-label").hidden = true; });
+// data-tip feeds the shared popover (wired above); an empty string is
+// removed rather than kept, so a button with nothing to say never anchors
+// an empty box.
+function setTip(el, text) {
+  if (text) el.dataset.tip = text; else delete el.dataset.tip;
 }
 
 // The scrub preview is the scene's thumbnail, unwarped, stretched flat over

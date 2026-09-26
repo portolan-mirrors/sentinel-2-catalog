@@ -93,18 +93,13 @@
     </div>
   </section>
   <section id="query">
-    <div class="secthead"><h2>Find scenes</h2>
-      <button type="button" class="info" id="query-info" aria-expanded="false"
-        aria-label="How the filters work">i</button></div>
-    <div class="tip" id="query-tip" hidden>
-      <p><b>Max cloud</b>: tiles whose clearest scene in the window is cloudier go grey.</p>
-      <p><b>Min coverage</b>: tiles whose fullest scene fills less of the tile go grey.</p>
-      <p><b>Min scenes</b>: tiles imaged fewer times across the window go grey.
-        The scene list below is not gated by this slider.</p>
-      <p><b>Dates</b>: drag either handle; the calendars follow. The map recolors
-        by whole months; the scene list follows to the day.</p>
-    </div>
+    <h2>Find scenes</h2>
     <p class="hint">Click the map to pick an MGRS tile.</p>
+    <div class="filter dates-head">
+      <label for="date0">Dates</label>
+      <button type="button" class="info" aria-label="About the date window"
+        data-tip="Drag either handle; the calendars follow. The map recolors by whole months; the scene list follows to the day.">i</button>
+    </div>
     <div class="dates">
       <label>From <input type="date" id="date0"></label>
       <label>To <input type="date" id="date1"></label>
@@ -113,12 +108,27 @@
           aria-label="Back to the whole year">✕</button></span>
     </div>
     <div id="dayrange" class="dayrange"></div>
-    <label>Max cloud % <input type="range" id="maxcloud" min="0" max="100" value="100">
-      <output id="maxcloud-out">100</output></label>
-    <label>Min coverage % <input type="range" id="mincoverage" min="0" max="100" value="10">
-      <output id="mincoverage-out">10</output></label>
-    <label>Min scenes <input type="range" id="minscenes" min="0" max="1" value="0" step="1">
-      <output id="minscenes-out">0</output></label>
+    <div class="filter">
+      <label for="maxcloud">Max cloud %</label>
+      <button type="button" class="info" aria-label="About max cloud"
+        data-tip="Tiles whose clearest scene in the window is cloudier go grey. The scene list follows the same ceiling.">i</button>
+      <input type="range" id="maxcloud" min="0" max="100" value="100">
+      <output id="maxcloud-out">100</output>
+    </div>
+    <div class="filter">
+      <label for="mincoverage">Min coverage %</label>
+      <button type="button" class="info" aria-label="About min coverage"
+        data-tip="Tiles whose fullest scene fills less of the tile go grey. A scene with no coverage value is never excluded.">i</button>
+      <input type="range" id="mincoverage" min="0" max="100" value="10">
+      <output id="mincoverage-out">10</output>
+    </div>
+    <div class="filter">
+      <label for="minscenes">Min scenes</label>
+      <button type="button" class="info" aria-label="About min scenes"
+        data-tip="Tiles imaged fewer times across the window go grey. The scene list is not gated by this slider.">i</button>
+      <input type="range" id="minscenes" min="0" max="1" value="0" step="1">
+      <output id="minscenes-out">0</output>
+    </div>
   </section>
   <section id="timeline"><h2>Monthly scenes</h2><div id="bars"></div>
     <p class="hint" id="timeline-scope">All tiles. Click a tile on the map, then a bar to search a month.</p></section>
@@ -132,6 +142,12 @@
 </aside>
   </div>
 </div>
+<!-- The shared info/hover popover (Task 15): one box for every info button
+     and the image nav's prev/next caption, positioned by app.js next to
+     whichever one is active. A direct child of body, not of #sheet or
+     #imgpanel, so it can sit on top of either and is never clipped by
+     their scrolling. -->
+<div id="tip" role="tooltip" hidden></div>
 <!-- deck.gl's own bundle, not a CDN ESM transpile: the esm.sh build of
      9.4.0 renders but its picking pass returns nothing (see task-20-report),
      the official dist picks fine. Pinned; a classic script runs before the
