@@ -264,9 +264,9 @@ button.mini:not(:disabled):hover { background: #26457a; }
     box-shadow: 0 -6px 24px rgba(0, 0, 0, .5);
     transition: height .18s ease;
   }
-  /* peek is the handle plus one line, so the "Showing …" line a user just
-     asked for stays readable with the whole map above it. */
-  #sheet[data-snap="peek"] { height: calc(110px + env(safe-area-inset-bottom, 0px)); }
+  /* peek is the handle, the "Showing …" line, and the image nav strip, so
+     both stay readable with the whole map above them. */
+  #sheet[data-snap="peek"] { height: calc(150px + env(safe-area-inset-bottom, 0px)); }
   #sheet[data-snap="half"] { height: 50dvh; }
   #sheet[data-snap="full"] { height: 88dvh; }
   /* A drag sets the height in pixels every pointermove; an animation on top
@@ -279,6 +279,9 @@ button.mini:not(:disabled):hover { background: #26457a; }
     /* The browser must not scroll or zoom on a drag of the handle. */
     touch-action: none;
   }
+  /* The browser must not scroll the sheet on a horizontal drag of the
+     scrubber; the scrubber owns the drag instead. */
+  #imgscrub { touch-action: none; }
   #grip::before {
     content: ""; display: block; width: 44px; height: 4px; margin: 13px auto 0;
     background: var(--dim); border-radius: 2px; opacity: .8;

@@ -1342,8 +1342,9 @@ async function thumbnailBitmap(url) {
 // ---------------------------------------------------------------------------
 // The bottom sheet. On a phone (style.css, max-width 760px) the map
 // fills the viewport and one sheet holds the image controls and the search
-// controls. The sheet has three heights: "peek" is the handle plus one line,
-// "half" is what a fresh page shows, "full" is nearly the screen. style.css
+// controls. The sheet has three heights: "peek" is the handle, one line, and
+// the image nav strip, "half" is what a fresh page shows, "full" is nearly
+// the screen. style.css
 // owns the heights, in dvh, so they follow the iOS URL bar; this code only
 // says which stop is current, in data-snap, and sets a pixel height while a
 // finger is on the handle. On a desktop the handle is display: none and the
@@ -1353,7 +1354,7 @@ const SNAPS = ["peek", "half", "full"];
 // The same three heights as style.css, for picking the nearest stop on
 // release. The safe-area inset is left out: it shifts all three equally.
 const snapHeight = (name) =>
-  ({ peek: 110, half: 0.5 * innerHeight, full: 0.88 * innerHeight })[name];
+  ({ peek: 150, half: 0.5 * innerHeight, full: 0.88 * innerHeight })[name];
 let snap = "half";
 // A sheet only on a phone: on a desktop #sheet is display: contents and has
 // no height to snap. Asking the style, not the viewport width, keeps the one
