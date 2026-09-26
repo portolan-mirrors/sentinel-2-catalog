@@ -5,6 +5,12 @@
   --dim: #93a2c0;
   --line: #24304d;
   --accent: #6ea8ff;
+  /* A .dayrange thumb's rendered box, both engines. A thumb's CENTER travels
+     between half this width and (track width − half this width), never the
+     track's own edges, so anything drawn to line up with a handle — the
+     stretch histogram — must inset by half this value on each side. One
+     source of truth for both keeps the two from drifting apart. */
+  --thumb: 14px;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -117,11 +123,12 @@ input[type=range] { width: 74%; vertical-align: middle; padding: 0; border: 0;
 .dayrange input[type=range]::-webkit-slider-runnable-track { background: none; height: 22px; }
 .dayrange input[type=range]::-moz-range-track { background: none; height: 22px; }
 .dayrange input[type=range]::-webkit-slider-thumb {
-  -webkit-appearance: none; pointer-events: auto; width: 14px; height: 14px; margin-top: 4px;
+  -webkit-appearance: none; pointer-events: auto; width: var(--thumb); height: var(--thumb);
+  margin-top: 4px;
   border-radius: 50%; background: var(--ink); border: 2px solid var(--accent); cursor: ew-resize;
 }
 .dayrange input[type=range]::-moz-range-thumb {
-  pointer-events: auto; width: 10px; height: 10px;
+  pointer-events: auto; width: var(--thumb); height: var(--thumb);
   border-radius: 50%; background: var(--ink); border: 2px solid var(--accent); cursor: ew-resize;
 }
 .dayrange input[type=range]:focus-visible::-webkit-slider-thumb { outline: 2px solid #fff; }
@@ -238,7 +245,12 @@ button.mini:not(:disabled):hover { background: #26457a; }
 .chan-head .hint { margin: 0; flex: 1 1 auto; white-space: nowrap; overflow: hidden;
                    text-overflow: ellipsis; }
 .chan-head button.mini { padding: 0 5px; font-size: 10.5px; }
-.chan canvas.hist { display: block; width: 100%; height: 36px; margin-top: 4px;
+/* Inset by half a thumb on each side so the drawn bins share the handles'
+   own scale (see --thumb): at value = min the left handle's center sits
+   half a thumb in from the container edge, and now so does the histogram's
+   first bin. */
+.chan canvas.hist { display: block; width: calc(100% - var(--thumb)); height: 36px;
+                    margin: 4px calc(var(--thumb) / 2) 0;
                     background: #0b1020; border-radius: 3px 3px 0 0; }
 .chan .vrange { margin: -4px 0 2px; }
 .chan .minmax { display: flex; gap: 6px; align-items: center; color: var(--dim); font-size: 11px; }
