@@ -97,6 +97,9 @@
     <div class="dates">
       <label>From <input type="date" id="date0"></label>
       <label>To <input type="date" id="date1"></label>
+      <span id="datelock" class="chip" hidden><span id="datelock-label"></span>
+        <button id="datereset" class="mini" type="button"
+          aria-label="Back to the whole year">✕</button></span>
     </div>
     <div id="dayrange" class="dayrange"></div>
     <label>Max cloud % <input type="range" id="maxcloud" min="0" max="100" value="100">
@@ -107,7 +110,7 @@
       <output id="minscenes-out">0</output></label>
   </section>
   <section id="timeline"><h2>Monthly scenes</h2><div id="bars"></div>
-    <p class="hint" id="timeline-scope">All tiles. Click a bar to jump to that month.</p></section>
+    <p class="hint" id="timeline-scope">All tiles. Click a tile on the map, then a bar to search a month.</p></section>
   <div id="sortrow"><label>Sort <select id="sort"></select></label></div>
   <section id="results"></section>
   <details id="apibox"><summary>The "API request" this answered</summary>

@@ -788,7 +788,7 @@ export async function timelineFor(tile) {
   const ymOf = (r) => `${r.year}-${String(r.month).padStart(2, "0")}`;
   $("timeline-scope").textContent =
     `${scope}, ${ymOf(rows[0])} → ${ymOf(rows[rows.length - 1])}. `
-    + "Click a bar to jump to that month.";
+    + "Click a bar to search that month.";
   const max = Math.max(...rows.map((r) => Number(r.n)), 1);
   for (const r of rows) {
     const ym = ymOf(r);
@@ -800,7 +800,7 @@ export async function timelineFor(tile) {
     d.style.background = rampColor(r.clearest);
     d.title = `${ym}: ${r.n} scenes, clearest ${Number(r.clearest).toFixed(1)}%`;
     d.setAttribute("aria-label", d.title);
-    d.onclick = () => setWindow(`${ym}-01`, lastDayOfMonth(ym));
+    d.onclick = () => onBarClick(ym);
     bars.append(d);
   }
   markActiveBars();
@@ -917,10 +917,36 @@ function setWindow(from0, to0) {
 function setYear(year) {
   S.year = year;
   S.monthLock = null;
-  $("datelock")?.toggleAttribute("hidden", true);
+  $("datelock").hidden = true;
   $("year").value = String(year);
   setWindow(`${year}-01-01`, `${year}-12-31`);
   if (S.tile && S.search) startSearch(S.tile, year);
+}
+
+// A month bar clamps the slider to that month and searches it. Three
+// exits: the chip's ✕, a second click on the active bar, a year change.
+function lockToMonth(ym) {
+  S.monthLock = ym;
+  $("datelock").hidden = false;
+  $("datelock-label").textContent = ym;
+  setWindow(`${ym}-01`, lastDayOfMonth(ym));
+  if (S.tile) startSearch(S.tile, Number(ym.slice(0, 4)));
+}
+function unlockMonth() {
+  S.monthLock = null;
+  $("datelock").hidden = true;
+  setWindow(`${S.year}-01-01`, `${S.year}-12-31`);
+}
+$("datereset").addEventListener("click", unlockMonth);
+
+function onBarClick(ym) {
+  if (S.monthLock === ym) { unlockMonth(); return; }
+  const year = Number(ym.slice(0, 4));
+  if (year !== S.year) {
+    S.year = year;
+    $("year").value = String(year);
+  }
+  lockToMonth(ym);
 }
 
 // Warm the window's parts the moment the window is known, for the
