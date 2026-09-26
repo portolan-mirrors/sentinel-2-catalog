@@ -239,7 +239,12 @@ let hideTipFor = () => {};
       });
     }
     if (pinnable) {
-      anchor.addEventListener("click", () => {
+      anchor.addEventListener("click", (e) => {
+        // Task 20 moved the "?" button inside its label's text, so a click
+        // on it now bubbles toward a <label for=…> around a range input.
+        // Stopped here so the label never also forwards the click to the
+        // slider it wraps — this button only ever toggles the tip.
+        e.stopPropagation();
         if (pinned === anchor) { unpin(); return; }
         pinned = anchor;
         show(anchor);
