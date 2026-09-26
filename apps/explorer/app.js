@@ -1041,6 +1041,64 @@ function unlockMonth() {
 }
 $("datereset").addEventListener("click", unlockMonth);
 
+// English month names for the widen-button label. No other code in this
+// file names a month (bars and titles print "YYYY-MM" throughout), and
+// Intl.DateTimeFormat's month name follows the browser locale, so a fixed
+// table keeps the label the same string in every browser.
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+function monthYearLabel(isoDay) {
+  const [y, m] = isoDay.slice(0, 7).split("-").map(Number);
+  return `${MONTH_NAMES[m - 1]} ${y}`;
+}
+
+// The window one month wider than S.from/S.to, or null when it already
+// spans the whole year. The start gives way first, one month at a time,
+// down to the year's first day; only once it is pinned there does the end
+// start moving. Both ends stay inside S.year — lastDayOfMonth resolves a
+// "YYYY-MM" string to that month's own last day.
+function widerWindow() {
+  const first = `${S.year}-01-01`, last = `${S.year}-12-31`;
+  if (S.from > first) {
+    const m = Number(S.from.slice(5, 7));
+    const from = m === 1 ? first : `${S.year}-${String(m - 1).padStart(2, "0")}-01`;
+    return { from, to: S.to };
+  }
+  if (S.to < last) {
+    const m = Number(S.to.slice(5, 7));
+    const to = m === 12 ? last : lastDayOfMonth(`${S.year}-${String(m + 1).padStart(2, "0")}`);
+    return { from: S.from, to };
+  }
+  return null;
+}
+
+// The footer's "widen" button shell, appended to whatever list calls it —
+// the full card list once every match is already shown, or the empty
+// view's hint. One builder for both so the label math lives in one place;
+// each call site wires its own click listener to widenWindow.
+function widenButton() {
+  if (!S.search) return null;
+  const next = widerWindow();
+  if (!next) return null;
+  const label = next.from !== S.from ? monthYearLabel(next.from) : monthYearLabel(next.to);
+  const b = el("button", "mini", `Show more — widen to ${label}`);
+  b.id = "more";
+  b.type = "button";
+  return b;
+}
+
+// Grow the window by one month and sync the date slider to it. The year's
+// rows are already in memory (readTable/keyedRows cache them), so this
+// re-filters and repaints from cache — no new read. A month lock is dropped
+// first: the widened window is no longer one calendar month.
+function widenWindow() {
+  const next = widerWindow();
+  if (!next) return;
+  S.monthLock = null;
+  $("datelock").hidden = true;
+  setWindow(next.from, next.to);
+}
+
 function onBarClick(ym) {
   if (S.monthLock === ym) { unlockMonth(); return; }
   const year = Number(ym.slice(0, 4));
@@ -2466,6 +2524,8 @@ function renderResultsNow() {
   if (!view.length) {
     box.replaceChildren(el("p", "hint",
       `0 of ${S.search.rows.length} scenes pass — widen a slider or the date window.`));
+    const b = widenButton();
+    if (b) { b.addEventListener("click", widenWindow); box.append(b); }
     return;
   }
   const want = view.slice(0, S.shown).map(cardFor);
@@ -2483,12 +2543,16 @@ function renderResultsNow() {
 }
 function renderMore(box, total) {
   document.getElementById("more")?.remove();
-  if (total <= S.shown) return;
-  const b = el("button", "mini", `Show ${Math.min(15, total - S.shown)} more (${total - S.shown} left)`);
-  b.id = "more";
-  b.type = "button";
-  b.addEventListener("click", () => { S.shown += 15; renderResultsNow(); });
-  box.append(b);
+  if (total > S.shown) {
+    const b = el("button", "mini", `Show ${Math.min(15, total - S.shown)} more (${total - S.shown} left)`);
+    b.id = "more";
+    b.type = "button";
+    b.addEventListener("click", () => { S.shown += 15; renderResultsNow(); });
+    box.append(b);
+    return;
+  }
+  const b = widenButton();
+  if (b) { b.addEventListener("click", widenWindow); box.append(b); }
 }
 
 await init();
