@@ -1093,6 +1093,10 @@ function currentView() {
 
 function updateFilterStatus() {
   if (!S.search) { say(`${filterLine()}.`); return; }
+  // The mirror shows the request the page did not make, so it tracks the
+  // filters the user sees, not the ones the last read ran under. A slider
+  // drag rewrites it with the rest of the apply.
+  $("api").textContent = apiMirror(S.search.tile, S.from, S.to, S.maxCloud, S.minCoverage);
   const view = currentView();
   say(`${view.length} of ${S.search.rows.length} ${S.search.tile} scenes in `
     + `${S.search.year} pass (${S.from} → ${S.to}, cloud ≤ ${S.maxCloud}, `
@@ -1934,8 +1938,17 @@ let searchSeq = 0;
 async function startSearch(tile, year) {
   const seq = ++searchSeq;
   const box = $("results");
+  // The old search dies with the click that replaces it. It must not outlive
+  // this line: an apply between here and the new rows would otherwise render
+  // the previous tile-year's cards over the hint below, and a search that
+  // finds no published parts would leave them there. renderResults returns
+  // on a null search, currentView is empty, and the status line falls back
+  // to the map's own filter sentence.
+  S.search = null;
   box.replaceChildren(el("p", "hint", "Reading the item parts…"));
   $("sql").textContent = "Range-reading…";
+  // The mirror while the read runs. updateFilterStatus keeps it current from
+  // the first rows on, but it cannot write it yet: S.search is null here.
   $("api").textContent = apiMirror(tile, S.from, S.to, S.maxCloud, S.minCoverage);
   say(`Range-reading tile ${tile}'s ${year} scenes…`);
   let got;
