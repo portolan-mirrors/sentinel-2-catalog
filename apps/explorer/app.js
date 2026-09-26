@@ -1757,31 +1757,67 @@ async function previewIndex(i) {
 }
 $("imgscrub").addEventListener("input", () => previewIndex(Number($("imgscrub").value)));
 
+// The scrub layer is a live bridge while a committed scene is still
+// loading and nothing else covers the map yet; the hand-off points
+// (showTci, showBandsLoaded, tilesSettled, hideImagePanel) already null
+// it the moment any of those flip, so this only asks whether that
+// hand-off has happened yet.
+const scrubBridging = () => !!(scrubLayer && shown && !shown.settled && !cogLayer && !cogPreview);
+
 // A gesture ends one of two ways: "change" commits it (release, or once per
 // keypress on a held arrow key), or nothing fires at all — a drag back to
 // the start value, Esc mid-drag (Firefox rolls the value back with no
-// change), a cancelled touch. Either way the preview, the card outline and
-// the label must not outlive the gesture.
+// change), a cancelled touch. Either way the card outline and the label
+// must not outlive the gesture; the preview comes off too, unless a
+// commit's load is already bridging, in which case the bridge is left for
+// the hand-off points to clear and only the cosmetics come off here.
 let scrubCommitting = false;
+let commitTimer = 0;
+function clearScrubCosmetics() {
+  for (const card of cardNodes.values()) card.classList.remove("peek");
+  $("imgnav-label").hidden = true;
+  delete $("imgnav-label").dataset.detached;
+}
 function clearScrubPreview() {
   scrubSeq += 1;
   scrubLayer = null;
   render();
-  for (const card of cardNodes.values()) card.classList.remove("peek");
-  $("imgnav-label").hidden = true;
-  delete $("imgnav-label").dataset.detached;
+  clearScrubCosmetics();
 }
 function endScrubGesture() {
   // A "change" for a real commit fires, and sets scrubCommitting, before
   // the matching pointerup settles — so the deferred check below always
   // sees the flag a commit already raised, and never strips the bridging
-  // layer a commit is waiting to hand off (finding 2c).
+  // layer a commit is waiting to hand off.
   setTimeout(() => { if (!scrubCommitting) clearScrubPreview(); }, 0);
 }
 $("imgscrub").addEventListener("pointerup", endScrubGesture);
 $("imgscrub").addEventListener("pointercancel", endScrubGesture);
-$("imgscrub").addEventListener("blur", () => { if (!scrubCommitting) clearScrubPreview(); });
-$("imgscrub").addEventListener("keydown", (e) => { if (e.key === "Escape") clearScrubPreview(); });
+$("imgscrub").addEventListener("blur", () => {
+  // A pending debounce settles on its own; scrubCommitting still says so.
+  if (scrubCommitting) return;
+  // Past that window scrubCommitting is already reset, whether or not a
+  // load is still in flight — scrubBridging is the only reliable signal.
+  clearScrubCosmetics();
+  if (!scrubBridging()) { scrubLayer = null; render(); }
+});
+$("imgscrub").addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (commitTimer) {
+    // The debounce has not fired: nothing has loaded, so the gesture
+    // aborts whole and no load follows.
+    clearTimeout(commitTimer);
+    commitTimer = 0;
+    scrubCommitting = false;
+    clearScrubPreview();
+    return;
+  }
+  // The debounce already fired: a load may be in flight, so only the
+  // cosmetics come off — the bridge, if live, is the hand-off points' job.
+  scrubCommitting = false;
+  clearScrubCosmetics();
+  if (!scrubBridging()) { scrubLayer = null; render(); }
+});
 
 // The release itself: scrubSeq bumps at once, so no in-flight bitmap can
 // draw after this point no matter how the heavy part below is scheduled.
@@ -1791,17 +1827,19 @@ $("imgscrub").addEventListener("keydown", (e) => { if (e.key === "Escape") clear
 // alone here: showTci, showBandsLoaded and tilesSettled drop it once the
 // new scene's preview or tiles actually land, so the old thumbnail
 // bridges the fly-and-load gap instead of the map going blank.
-let commitTimer = 0;
 function commitScrub() {
+  commitTimer = 0;
   scrubCommitting = false;
-  for (const card of cardNodes.values()) card.classList.remove("peek");
-  $("imgnav-label").hidden = true;
-  delete $("imgnav-label").dataset.detached;
+  clearScrubCosmetics();
   const i = Number($("imgscrub").value);
   const row = currentView()[i];
   // Already the shown scene: a track click at the current position must
-  // not re-fly the camera or reload it, so the bridge comes down at once.
-  if (!row || row.id === S.displayedId) { scrubLayer = null; render(); return; }
+  // not re-fly the camera or reload it either way. The bridge only comes
+  // down here when nothing is actually loading for it to bridge to.
+  if (!row || row.id === S.displayedId) {
+    if (!scrubBridging()) { scrubLayer = null; render(); }
+    return;
+  }
   showIndex(i);
 }
 $("imgscrub").addEventListener("change", () => {
