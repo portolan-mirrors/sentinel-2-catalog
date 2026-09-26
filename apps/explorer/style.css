@@ -5,6 +5,15 @@
   --dim: #93a2c0;
   --line: #24304d;
   --accent: #6ea8ff;
+  /* The scrub track's "loaded" fill (Task 23): a subdued accent so the
+     ready/not-ready read comes from coverage, not from a bright new hue. */
+  --scrub-loaded: color-mix(in srgb, var(--accent) 45%, transparent);
+  /* A .dayrange thumb's rendered box, both engines. A thumb's CENTER travels
+     between half this width and (track width − half this width), never the
+     track's own edges, so anything drawn to line up with a handle — the
+     stretch histogram — must inset by half this value on each side. One
+     source of truth for both keeps the two from drifting apart. */
+  --thumb: 14px;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -35,6 +44,49 @@ h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
 /* The collection switch sits between the title and its blurb. */
 .switch { margin: 2px 0 10px; }
 .hint { margin: 6px 0 0; color: var(--dim); font-size: 12px; }
+/* #query only, from the panel tightening: the "Click the map…" hint sits
+   between the section head and the dates row. Only its top margin is
+   trimmed here — the bottom
+   is already 0, so the gap it leaves before the dates row comes entirely
+   from that row's own top margin, trimmed below on .filter. Scoped to
+   #query so #bars, #bandnote, and the image-nav caption keep the wider
+   .hint spacing they already had. */
+#query .hint { margin: 4px 0 0; }
+/* The "?" glyph sits inline at the end of its label's text
+   instead of in its own grid column, so it is sized to sit on the text
+   baseline rather than centered on a row. */
+.info { width: 14px; height: 14px; border-radius: 50%; padding: 0;
+  font: 600 10px/12px system-ui, sans-serif; font-style: italic;
+  background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); cursor: pointer;
+  vertical-align: text-bottom; margin-left: 4px; }
+/* One filter row, one grid line: label, slider, value. The label carries
+   its own "?" button inline now, so the grid needs only three
+   tracks — dropping the old fixed icon column gives the slider the rest.
+   The first column is a fixed width, not max-content — each .filter is its
+   own grid, so max-content would size every row from its own label alone
+   and the sliders would not start at the same x. 8.5em clears the longest
+   label with its inline glyph ("Min coverage %" plus "?") with room to
+   spare, so every row lands on it and the columns line up. */
+.filter { display: grid; grid-template-columns: minmax(8.5em, max-content) 1fr 4ch;
+  align-items: center; gap: 6px; margin: 4px 0; }
+.filter label { white-space: nowrap; }
+.filter output { text-align: right; font-variant-numeric: tabular-nums; }
+/* The grid's middle track is already the slider's share of the row, so the
+   base 74% only left a quarter of it empty before the value column. Filling
+   the track is the whole point of giving it one. */
+.filter input[type=range] { width: 100%; }
+/* The dates header holds only a label — no slider, no value — so its row
+   collapses to that one column instead of leaving two tracks empty. */
+.dates-head { grid-template-columns: 1fr; }
+/* The shared info/hover popover: a box fixed to the viewport, so
+   it sits on top of the sheet and the image panel instead of pushing them
+   open. app.js sets its left/top next to whichever button raised it. */
+#tip {
+  position: fixed; z-index: 20; max-width: 240px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 9px; font-size: 12px; color: var(--dim);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .4);
+}
 .status {
   margin: 0 0 14px; padding: 8px 10px; font-size: 12.5px;
   background: var(--panel-2); border-left: 3px solid var(--accent);
@@ -49,13 +101,61 @@ input, select, button {
   border: 1px solid var(--line); border-radius: 4px; padding: 5px 7px;
 }
 input[type=month], input[type=date], select { width: 100%; margin-top: 3px; }
+/* Customizable select (every #collection/#year/#metric/#sort/#preset/
+   #sel-r/g/b/#nodata select matches the bare element selector below, so
+   no per-id styling is needed for coverage). appearance: base-select opts
+   a <select> and its ::picker(select) popover into a styleable render path;
+   Chromium paints the dropdown list to match the panel. Firefox/Safari
+   don't parse the base-select value or the ::picker() pseudo-element, so
+   they drop these declarations/rules and keep the native OS picker — the
+   select element itself, and its closed-button look above, are unchanged
+   either way. The opt-in for `select` is its own rule (a plain element
+   selector, always valid) separate from the ::picker(select) rule (a
+   pseudo-element selector some engines don't know): a comma-joined
+   `select, ::picker(select) { appearance: base-select; }` would let an
+   unrecognized ::picker(select) invalidate the WHOLE selector list in a
+   non-forgiving engine, dropping the `select` opt-in too. Keeping them
+   separate means each engine drops only what it doesn't understand. */
+select { appearance: base-select; }
+::picker(select) {
+  appearance: base-select;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.45);
+  padding: 4px;
+}
+select option {
+  padding: 5px 10px 5px 10px;
+  border-radius: 5px;
+  color: var(--ink);
+  background: transparent;
+}
+select option:hover, select option:focus { background: var(--line); }
+select option:checked { font-weight: 600; }
+/* ::checkmark is the spec pseudo-element for the tick base-select draws on
+   the selected option; an engine that doesn't know it drops this rule and
+   nothing else needs to change. */
+select option::checkmark { color: var(--accent); }
 input[type=range] { width: 74%; vertical-align: middle; padding: 0; border: 0;
                     background: none; accent-color: var(--accent); }
-.dates { display: flex; gap: 8px; }
-.dates label { flex: 1 1 0; min-width: 0; }
+.dates { display: flex; gap: 8px; align-items: flex-end; }
+/* A flex item's own margin sets its height in the row (flex items never
+   collapse margins), so the base label's 9px bottom margin was the real
+   floor under From/To. Trimmed here, by the panel tightening, without
+   touching the base rule, which other labels outside #query still rely on. */
+.dates label { flex: 1 1 0; min-width: 0; margin-bottom: 3px; }
+/* The month-lock chip: sits beside the From/To labels, shown only
+   while a bar click has clamped the slider to one month. */
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--panel-2, #223); border: 1px solid var(--line, #3a4666);
+  border-radius: 10px; padding: 1px 6px; font-size: 12px; color: var(--dim);
+  margin-bottom: 9px;
+}
 /* Two native range inputs stacked; each is transparent except its thumb,
    so the pair reads as one two-handle slider. */
-.dayrange { position: relative; height: 22px; margin: -2px 0 10px; }
+.dayrange { position: relative; height: 22px; margin: -2px 0 4px; }
 .dayrange .fill { position: absolute; top: 9px; height: 4px; left: 0; width: 100%;
                   background: var(--accent); border-radius: 2px; opacity: .8; }
 .dayrange::before { content: ""; position: absolute; top: 9px; left: 0; right: 0;
@@ -67,19 +167,18 @@ input[type=range] { width: 74%; vertical-align: middle; padding: 0; border: 0;
 .dayrange input[type=range]::-webkit-slider-runnable-track { background: none; height: 22px; }
 .dayrange input[type=range]::-moz-range-track { background: none; height: 22px; }
 .dayrange input[type=range]::-webkit-slider-thumb {
-  -webkit-appearance: none; pointer-events: auto; width: 14px; height: 14px; margin-top: 4px;
+  -webkit-appearance: none; pointer-events: auto; width: var(--thumb); height: var(--thumb);
+  margin-top: 4px;
   border-radius: 50%; background: var(--ink); border: 2px solid var(--accent); cursor: ew-resize;
 }
 .dayrange input[type=range]::-moz-range-thumb {
-  pointer-events: auto; width: 10px; height: 10px;
+  pointer-events: auto; width: var(--thumb); height: var(--thumb);
   border-radius: 50%; background: var(--ink); border: 2px solid var(--accent); cursor: ew-resize;
 }
 .dayrange input[type=range]:focus-visible::-webkit-slider-thumb { outline: 2px solid #fff; }
 output { color: var(--ink); font-variant-numeric: tabular-nums; }
 button { cursor: pointer; }
 button:disabled { opacity: .45; cursor: not-allowed; }
-#run { width: 100%; margin-top: 4px; background: #1d365e; border-color: #2b4c86; }
-#run:not(:disabled):hover { background: #26457a; }
 
 #legend { margin-top: 10px; }
 #legend .ramp {
@@ -111,8 +210,13 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .scene img {
   width: 96px; height: 96px; object-fit: cover; flex: 0 0 96px;
   border-radius: 4px;
-  /* The preview JPEGs' white nodata is keyed to transparent in app.js
-     (thumbnail()), so the swath sits straight on the panel. */
+}
+/* The preview JPEGs' white nodata is keyed to transparent in app.js
+   (thumbnail()), so the swath sits straight on the panel. A white
+   background under that transparency matches the map's own white
+   nodata, so a snowy scene still reads as snow, not as a hole. */
+#results .scene img.loaded {
+  background: #fff;
 }
 .scene div { font-size: 12px; color: var(--dim); min-width: 0; word-break: break-word; }
 .scene b { color: var(--ink); font-weight: 600; }
@@ -156,6 +260,22 @@ button.mini:not(:disabled):hover { background: #26457a; }
 }
 #cog-state[data-state="partial"]::before { background: #f4a261; }
 @keyframes cog-spin { to { transform: rotate(360deg); } }
+/* The nav strip: prev/next and zoom-to beside the scrub bar, one row. */
+#imgnav { display: flex; align-items: center; gap: 6px; }
+#imgnav input[type=range] { flex: 1; min-width: 60px; }
+/* A dashed-thumb style per engine is not portable; reduced opacity says
+   "detached" everywhere: the shown scene sits outside the current filters. */
+#imgscrub[data-detached] { opacity: 0.5; }
+/* app.js's paintScrubTrack sets --scrub-fill to a hard-stop gradient over
+   the view's loaded/unloaded ranges. #imgscrub keeps the plain input rule's
+   native thumb (it is not -webkit-appearance:none, so accent-color still
+   colors the thumb) — only the track pseudo-element's background changes,
+   per engine. The custom property, not a direct background on #imgscrub
+   itself, is the mechanism because the general `input[type=range]` rule
+   above sets `background: none` on the element and only the track pseudo
+   actually paints the fill either engine renders. */
+#imgscrub::-webkit-slider-runnable-track { background: var(--scrub-fill, none); }
+#imgscrub::-moz-range-track { background: var(--scrub-fill, none); }
 /* The band mapper: a compact block under the cogbar. */
 #bandbox:not([hidden]) {
   margin: 8px 0 0; padding: 6px 10px 8px; font-size: 12px; border-radius: 3px;
@@ -170,7 +290,15 @@ button.mini:not(:disabled):hover { background: #26457a; }
 #bandbox .bandrow.three select { font-size: 11px; padding: 3px 4px; }
 #bandbox .lbl { color: var(--dim); font-size: 12px; margin-right: 6px; }
 #bandbox label.inline { display: inline; margin: 0 8px 0 0; }
-#bandbox input[type=range] { width: 60%; }
+/* Gamma is the only lone slider in the band box, and it is named here rather
+   than matched as `#bandbox input[type=range]`: that selector carries an id,
+   so it outranks `.dayrange input[type=range] { width: 100% }` and shrank the
+   channel blocks' two stacked handles to 60% of their container. A handle then
+   travelled 60% of the track its own histogram was drawn across — the max
+   handle of a 0.95 stretch rendered at 55%, which is what the bins disagreed
+   with. Naming the one input keeps the rule off every slider built into a
+   .dayrange container inside #bandbox. */
+#bandbox #gamma { width: 60%; }
 #bandbox #bandnote:empty { display: none; }
 #bandbox #bandnote { margin: 6px 0 0; }
 .chan-r { color: #ff8a8a; font-weight: 700; } .chan-g { color: #8ae28a; font-weight: 700; }
@@ -181,7 +309,12 @@ button.mini:not(:disabled):hover { background: #26457a; }
 .chan-head .hint { margin: 0; flex: 1 1 auto; white-space: nowrap; overflow: hidden;
                    text-overflow: ellipsis; }
 .chan-head button.mini { padding: 0 5px; font-size: 10.5px; }
-.chan canvas.hist { display: block; width: 100%; height: 36px; margin-top: 4px;
+/* Inset by half a thumb on each side so the drawn bins share the handles'
+   own scale (see --thumb): at value = min the left handle's center sits
+   half a thumb in from the container edge, and now so does the histogram's
+   first bin. */
+.chan canvas.hist { display: block; width: calc(100% - var(--thumb)); height: 36px;
+                    margin: 4px calc(var(--thumb) / 2) 0;
                     background: #0b1020; border-radius: 3px 3px 0 0; }
 .chan .vrange { margin: -4px 0 2px; }
 .chan .minmax { display: flex; gap: 6px; align-items: center; color: var(--dim); font-size: 11px; }
@@ -192,9 +325,6 @@ button.mini:not(:disabled):hover { background: #26457a; }
 #scl-legend span::before { content: ""; display: inline-block; width: 10px; height: 10px;
                             margin-right: 5px; vertical-align: -1px; border-radius: 2px;
                             background: var(--sw); border: 1px solid #0b1020; }
-.scene .chips { display: inline-flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
-.scene .chips button.mini { padding: 1px 6px; font-size: 11px; }
-.scene .chips a { margin: 0 4px 0 -2px; font-size: 11px; }
 
 .scene.best { position: relative; }
 .scene.best::before {
@@ -203,6 +333,10 @@ button.mini:not(:disabled):hover { background: #26457a; }
   letter-spacing: .05em; text-transform: uppercase; padding: 1px 5px;
   border-radius: 3px;
 }
+/* Which card the map shows now (.current) and, from the scrub preview, which
+   one a hover or key press previews without changing what is shown (.peek). */
+.scene.current { outline: 2px solid #6ea8ff; outline-offset: -2px; }
+.scene.peek { outline: 2px dashed #6ea8ff; outline-offset: -2px; }
 
 #apibox { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
 #apibox summary { cursor: pointer; color: var(--dim); font-size: 12px; }
@@ -243,9 +377,9 @@ button.mini:not(:disabled):hover { background: #26457a; }
     box-shadow: 0 -6px 24px rgba(0, 0, 0, .5);
     transition: height .18s ease;
   }
-  /* peek is the handle plus one line, so the "Showing …" line a user just
-     asked for stays readable with the whole map above it. */
-  #sheet[data-snap="peek"] { height: calc(110px + env(safe-area-inset-bottom, 0px)); }
+  /* peek is the handle, the "Showing …" line, and the image nav strip, so
+     both stay readable with the whole map above them. */
+  #sheet[data-snap="peek"] { height: calc(150px + env(safe-area-inset-bottom, 0px)); }
   #sheet[data-snap="half"] { height: 50dvh; }
   #sheet[data-snap="full"] { height: 88dvh; }
   /* A drag sets the height in pixels every pointermove; an animation on top
@@ -258,6 +392,9 @@ button.mini:not(:disabled):hover { background: #26457a; }
     /* The browser must not scroll or zoom on a drag of the handle. */
     touch-action: none;
   }
+  /* The browser must not scroll the sheet on a horizontal drag of the
+     scrubber; the scrubber owns the drag instead. */
+  #imgscrub { touch-action: none; }
   #grip::before {
     content: ""; display: block; width: 44px; height: 4px; margin: 13px auto 0;
     background: var(--dim); border-radius: 2px; opacity: .8;

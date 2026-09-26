@@ -27,6 +27,17 @@
   <div id="cogbar" hidden>Showing <b id="cog-id"></b> on the map
     <span id="cog-state" data-state="loading" role="status"></span>
     <button id="cog-clear" class="mini" type="button">Clear</button></div>
+  <!-- The image nav strip: step through the current sort order, scrub
+       across it, and zoom to the shown scene's footprint. Hidden with no
+       scene shown. -->
+  <div id="imgnav" hidden>
+    <button id="imgprev" class="mini" type="button" aria-label="Previous scene">‹</button>
+    <input type="range" id="imgscrub" min="0" max="0" step="1" value="0"
+      aria-label="Scrub through the search results" disabled>
+    <button id="imgnext" class="mini" type="button" aria-label="Next scene">›</button>
+    <button id="zoomto" class="mini" type="button" disabled>Zoom to</button>
+  </div>
+  <p id="imgnav-label" class="hint" hidden></p>
   <!-- The band mapper (Task 28): which bands of the shown scene are drawn,
        and how they are stretched. Filled in by app.js from bands.js. -->
   <details id="bandbox" open hidden>
@@ -68,7 +79,7 @@
      there is no API.</p>
   <p id="status" class="status" role="status">Loading the map…</p>
   <section id="controls">
-    <label>Month <input type="month" id="month" min="2015-07"></label>
+    <label>Year <select id="year"></select></label>
     <label>Color by
       <select id="metric">
         <option value="min_cloud_cover">clearest scene (min cloud %)</option>
@@ -84,25 +95,48 @@
   <section id="query">
     <h2>Find scenes</h2>
     <p class="hint">Click the map to pick an MGRS tile.</p>
+    <div class="filter dates-head">
+      <label for="date0">Dates
+        <button type="button" class="info" aria-label="About the date window"
+          data-tip="Drag either handle; the calendars follow. The map recolors by whole months; the scene list follows to the day.">?</button>
+      </label>
+    </div>
     <div class="dates">
       <label>From <input type="date" id="date0"></label>
       <label>To <input type="date" id="date1"></label>
+      <span id="datelock" class="chip" hidden><span id="datelock-label"></span>
+        <button id="datereset" class="mini" type="button"
+          aria-label="Back to the whole year">✕</button></span>
     </div>
-    <div id="dayrange" class="dayrange" title="Drag either handle; the calendars follow"></div>
-    <label>Max cloud % <input type="range" id="maxcloud" min="0" max="100" value="100">
-      <output id="maxcloud-out">100</output></label>
-    <p class="hint">Tiles whose clearest scene is cloudier than this go grey on the map.</p>
-    <label>Min coverage % <input type="range" id="mincoverage" min="0" max="100" value="10">
-      <output id="mincoverage-out">10</output></label>
-    <p class="hint">Tiles whose fullest scene this month fills less of the tile than this go grey on the map.</p>
-    <label>Min scenes <input type="range" id="minscenes" min="0" max="1" value="0" step="1"
-        title="Tiles with fewer scenes this month go grey on the map. The scene search below is not gated by this slider: a search window's scene count can differ from the whole month's.">
-      <output id="minscenes-out">0</output></label>
-    <p class="hint">Tiles imaged fewer times this month than this go grey on the map.</p>
-    <button id="run" disabled>Search scenes</button>
+    <div id="dayrange" class="dayrange"></div>
+    <div class="filter">
+      <label for="maxcloud">Max cloud %
+        <button type="button" class="info" aria-label="About max cloud"
+          data-tip="Tiles whose clearest scene in the window is cloudier go grey. The scene list follows the same ceiling.">?</button>
+      </label>
+      <input type="range" id="maxcloud" min="0" max="100" value="100">
+      <output id="maxcloud-out">100</output>
+    </div>
+    <div class="filter">
+      <label for="mincoverage">Min coverage %
+        <button type="button" class="info" aria-label="About min coverage"
+          data-tip="Tiles whose fullest scene fills less of the tile go grey. A scene with no coverage value is never excluded.">?</button>
+      </label>
+      <input type="range" id="mincoverage" min="0" max="100" value="10">
+      <output id="mincoverage-out">10</output>
+    </div>
+    <div class="filter">
+      <label for="minscenes">Min scenes
+        <button type="button" class="info" aria-label="About min scenes"
+          data-tip="Tiles imaged fewer times across the window go grey. The scene list is not gated by this slider.">?</button>
+      </label>
+      <input type="range" id="minscenes" min="0" max="1" value="0" step="1">
+      <output id="minscenes-out">0</output>
+    </div>
   </section>
   <section id="timeline"><h2>Monthly scenes</h2><div id="bars"></div>
-    <p class="hint" id="timeline-scope">All tiles. Click a bar to jump to that month.</p></section>
+    <p class="hint" id="timeline-scope">All tiles. Click a tile on the map, then a bar to search a month.</p></section>
+  <div id="sortrow"><label>Sort <select id="sort"></select></label></div>
   <section id="results"></section>
   <details id="apibox"><summary>The "API request" this answered</summary>
     <pre id="api"></pre><pre id="sql"></pre></details>
@@ -112,6 +146,12 @@
 </aside>
   </div>
 </div>
+<!-- The shared info/hover popover: one box for every info button
+     and the image nav's prev/next caption, positioned by app.js next to
+     whichever one is active. A direct child of body, not of #sheet or
+     #imgpanel, so it can sit on top of either and is never clipped by
+     their scrolling. -->
+<div id="tip" role="tooltip" hidden></div>
 <!-- deck.gl's own bundle, not a CDN ESM transpile: the esm.sh build of
      9.4.0 renders but its picking pass returns nothing (see task-20-report),
      the official dist picks fine. Pinned; a classic script runs before the
