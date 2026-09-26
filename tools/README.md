@@ -21,7 +21,7 @@ cluster, and GitHub only appends its daily tail.
 | | `sentinel-2-l2a` | `sentinel-2-c1-l2a` |
 |---|---|---|
 | Backfill | `backfill` then `publish-backfill` (GitHub) | `tools/rails/` on RAILS |
-| Daily tail | `refresh-daily`: `live.parquet` per year, zstd 18 | `refresh-daily`'s `refresh-c1` job, on when the repository variable `C1_LIVE_ENABLED` is `true`: `live.parquet` per year, zstd 3, lookback on `created` |
+| Daily tail | `refresh-daily`: `live.parquet` per year, zstd 18 | `refresh-daily`'s `refresh-c1` job, on when the repository variable `C1_LIVE_ENABLED` is `true`: `live-MM.parquet` per year and month, zstd 3, lookback on `created` |
 | Consolidation | `consolidate-month`, the 3rd of each month | `fold_live.sbatch` on RAILS, by hand, every 1 to 2 months |
 | Repair | `repair-slices` (bucket crawl) | `repair_month.sbatch` |
 | Audit | `s2_audit.py` by hand | `audit_year.sbatch` |
@@ -59,7 +59,9 @@ gates, and publishes the metadata.
 per year from the previous live plus the slice, minus every id the year's
 archive parts hold (`--exclude-ids-from`), so live and archive never
 overlap. It splices those years into the stats table, restamps the two
-collections, validates, uploads and publishes. Nothing is committed.
+collections, validates, uploads and publishes. Nothing is committed. Its
+Collection 1 job does the same per (year, month): see "The Collection 1
+lane" below.
 
 **`consolidate-month.yml`** (the 3rd, 05:17 UTC). Folds each year's live
 into its archive parts, one job per (year, part) because eight octants at
@@ -144,42 +146,55 @@ The full instructions, the credentials setup and every script are in
 6. **Daily**: `refresh-daily`'s `refresh-c1` job, on while
    `C1_LIVE_ENABLED` is `true`, fetches the lookback by
    `created` (so a scene ESA reprocessed last week, whatever its
-   acquisition date, is caught), appends to `year=YYYY/live.parquet` at
-   zstd 3 with the year file's ids excluded, splices the touched years
-   into `stats-c1`, and restamps both collections. It never
-   consolidates. Set the variable only once every year it appends to is
-   uploaded and `publish-stats` has seeded `stats-c1` (its splice reads
-   the published table); the fold below has the same condition.
+   acquisition date, is caught), appends to
+   `year=YYYY/live-MM.parquet` -- one live file per month, `MM` the month
+   the scene was acquired in -- at zstd 3 with the year file's ids
+   excluded, splices the touched years into `stats-c1`, and restamps both
+   collections. It never consolidates. A day of refresh rewrites and
+   re-uploads only the months its lookback touched, in steady state one:
+   one `live.parquet` a year grew by about 15,000 rows (24 MB) a day and
+   went back up whole every morning, which is 700 MB a day after a month
+   and 2 GB after three. The single `live.parquet` the collection
+   published before the monthly parts stays in the bucket with zero rows
+   (the catalog never deletes); the first run under the monthly scheme
+   folds its rows into the right months and empties it, and later runs see
+   zero rows there and do nothing. Set the variable only once every year
+   it appends to is uploaded and `publish-stats` has seeded `stats-c1`
+   (its splice reads the published table); the fold below has the same
+   condition.
 
 **The periodic duty.** Every one to two months, and at the end of each
 year, a person runs the fold:
 
 ```bash
 ssh rails 'cd ~/s2-catalog && sbatch tools/rails/fold_live.sbatch'
-# YEARS unset: every year whose published live.parquet holds rows.
-# The refresh looks back on `created`, so a live can sit under any year
-# ESA is reprocessing, not only the current one. To name the years:
+# YEARS unset: every year whose published live parts hold rows between
+# them. The refresh looks back on `created`, so a live part can sit under
+# any year ESA is reprocessing, not only the current one. To name the years:
 ssh rails 'cd ~/s2-catalog && sbatch --export=ALL,YEARS=2022,2026 tools/rails/fold_live.sbatch'
 ```
 
-It downloads each year's `items.parquet` and `live.parquet`, rebuilds the
-year (`s2_build --collection sentinel-2-c1-l2a`, dedupe by id keeping the
+It downloads each year's `items.parquet` and every live part of it that
+holds rows (`live-01.parquet` to `live-12.parquet`, and the pre-monthly
+`live.parquet` while that still holds any), rebuilds the year
+(`s2_build --collection sentinel-2-c1-l2a`, dedupe by id keeping the
 highest `s2:generation_time`, sort `(_tile, datetime)`, zstd 18), uploads
-the new year file and then a zero-row live, and prints the laptop
-commands: `make_items.py` and `make_collection.py` with
+the new year file and then a zero-row replacement for each part it folded,
+and prints the laptop commands: `make_items.py` and `make_collection.py` with
 `--collection sentinel-2-c1-l2a --remote-baseline`, the gates, a commit,
 and the `publish-catalog` workflow. That workflow restamps the first
 collection's items and both stats collections from the bucket before it
 uploads, so the publish keeps the daily restamp instead of putting the
 committed copies over it. Start the fold after 04:00 UTC: one that
-crosses the refresh's 03:42 UTC rewrite of live loses that day's
-`created` slice from live until the next lookback fetches it again.
+crosses the refresh's 03:42 UTC rewrite of a live part loses that day's
+`created` slice from that part until the next lookback fetches it again.
 
-**If the fold is skipped**: live keeps growing (a whole year in live is
-about 5 million rows at zstd 3, a larger and slower file than the year
-file would be); every query stays correct, because the year item lists
-both files and the collection glob reads both; and the year file lags the
-truth by however long the fold is late, with reprocessed scenes present
-twice across the two files (the newer `s2:generation_time` in live) until
-the fold dedupes them. Nothing is lost, and nothing else needs to change
+**If the fold is skipped**: the months keep growing (a whole year of tail
+is about 5 million rows at zstd 3 across up to twelve files, more and
+slower files than the year file would be, though each day's refresh still
+only rewrites the months it fetched); every query stays correct, because
+the year item lists every part and the collection glob reads them all; and
+the year file lags the truth by however long the fold is late, with
+reprocessed scenes present twice across the files (the newer
+`s2:generation_time` in the live part) until the fold dedupes them. Nothing is lost, and nothing else needs to change
 when the fold finally runs.

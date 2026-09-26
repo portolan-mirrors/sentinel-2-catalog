@@ -25,16 +25,24 @@ describes it.
 
 ```
 https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=YYYY/items.parquet   every year, one file
-https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=YYYY/live.parquet    any year may have one
+https://data.source.coop/portolan-mirrors/sentinel-2-catalog/sentinel-2-c1-l2a/year=YYYY/live-MM.parquet  any year may have some, MM = 01..12
 ```
 
 A year is one `items.parquet`. There is no zone split and no zone column:
 the archive of a year, whatever its size, is that one file. Any year may
-also carry `live.parquet`, the tail the daily refresh has appended since the
-last fold; a fold every month or two merges it into `items.parquet` and
-empties it. The two files of a year do not overlap, with one exception: a
-scene ESA reprocessed keeps its id with a newer `s2:generation_time`, and
-live holds the newer copy beside the archive's older one until the next
+also carry live files, one per month of it (`live-01.parquet` to
+`live-12.parquet`): the tail the daily refresh has appended since the last
+fold, each scene in the month it was acquired in, so a day of refresh
+rewrites only the months it fetched. A fold every month or two merges them
+into `items.parquet` and empties each one. A year refreshed before those
+files existed may also carry `live.parquet` with zero rows: it held the
+whole tail as one file, and this catalog never deletes a published file.
+Glob the year (`year=YYYY/*.parquet`) rather than naming the parts, and you
+do not have to know which months are there.
+
+The files of a year do not overlap, with one exception: a scene ESA
+reprocessed keeps its id with a newer `s2:generation_time`, and the live
+part holds the newer copy beside the archive's older one until the next
 fold. Dedupe on `id` keeping the highest `s2:generation_time` when you glob
 a year; it is safe and removes nothing else. The `QUALIFY` below is that
 dedupe; without it the count is high by the number of scenes reprocessed
@@ -305,7 +313,7 @@ A scene can be fetched more than once: the daily refresh re-reads a lookback
 window on `created`, and a reprocessed product keeps its id. Rows are
 deduped by `id`, keeping the highest `s2:generation_time` (`NULLS LAST`),
 when each year file is built and again at each fold. So `id` is unique
-within a file. Between folds, a reprocessed scene can sit in `live.parquet`
+within a file. Between folds, a reprocessed scene can sit in a live part
 with a newer `s2:generation_time` than the copy in `items.parquet`, so
 dedupe on `id` keeping the highest `s2:generation_time` when you glob a
 year (the `QUALIFY` in the glob snippet above). Across the whole table,
@@ -318,19 +326,20 @@ Three clocks, from the workflows in the repository's `.github/workflows/`
 and the cluster scripts in `tools/rails/`:
 
 - **Daily, 03:42 UTC** (`refresh-daily`, its Collection 1 job): the last
-  five days of Earth Search by `created`, appended to the `live.parquet` of
-  every year the slice touches, with the ids the year's `items.parquet`
-  already holds dropped. The year items and the collection are restamped
-  from the published files on the same run, so `table:row_count` and the
-  extents describe the bucket, not the commit.
+  five days of Earth Search by `created`, appended to the live part of
+  every (year, month) the slice touches -- in steady state one file --
+  with the ids the year's `items.parquet` already holds dropped. The year
+  items and the collection are restamped from the published files on the
+  same run, so `table:row_count` and the extents describe the bucket, not
+  the commit.
 - **Daily, on the same run**: the stats collection
   ([`stats-c1`](../stats-c1/AGENTS.md)) has every touched year recomputed
   and spliced into `mgrs-monthly.parquet`.
 - **Every month or two, and at year end**, by a person on the RAILS
-  cluster (`tools/rails/fold_live.sbatch`): each `live.parquet` is merged
-  into its year's `items.parquet` and emptied. There is no monthly
-  consolidation on GitHub for this collection. Between folds a year's two
-  files together are the year; the dedupe above makes the count exact.
+  cluster (`tools/rails/fold_live.sbatch`): every live part of a year is
+  merged into its `items.parquet` and emptied. There is no monthly
+  consolidation on GitHub for this collection. Between folds a year's files
+  together are the year; the dedupe above makes the count exact.
 
 The daily job runs only while the repository variable `C1_LIVE_ENABLED` is
 set. With it unset this collection changes only when a person commits and
