@@ -36,7 +36,8 @@ import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOver
 import { BANDS, MASK_BANDS, bandInfo, bandTitle, fixedRange, INDICES, SCL_CLASSES, PRESETS,
   bandsOf, HIST_BINS } from "./bands.js";
 import { dayRange, valueRange } from "./rangeslider.js";
-import { sceneSearch, warmPart, readTable, keyedRows } from "./search.js";
+import { sceneRows, warmPart, readTable, keyedRows } from "./search.js";
+import { SORTS, viewOf, indexOfId, clampIndex, filterKeyOf } from "./results.js";
 // deck.gl comes from its pinned dist bundle (index.html), not an ESM CDN
 // transpile: the esm.sh build draws but cannot pick. One bundle, one luma.gl.
 // A classic script that failed to load is a missing global, not an import
@@ -425,6 +426,9 @@ Object.defineProperties(window.S2, {
   lookup: { get: () => lookup },
   selectedTile: { get: () => S.tile },
   S: { value: S },
+  // The ids the filters admit, in view order. Only the first 15 cards render,
+  // so the headless gate reads the view here instead of off the DOM.
+  viewIds: { value: () => currentView().map((r) => r.id) },
 });
 
 function render() {
@@ -483,8 +487,8 @@ render();
 
 // One coalesced apply per animation frame: a slider drag asks for a paint
 // and a card render, and both run once, in order, on the next frame.
-// renderResults, renderScrubber and syncNavButtons arrive in later tasks;
-// the typeof guards keep this file loadable in between.
+// renderScrubber and syncNavButtons arrive in later tasks; the typeof
+// guards keep this file loadable in between.
 let applyFlags = null;
 function scheduleApply(flags = {}) {
   const first = !applyFlags;
@@ -500,7 +504,7 @@ function applyNow() {
     typeof renderScrubber === "function" && renderScrubber();
     typeof syncNavButtons === "function" && syncNavButtons();
   }
-  if (!f.cards) say(`${filterLine()}.`);
+  updateFilterStatus();
 }
 
 // ---------------------------------------------------------------------------
@@ -908,15 +912,15 @@ function setWindow(from0, to0) {
 }
 
 // Switch the whole page to a different year: clear any bar-click month lock,
-// rebound the date slider to Jan 1 - Dec 31, and repaint. From Task 6 on,
-// it also re-runs the scene search for the selected tile.
+// rebound the date slider to Jan 1 - Dec 31, and repaint. A tile with an
+// active search is searched again, in the new year.
 function setYear(year) {
   S.year = year;
   S.monthLock = null;
   $("datelock")?.toggleAttribute("hidden", true);
   $("year").value = String(year);
   setWindow(`${year}-01-01`, `${year}-12-31`);
-  if (S.tile && S.search) startSearch(S.tile, year);   // no-op until Task 6
+  if (S.tile && S.search) startSearch(S.tile, year);
 }
 
 // Warm the window's parts the moment the window is known, for the
@@ -1034,12 +1038,14 @@ async function initWithoutStats() {
 // scene query's constants and helpers, which are defined below.
 
 // ---------------------------------------------------------------------------
-// The scene query. Click a tile, pick a window, and hyparquet (search.js)
-// range-reads the year parts of the collection directly: the footer once per
-// part per session, then the admitted row groups' search columns in
-// parallel. Every COG the page draws or links sits in the scene directory
-// that `thumbnail_url` names (see sceneDirOf), so no row ever needs the
-// parts' ~18 KB-a-row `assets` column.
+// The scene query. A tile click is the whole search — there is no Search
+// button. hyparquet (search.js) range-reads the clicked year's parts
+// directly: the footer once per part per session, then the admitted row
+// groups' search columns in parallel. The read is per tile-year and the rows
+// stay in the page, so the sliders and the date window filter them with no
+// further network read. Every COG the page draws or links sits in the scene
+// directory that `thumbnail_url` names (see sceneDirOf), so no row ever
+// needs the parts' ~18 KB-a-row `assets` column.
 // ---------------------------------------------------------------------------
 
 // An MGRS tile id: 1-2 digit UTM zone, latitude band C..X, then two letters.
@@ -1048,24 +1054,77 @@ async function initWithoutStats() {
 const TILE_RE = /^\d{1,2}[C-X][A-Z]{2}$/;
 const CURRENT_YEAR = new Date().getUTCFullYear();
 
+// A whole tile-year of scene rows, cached as the in-flight promise so two
+// clicks share one fetch and a revisit is instant. A failure is forgotten
+// so the next click retries. The cap only bounds a long session; a
+// tile-year is tens of KB decoded.
+const YEAR_CACHE_MAX = 8;
+const yearCache = new Map();
+function yearRows(tile, year) {
+  const key = `${COLLECTION_ID}|${tile}|${year}`;
+  if (!yearCache.has(key)) {
+    const p = (async () => {
+      const urls = await partUrls(year, year, tile);
+      if (!urls.length) return { rows: [], plan: "", urls };
+      const got = await sceneRows({ urls, tileColumn: COL.tileColumn, tile,
+        sidecars: COL.sidecars !== false });
+      return { ...got, urls };
+    })();
+    p.catch(() => yearCache.delete(key));
+    yearCache.set(key, p);
+    if (yearCache.size > YEAR_CACHE_MAX) yearCache.delete(yearCache.keys().next().value);
+  }
+  return yearCache.get(key);
+}
+
+// The filtered, sorted view of the active search, memoised on every input.
+let viewKey = "";
+let viewRows = [];
+function currentView() {
+  if (!S.search) return [];
+  const f = currentFilters();
+  const key = filterKeyOf(f, S.sort, S.search);
+  if (key !== viewKey) {
+    viewRows = viewOf(S.search.rows, f, S.sort);
+    viewKey = key;
+  }
+  return viewRows;
+}
+
+function updateFilterStatus() {
+  if (!S.search) { say(`${filterLine()}.`); return; }
+  const view = currentView();
+  say(`${view.length} of ${S.search.rows.length} ${S.search.tile} scenes in `
+    + `${S.search.year} pass (${S.from} → ${S.to}, cloud ≤ ${S.maxCloud}, `
+    + `coverage ≥ ${S.minCoverage}) — one year of parts range-read once, `
+    + `filters run in the page.`);
+}
+
 map.on("click", (e) => {
   const tile = hitIndex.at(e.lngLat.wrap().lng, e.lngLat.lat)?.tile;
   if (!TILE_RE.test(tile ?? "")) return;
-  S.tile = tile;
-  $("run").disabled = false;
-  timelineFor(tile);
-  // The click is the search: picking a tile runs the query for the window
-  // already on screen. The button stays for re-runs after a slider or
-  // window change. Before the month picker has settled a window (no dates
-  // yet), the old two-step hint stands and nothing runs.
-  if ($("date0").value && $("date1").value) {
-    $("query").querySelector(".hint").textContent = `Tile ${tile}.`;
-    runQuery();
-  } else {
-    $("query").querySelector(".hint").textContent =
-      `Tile ${tile}. Pick a window and search.`;
-  }
+  selectTile(tile);
 });
+
+// The click is the search. The date inputs, not S, carry the window here:
+// the headless gate writes their .value directly with no events, and a
+// calendar edit lands the same way.
+function selectTile(tile) {
+  S.tile = tile;
+  timelineFor(tile);
+  const d0 = $("date0").value, d1 = $("date1").value;
+  if (!d0 || !d1) {
+    $("query").querySelector(".hint").textContent = `Tile ${tile}. Pick a window first.`;
+    return;
+  }
+  if (d1 < d0) { say("The window ends before it starts — swap the two dates.", true); return; }
+  S.from = d0;
+  S.to = d1;
+  const year = Number(d0.slice(0, 4));
+  if (year !== S.year) { S.year = year; $("year").value = String(year); }
+  $("query").querySelector(".hint").textContent = `Tile ${tile}.`;
+  startSearch(tile, year);
+}
 
 // The zone parts of a year: [file stem, first zone, last zone], mirrored
 // from tools/s2_build.py because the browser cannot import it (spec
@@ -1152,13 +1211,14 @@ async function partUrls(y0, y1, tile) {
   return candidates.filter((_, i) => present[i]);
 }
 
-// The query itself lives in search.js (sceneSearch): hyparquet range-reads
-// the parts' footers once per session, admits row groups by the tile
-// column's statistics, fetches the admitted groups' search columns in
-// parallel, and filters the rows here in the page. The coverage gate is the
-// item-level twin of the stats file's max_cover
-// (100 - s2:nodata_pixel_percentage), and is omitted at 0 (the slider's
-// no-op value, and its state whenever the slider is hidden). `assets`
+// The read itself lives in search.js (sceneRows): hyparquet range-reads the
+// parts' footers once per session, admits row groups by the tile column's
+// statistics, and fetches the admitted groups' search columns in parallel.
+// Every gate — the date window, the cloud ceiling, the coverage floor — then
+// runs over those rows in the page (results.js filterRows). The coverage
+// gate is the item-level twin of the stats file's max_cover
+// (100 - s2:nodata_pixel_percentage), and is a no-op at 0 (the slider's
+// inert value, and its state whenever the slider is hidden). `assets`
 // (~half the bytes of a part) is never fetched; `bbox` is, for "Show on
 // map", and the processing baseline for the band mapper's index offset.
 
@@ -1169,7 +1229,7 @@ function apiMirror(tile, d0, d1, cc, cov) {
     "eo:cloud_cover": { lte: cc },
     ...COL.apiTile(tile),
   };
-  // Mirrors sceneSearch's coverage gate: coverage = 100 - nodata, so
+  // Mirrors the page's coverage gate: coverage = 100 - nodata, so
   // coverage >= cov is nodata <= 100 - cov. Omitted at the slider's inert
   // value, same as the real query.
   if (cov > 0) query["s2:nodata_pixel_percentage"] = { lte: 100 - cov };
@@ -1695,6 +1755,8 @@ async function showTci(me, spec, serial) {
 
 // "Show on map" and the card's band chips: fly to the scene's footprint,
 // remember the scene, set the panel to the asked preset and apply it.
+// `button` is the control to disable while the read runs. It is null when
+// the page itself asks for a scene (showIndex), because no control was hit.
 async function showOnMap(r, button, preset = "tci", band = null) {
   const id = String(r.id);
   // A chip on the scene already shown keeps what it has read and set.
@@ -1705,7 +1767,7 @@ async function showOnMap(r, button, preset = "tci", band = null) {
     loading: false, eventsFor: null };
   const bbox = bboxOf(r);
   if (bbox) map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40, duration: 1200 });
-  button.disabled = true;
+  if (button) button.disabled = true;
   // A scene already on the map comes off now, not when this one is ready:
   // the bar names this scene from here on and the map must not contradict it.
   if (cogLayer || cogPreview) { cogLayer = null; cogPreview = null; render(); }
@@ -1745,7 +1807,7 @@ async function showOnMap(r, button, preset = "tci", band = null) {
     hideImagePanel();
     say(`Could not show ${id} — ${err.message}`, true);
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
 }
 
@@ -1826,8 +1888,8 @@ function thumbnail(r) {
   return img;
 }
 
-function sceneCard(r, i) {
-  const card = el("div", "scene" + (i === 0 ? " best" : ""));
+function sceneCard(r) {
+  const card = el("div", "scene");
   if (typeof r.thumbnail_url === "string" && r.thumbnail_url) card.append(thumbnail(r));
   const cap = document.createElement("div");
   cap.append(el("b", null, r.id), document.createElement("br"));
@@ -1869,82 +1931,79 @@ function sceneCard(r, i) {
 // await to find a newer number leaves the page to the newer run.
 let searchSeq = 0;
 
-async function runQuery() {
+async function startSearch(tile, year) {
   const seq = ++searchSeq;
-  const d0 = $("date0").value;
-  const d1 = $("date1").value;
-  const cc = Number($("maxcloud").value);
   const box = $("results");
-  if (!S.tile || !TILE_RE.test(S.tile)) {
-    say("Click an MGRS tile on the map first.", true);
-    return;
-  }
-  if (!d0 || !d1) {
-    say("Set both ends of the date window.", true);
-    return;
-  }
-  if (d1 < d0) {
-    say("The window ends before it starts — swap the two dates.", true);
-    return;
-  }
-  $("run").disabled = true;
   box.replaceChildren(el("p", "hint", "Reading the item parts…"));
+  $("sql").textContent = "Range-reading…";
+  $("api").textContent = apiMirror(tile, S.from, S.to, S.maxCloud, S.minCoverage);
+  say(`Range-reading tile ${tile}'s ${year} scenes…`);
+  let got;
   try {
-    const urls = await partUrls(Number(d0.slice(0, 4)), Number(d1.slice(0, 4)),
-      S.tile);
-    if (seq !== searchSeq) return;
-    if (!urls.length) {
-      $("sql").textContent = "";
-      $("api").textContent = "";
-      box.replaceChildren(el("p", "hint",
-        `No published ${COLLECTION_ID} parts cover ${d0.slice(0, 4)}–${d1.slice(0, 4)}. `
-        + "Pick a window the backfill has reached."));
-      say(`Nothing published for ${d0.slice(0, 4)}–${d1.slice(0, 4)} in ${COLLECTION_ID} yet.`);
-      return;
-    }
-    $("sql").textContent = "Range-reading…";
-    $("api").textContent = apiMirror(S.tile, d0, d1, cc, S.minCoverage);
-    say(`Range-reading ${urls.length} parquet part`
-      + `${urls.length === 1 ? "" : "s"} for tile ${S.tile}…`);
-    const { rows, plan } = await sceneSearch({ urls, tileColumn: COL.tileColumn,
-      tile: S.tile, d0, d1, cc, cov: S.minCoverage,
-      sidecars: COL.sidecars !== false });
-    if (seq !== searchSeq) return;
-    $("sql").textContent = plan;
-    box.replaceChildren();
-    if (!rows.length) {
-      box.append(el("p", "hint",
-        `No ${S.tile} scenes under ${cc}% cloud in that window — `
-        + "raise the slider or widen the dates."));
-      say(`No scenes matched — still no API call.`);
-      return;
-    }
-    box.append(...rows.map(sceneCard));
-    // The clearest scene goes straight onto the map: the search's answer is
-    // an image, not a list. Clicking the best card's own button keeps this
-    // path identical to a hand click (state, spinner, band mapper).
-    box.querySelector(".scene.best .actions button")?.click();
-    // The results sit below the timeline in the panel; without this the hero
-    // flow's answer lands off-screen on a short window.
-    // Not on a phone once the sheet has dropped to peek: the scene the search
-    // just put on the map is the answer there, and this scroll would carry
-    // the "Showing …" line out of the one line peek shows.
-    if (snap !== "peek") box.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    // The collection is named only off the default: the default's text is
-    // the page as it always read; the API mirror names it either way.
-    const parts = COLLECTION_ID === DEFAULT_COLLECTION ? "part" : `${COLLECTION_ID} part`;
-    say(`${rows.length} scene${rows.length === 1 ? "" : "s"} for ${S.tile}, `
-      + `clearest first — ${urls.length} range-read ${parts}`
-      + `${urls.length === 1 ? "" : "s"}, no API call.`);
+    got = await yearRows(tile, year);
   } catch (err) {
     if (seq !== searchSeq) return;
     box.replaceChildren(el("p", "hint", `Query failed — ${err.message}`));
     say(`Could not read the item parts — ${err.message}`, true);
-  } finally {
-    if (seq === searchSeq) $("run").disabled = false;
+    return;
+  }
+  if (seq !== searchSeq) return;
+  if (!got.urls.length) {
+    $("sql").textContent = "";
+    $("api").textContent = "";
+    box.replaceChildren(el("p", "hint",
+      `No published ${COLLECTION_ID} parts cover ${year}. Pick a year the backfill has reached.`));
+    say(`Nothing published for ${year} in ${COLLECTION_ID} yet.`);
+    return;
+  }
+  $("sql").textContent = got.plan;
+  S.search = { tile, year, rows: got.rows, at: Date.now() };
+  S.shown = 15;
+  S.displayedId = null;
+  S.detachedAt = 0;
+  renderResults();
+  scheduleApply({ nav: true });
+  const view = currentView();
+  if (view.length) {
+    showIndex(0);
+    if (snap !== "peek") box.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 }
 
-$("run").addEventListener("click", runQuery);
+// Commit the view's position i to the map. Task 11 extends this with the
+// card outline scroll; here it is the auto-show of the best result.
+function showIndex(i) {
+  const view = currentView();
+  const row = view[i];
+  if (!row) return;
+  S.displayedId = row.id;
+  S.detachedAt = i;
+  showOnMap(row, null, ui.preset);
+  scheduleApply({ cards: true, nav: true });
+}
+
+// Plain render for now: the visible slice of the view, plus a Show-more
+// footer. Task 7 turns this into a keyed reconcile.
+function renderResults() {
+  const box = $("results");
+  if (!S.search) return;
+  const view = currentView();
+  if (!view.length) {
+    box.replaceChildren(el("p", "hint",
+      `0 of ${S.search.rows.length} scenes pass — widen a slider or the date window.`));
+    return;
+  }
+  box.replaceChildren(...view.slice(0, S.shown).map(sceneCard));
+  renderMore(box, view.length);
+}
+function renderMore(box, total) {
+  document.getElementById("more")?.remove();
+  if (total <= S.shown) return;
+  const b = el("button", "mini", `Show ${Math.min(15, total - S.shown)} more (${total - S.shown} left)`);
+  b.id = "more";
+  b.type = "button";
+  b.addEventListener("click", () => { S.shown += 15; renderResults(); });
+  box.append(b);
+}
 
 await init();

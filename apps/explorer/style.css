@@ -86,8 +86,6 @@ input[type=range] { width: 74%; vertical-align: middle; padding: 0; border: 0;
 output { color: var(--ink); font-variant-numeric: tabular-nums; }
 button { cursor: pointer; }
 button:disabled { opacity: .45; cursor: not-allowed; }
-#run { width: 100%; margin-top: 4px; background: #1d365e; border-color: #2b4c86; }
-#run:not(:disabled):hover { background: #26457a; }
 
 #legend { margin-top: 10px; }
 #legend .ramp {

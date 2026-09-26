@@ -160,8 +160,9 @@ else {
     }
     out.tile = ($("query").querySelector(".hint")?.textContent || "").trim();
     out.plan = $("sql").textContent;
-    out.ids = [...$("results").querySelectorAll(".card b, b")].map((b) => b.textContent.trim())
-      .filter((t) => /^S2[A-Z]/.test(t));
+    out.ids = (w.S2 && w.S2.viewIds ? w.S2.viewIds()
+      : [...$("results").querySelectorAll(".card b, b")].map((b) => b.textContent.trim()))
+      .filter((t) => /^S2[A-Z]/.test(t)).slice(0, 30);
     say(`  ${out.ids.length} row(s): ${out.ids.slice(0, 3).join(", ")}`);
   } catch (e) {
     out.error = `${e}\\n${e.stack ?? ""}`;
