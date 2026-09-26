@@ -70,7 +70,8 @@ export const BASE = new URLSearchParams(location.search).get("base")
 // `created`, so a reprocessed 2019 scene lands in year=2019/live-MM.parquet,
 // the month it was acquired in. `live.parquet` stays in the list: the single
 // file this collection published before the monthly parts is still in the
-// bucket, emptied and never deleted. `apiTile` is how a STAC API is asked for a tile
+// bucket, emptied and never deleted. `apiTile` is how a STAC API is asked
+// for a tile
 // (apiMirror): Collection 1 items have no s2:mgrs_tile, their tile is
 // grid:code "MGRS-31UET". `masks` are the extra single bands its scenes
 // carry (bands.js MASK_BANDS). `since` is the first year with scenes, for

@@ -1,7 +1,10 @@
 # Monthly live parts for Collection 1 — what was done
 
-Answers `docs/monthly-live-brief.md`. Branch `s2-monthly-live-work`, seven
-commits, one per ruling where that was natural.
+Answers `docs/monthly-live-brief.md`. Branch `s2-monthly-live-work`, nine
+commits over `main`, one per ruling where that was natural. The first two
+(`--months` with the one list of live part names, and the `make_items` half
+of the metadata ruling) were made before this report and are described here
+for completeness.
 
 Collection 1 only. Nothing under `catalog/sentinel-2-l2a/`, and no code path
 of the first collection, changed: `live_part_names(DEFAULT_CONFIG)` is still
@@ -152,6 +155,13 @@ way.
   whether a year is published pass no window and get today's month — the
   part the refresh rewrites every morning, and the only file a year the
   archive has not reached can have.
+
+Nothing in the explorer changes what a search reads until the refresh has
+published a monthly part: today a Collection 1 search pays one extra HEAD for
+`live-MM.parquet`, gets a 404, and `partUrls` filters it out exactly as it
+filters an unpublished `live.parquet`, so the same two files are read. No
+browser run was made: the two pure functions are tested in node and the rest
+of the diff is the argument they feed.
 
 `apps/explorer/search.js`: a part that answers **404 is now read as empty**.
 It was not graceful before: `partMeta` threw `range read of … got HTTP 404`,
