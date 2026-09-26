@@ -168,6 +168,12 @@ const say = (msg, isError = false) => {
     + "is a range read against static GeoParquet on Source Cooperative; there is no API.";
 }
 
+// hideTipFor(el) lets code outside this block close the popover for one
+// anchor (setTip calls it when a nav button's caption changes or clears).
+// The popover block below replaces it with the real function at load; this
+// stub only guards a call that somehow lands before that.
+let hideTipFor = () => {};
+
 // The shared info/hover popover (Task 15). One #tip element serves every
 // `button.info` and the image nav's prev/next caption, instead of Task 5's
 // one tip per section. It is position: fixed on body, so it covers the map
@@ -178,9 +184,17 @@ const say = (msg, isError = false) => {
 // any .info button, or Escape, takes it down. imgprev/imgnext wire in the
 // same way but not pinnable: their own click already steps to a scene, so
 // a second, competing click meaning would be confusing.
+// Two anchors matter here: `pinned`, set only by a click and cleared only
+// by Escape, an outside click, or another pinnable anchor's click; and
+// `activeAnchor`, whichever anchor's text is on screen right now, pinned
+// or not. A hover never starts, moves, or ends the pin — while one is
+// pinned, hovering a different anchor is a no-op, so the pinned box stays
+// exactly as it was. Only the anchor that opened a plain hover (activeAnchor)
+// may close it on its own mouseleave.
 {
   const tip = $("tip");
   let pinned = null;
+  let activeAnchor = null;
 
   // Put the box beside `anchor`: right first, left if the right edge would
   // leave the viewport, under the anchor if neither side fits. Measured
@@ -205,15 +219,24 @@ const say = (msg, isError = false) => {
     if (!text) return;
     tip.textContent = text;
     tip.hidden = false;
+    activeAnchor = anchor;
     place(anchor);
   }
-  function hide() { tip.hidden = true; }
+  function hide() { tip.hidden = true; activeAnchor = null; }
   function unpin() { pinned = null; hide(); }
 
   function wire(anchor, pinnable) {
     if (matchMedia("(hover: hover)").matches) {
-      anchor.addEventListener("mouseenter", () => show(anchor));
-      anchor.addEventListener("mouseleave", () => { if (pinned !== anchor) hide(); });
+      anchor.addEventListener("mouseenter", () => {
+        // A pinned box is only ever moved by a click; a hover elsewhere
+        // must not steal it or blank it out from under the pin.
+        if (pinned && pinned !== anchor) return;
+        show(anchor);
+      });
+      anchor.addEventListener("mouseleave", () => {
+        if (anchor === pinned) return;        // the pin keeps it open
+        if (anchor === activeAnchor) hide();  // only its own opener closes it
+      });
     }
     if (pinnable) {
       anchor.addEventListener("click", () => {
@@ -235,6 +258,14 @@ const say = (msg, isError = false) => {
   // no filter row scrolls far enough for the anchor to need re-finding.
   $("panel").addEventListener("scroll", hide, { passive: true });
   $("imgpanel").addEventListener("scroll", hide, { passive: true });
+
+  // A disabled button gets no mouseleave, so a caption change or a step to
+  // the sort order's edge (syncNavButtons, via setTip) must close its tip
+  // itself rather than wait for an event that will never come.
+  hideTipFor = (el) => {
+    if (el === pinned) pinned = null;
+    if (el === activeAnchor) hide();
+  };
 }
 
 const protocol = new Protocol();
@@ -1777,8 +1808,13 @@ function syncNavButtons() {
 }
 // data-tip feeds the shared popover (wired above); an empty string is
 // removed rather than kept, so a button with nothing to say never anchors
-// an empty box.
+// an empty box. hideTipFor closes a tip already on screen for `el` before
+// its caption changes under it — needed because syncNavButtons can disable
+// imgprev/imgnext (or blank their caption) while the pointer is still over
+// one, and a disabled element never fires the mouseleave that would
+// otherwise close it.
 function setTip(el, text) {
+  hideTipFor(el);
   if (text) el.dataset.tip = text; else delete el.dataset.tip;
 }
 
