@@ -131,9 +131,15 @@ and any tile window is one or two row groups (spec Amendment 1, issue #9)
 -- `--split zones` is refused (zone_split=False: a year is one
 items.parquet), row groups are uniform at a 6,000-row target (6,144 as
 DuckDB writes them), and the daily live build passes `--zstd-level 3`
-(config.live_zstd_level) because a live.parquet is rewritten every day and
+(config.live_zstd_level) because a live part is rewritten every day and
 folded into the year within weeks, so nobody downloads it enough to earn
-the zstd-18 encode. The month-aligned writer (month_align) stays behind
+the zstd-18 encode. Its live tail is one file per month
+(config.monthly_live, `live-01.parquet` .. `live-12.parquet`,
+live_part_names): the refresh builds each one with `--years Y --months M
+--name live-MM.parquet`, so a day of refresh rewrites and re-uploads the
+months its lookback touched -- in steady state one -- instead of a single
+live.parquet that grows by about 15,000 rows (24 MB) a day for as long as
+the next fold takes. The year file itself stays one object. The month-aligned writer (month_align) stays behind
 `--row-group-mode month_aligned` for experiments; it needs a month-major
 order, so that mode puts `_month` in front of the collection's key.
 """
@@ -311,6 +317,31 @@ def archive_part_names(config: CollectionConfig = DEFAULT_CONFIG,
     return ("items",
             *(label for label, _, _ in ZONE_PARTS),
             *(label for label, _, _ in ZONE_PARTS_8))
+
+
+def live_month_name(month: int) -> str:
+    """The file name of one monthly live part: live-MM.parquet, MM padded.
+    The single source of that spelling; every caller (the refresh, the fold,
+    the metadata generators, the stats enumeration) asks here."""
+    if not 1 <= int(month) <= 12:
+        raise SystemExit(f"month {month} is not a month of the year (1-12)")
+    return f"live-{int(month):02d}.parquet"
+
+
+def live_part_names(config: CollectionConfig = DEFAULT_CONFIG,
+                    ) -> tuple[str, ...]:
+    """Every file stem the live tail of a year can have, in advertised
+    order. ("live",) for a collection with one live file. For a
+    monthly-live collection (config.monthly_live) the twelve monthly stems,
+    with "live" kept in front of them: the single file the catalog published
+    before the move stays in the bucket, emptied and never deleted, so every
+    list that enumerates parts must still name it. The probing workflows
+    enumerate this list because a HEAD is cheap and a hand-typed list would
+    drift."""
+    if not config.monthly_live:
+        return ("live",)
+    return ("live", *(live_month_name(m)[:-len(".parquet")]
+                      for m in range(1, 13)))
 
 
 def only_zone_parts(year: int, parts: tuple[tuple[str, int, int], ...],
@@ -1020,7 +1051,8 @@ def build_year(con, files: list[str], year: int, outdir: Path,
                config: CollectionConfig = DEFAULT_CONFIG,
                zstd_level: int = ZSTD_LEVEL,
                row_group_mode: str | None = None,
-               row_group_size: int | None = None) -> tuple[int, int, int]:
+               row_group_size: int | None = None,
+               months: tuple[int, ...] | None = None) -> tuple[int, int, int]:
     """Build one year. Returns (rows written, parts skipped as already
     published, part files written -- which counts a zero-row live written
     because --exclude-ids-from dropped every staged row). With --split zones the parts are zone_parts_for(year); a
@@ -1038,11 +1070,24 @@ def build_year(con, files: list[str], year: int, outdir: Path,
     mode); `zstd_level` (--zstd-level), `row_group_mode`
     (--row-group-mode, default config.row_group_mode) and `row_group_size`
     (--row-group-size, default the collection's then ROW_GROUP) are what
-    the published part is written with."""
+    the published part is written with. `months` (--months) narrows the
+    staging query to those months of the year, which is how the refresh
+    builds one monthly live part per (year, month) it touched: the filter is
+    month(datetime) in the same session zone as the _month column, so a row
+    lands in the same month on every machine."""
     lst = ",".join(f"'{f}'" for f in files)
     label = "zones" if split == "zones" else name
     if row_group_mode is None:
         row_group_mode = config.row_group_mode
+    month_filter = ""
+    if months:
+        bad = [m for m in months if not 1 <= int(m) <= 12]
+        if bad:
+            raise SystemExit(
+                f"--months: {', '.join(str(m) for m in bad)} is not a month "
+                f"of the year (1-12)")
+        month_filter = (" AND month(datetime) IN "
+                        f"({','.join(str(int(m)) for m in months)})")
     # Every refusal comes before the year directory exists, so a refused
     # build leaves no empty year=YYYY/ behind.
     parts = ()
@@ -1083,7 +1128,7 @@ def build_year(con, files: list[str], year: int, outdir: Path,
             COPY (
               SELECT {_select(con, lst, config)}
               FROM read_parquet([{lst}], union_by_name=true)
-              WHERE year(datetime) = {year}
+              WHERE year(datetime) = {year}{month_filter}
               QUALIFY row_number() OVER (
                 PARTITION BY id
                 ORDER BY "s2:generation_time" DESC NULLS LAST) = 1
@@ -1157,6 +1202,11 @@ def main() -> int:
                     help="chunk dirs and/or parquet files (a published "
                          "part or live.parquet counts)")
     ap.add_argument("--years", help="comma list; default = every year found")
+    ap.add_argument("--months",
+                    help="comma list of months (1-12); default = the whole "
+                         "year. The refresh builds one monthly live part per "
+                         "(year, month) it touched: --years Y --months M "
+                         "--name live-MM.parquet (s2_build.live_month_name)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", default="items.parquet")
     ap.add_argument("--memory", default="8GB")
@@ -1216,6 +1266,19 @@ def main() -> int:
     hook = shlex.split(a.on_part_done) if a.on_part_done else None
     if a.on_part_done and not hook:
         ap.error("--on-part-done needs a command")
+    months = None
+    if a.months is not None:
+        try:
+            months = tuple(dict.fromkeys(
+                int(m.strip()) for m in a.months.split(",") if m.strip()))
+        except ValueError:
+            ap.error(f"--months: {a.months!r} is not a comma list of numbers")
+        if not months:
+            ap.error("--months needs at least one month")
+        if a.split == "zones":
+            # Nothing needs both, and a zone part of part of a year would be
+            # a shape no reader knows.
+            ap.error("--months applies to one --name file, not --split zones")
 
     outdir = Path(a.out).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1240,7 +1303,7 @@ def main() -> int:
             a.skip_existing_url, hook, only_parts=only_parts,
             exclude_ids_from=a.exclude_ids_from, config=config,
             zstd_level=a.zstd_level, row_group_mode=a.row_group_mode,
-            row_group_size=a.row_group_size)
+            row_group_size=a.row_group_size, months=months)
         total += rows
         skipped += skips
         written += parts_written

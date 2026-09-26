@@ -71,11 +71,15 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          # live_years: which years' live.parquet to probe. The first
+          # live_years: which years' live parts to probe. The first
           # collection's live is the current year's (consolidate-month
-          # folds the rest); a Collection 1 live can sit under any year,
-          # because its lookback is on `created` and ESA reprocesses old
-          # years, so every mission year is probed.
+          # folds the rest); a Collection 1 live part can sit under any
+          # year, because its lookback is on `created` and ESA reprocesses
+          # old years, so every mission year is probed. Which names are
+          # probed for a year comes from s2_build.live_part_names(config):
+          # one live.parquet for the first collection, and for Collection 1
+          # the twelve live-MM.parquet plus the live.parquet it published
+          # before those existed.
           - collection: sentinel-2-l2a
             stats_dir: stats
             live_years: current
@@ -133,8 +137,9 @@ jobs:
       # year; the names come from tools/s2_build.py archive_part_names()
       # with the collection's config so this list cannot drift from the
       # builder -- from 2015 (Sentinel-2's launch year) through the current
-      # year with a HEAD request, plus live.parquet for the years
-      # LIVE_YEARS names, if refresh-daily has published one. A 404 is a
+      # year with a HEAD request, plus every live name of the collection
+      # (live_part_names, the same single source) for the years LIVE_YEARS
+      # names, if refresh-daily has published one. A 404 is a
       # part that does not exist for that year, which is the normal case
       # for most of the names; any other answer is a part this run cannot
       # see and would silently leave out of the stats, so it fails the
@@ -147,11 +152,17 @@ jobs:
         run: |
           set -euo pipefail
           CURRENT_YEAR=$(date -u +%Y)
-          ARCHIVE_NAMES=$(python3 -c '
+          NAMES=$(python3 -c '
           import os, sys; sys.path.insert(0, "tools")
           import s2_collections as cols
-          from s2_build import archive_part_names
-          print(" ".join(archive_part_names(cols.get(os.environ["COLLECTION"]))))')
+          from s2_build import archive_part_names, live_part_names
+          config = cols.get(os.environ["COLLECTION"])
+          print(" ".join(archive_part_names(config)))
+          print(" ".join(live_part_names(config)))')
+          ARCHIVE_NAMES=$(echo "$NAMES" | sed -n 1p)
+          LIVE_NAMES=$(echo "$NAMES" | sed -n 2p)
+          echo "archive part name(s): $ARCHIVE_NAMES"
+          echo "live part name(s): $LIVE_NAMES"
           # probe <year> <name>: 0 if year=<year>/<name>.parquet is published,
           # 1 if it answers 404; anything else stops the job.
           probe() {
@@ -171,9 +182,11 @@ jobs:
               fi
             done
             if [ "$LIVE_YEARS" = all ] || [ "$Y" = "$CURRENT_YEAR" ]; then
-              if probe "$Y" live; then
-                urls+=("$BASE/year=$Y/live.parquet")
-              fi
+              for NAME in $LIVE_NAMES; do
+                if probe "$Y" "$NAME"; then
+                  urls+=("$BASE/year=$Y/$NAME.parquet")
+                fi
+              done
             fi
           done
           if [ "${#urls[@]}" -eq 0 ]; then

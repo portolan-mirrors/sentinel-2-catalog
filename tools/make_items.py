@@ -40,10 +40,13 @@ from the same candidate list: 2015-2018 are one `items.parquet`; 2019-2020
 are four zone quartiles `z01-20.parquet` .. `z47-60.parquet`
 (s2_build.ZONE_PARTS); from 2021 eight zone octants `z01-15.parquet` ..
 `z53-60.parquet` (ZONE_PARTS_8), split by the UTM zone of `s2:mgrs_tile`.
-Any shape may add `live.parquet`. Every part present becomes its own asset,
-with its own row count, time range and size, so a client with a tile id can
-pick the one part its zone lives in and the year's totals are the sum of
-the parts.
+Any shape may add the live tail of the collection: one `live.parquet` for the
+first collection, and for Collection 1 one file per month,
+`live-01.parquet` .. `live-12.parquet` (s2_build.live_part_names), beside the
+`live.parquet` it published before that move. Every part present becomes its
+own asset, with its own row count, time range and size, so a client with a
+tile id can pick the one part its zone lives in and the year's totals are
+the sum of the parts.
 
 Collection item links are not written here. make_collection.py globs the item
 files it finds and links every one, so the two tools cannot disagree about
@@ -51,7 +54,7 @@ which items exist.
 
 --collection picks the collection (s2_collections; default the first one, so
 every existing call is unchanged). It decides the candidate parts (a
-collection that never zone-splits has two: items.parquet and live.parquet),
+collection that never zone-splits has items.parquet plus its live files),
 the published base the probes ask, the item's collection id and titles, and
 the default --out (catalog/<catalog_dir>/):
 
@@ -73,7 +76,9 @@ import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import s2_collections as cols  # noqa: E402
-from s2_build import ZONE_PARTS, ZONE_PARTS_8  # noqa: E402
+from s2_build import (  # noqa: E402
+    ZONE_PARTS, ZONE_PARTS_8, live_part_names,
+)
 from s2_collections import CollectionConfig  # noqa: E402
 from s2_schema import USER_AGENT  # noqa: E402
 
@@ -87,6 +92,13 @@ PUBLIC = cols.PUBLIC
 # file rather than a rejected client.
 UA = {"User-Agent": USER_AGENT}
 
+# The month names the monthly live titles use. Written out rather than taken
+# from `calendar.month_name`, which follows the runner's locale: an asset
+# title must read the same whoever generated the item.
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November",
+               "December")
+
 # Every part name a year can hold, in the order they are advertised:
 # (asset key, file name, title template, roles). `items.parquet` is the
 # consolidated archive of a year published before the zone split; the four
@@ -96,24 +108,41 @@ UA = {"User-Agent": USER_AGENT}
 # daily and folded back in monthly. A year holds one archive shape, never
 # two, and the archive and the tail do not overlap: a consolidation
 # rewrites the archive parts and resets live.parquet, so a year's row count
-# is the sum of its parts. Fourteen candidates, of which a year has at most
-# nine; a probe is one HEAD, so the misses cost nothing worth a table of
-# which year has which. A collection that never splits (Collection 1) has
-# just the first and the last: its archive is one items.parquet per year,
-# and its tail is folded back into that file by the periodic fold on
-# RAILS, not by the monthly consolidation; the live title says which.
+# is the sum of its parts. Fourteen candidates for the first collection, of
+# which a year has at most nine; a probe is one HEAD, so the misses cost
+# nothing worth a table of which year has which. A collection that never
+# splits (Collection 1) has one items.parquet per year, and its tail is
+# folded back into that file by the periodic fold on RAILS, not by the
+# monthly consolidation; the live titles say which. The live candidates are
+# s2_build.live_part_names(), the one list every workflow probes: Collection 1's tail is one file per
+# month (`live-01.parquet` .. `live-12.parquet`), so the daily refresh
+# rewrites only the months it touched, plus the single `live.parquet` it
+# published before that move, which stays in the bucket with zero rows --
+# the catalog never deletes a file, and a year's row count is still the sum
+# of its parts.
 def parts_for(config: CollectionConfig = DEFAULT_CONFIG,
               ) -> tuple[tuple[str, str, str, list[str]], ...]:
     zones = (*ZONE_PARTS, *ZONE_PARTS_8) if config.zone_split else ()
     merge = "consolidation" if config.zone_split else "fold"
+    lives = []
+    for stem in live_part_names(config):
+        if stem == "live":
+            title = ("Rolling tail from before the monthly live parts, "
+                     "emptied by the first refresh that wrote them"
+                     if config.monthly_live else
+                     f"Rolling tail since the last {merge}, refreshed daily")
+        else:
+            month = MONTH_NAMES[int(stem.split("-")[1]) - 1]
+            title = (f"{month} {{year}} tail, refreshed daily since the "
+                     f"last {merge}")
+        lives.append((stem, f"{stem}.parquet", title, ["data"]))
     return (
         ("data", "items.parquet", "{year} scenes, GeoParquet 2.0",
          ["data"]),
         *((f"data-{label}", f"{label}.parquet",
            f"{{year}} scenes, UTM zones {lo}\u2013{hi}", ["data"])
           for label, lo, hi in zones),
-        ("live", "live.parquet",
-         f"Rolling tail since the last {merge}, refreshed daily", ["data"]),
+        *lives,
     )
 
 
@@ -385,8 +414,14 @@ def build_item(con: duckdb.DuckDBPyConnection, year: int, parts: list[dict],
             "type": "application/vnd.apache.parquet",
             "title": part["title"].format(year=year),
             "roles": part["roles"],
-            "start_datetime": st["t0"],
-            "end_datetime": st["t1"],
+            # A part with no rows has no time range, and the pair is left
+            # out rather than written as null: null is not a string, and
+            # STAC 1.1.0 structural validation rejects the item for it
+            # (rashid PTL-STR-001, stac-check). An emptied live part is
+            # that case -- what a fold, a consolidation, or the day the
+            # year file already held every staged row leaves behind.
+            **({"start_datetime": st["t0"], "end_datetime": st["t1"]}
+               if st["t0"] and st["t1"] else {}),
             "table:row_count": st["rows"],
             **({"file:size": part["size"]} if part["size"] else {}),
         }

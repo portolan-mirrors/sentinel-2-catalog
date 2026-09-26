@@ -1,38 +1,46 @@
 #!/bin/bash
-# Fold each year's live.parquet into its items.parquet and empty live.
+# Fold each year's live parts into its items.parquet and empty them.
 #
 #     ssh rails 'cd ~/s2-catalog && sbatch tools/rails/fold_live.sbatch'
 #     ssh rails 'cd ~/s2-catalog && sbatch --export=ALL,YEARS=2022,2026 tools/rails/fold_live.sbatch'
 #
-# The daily refresh (refresh-daily.yml) appends to year=YYYY/live.parquet
-# at zstd 3 and never consolidates Collection 1; this job is the
-# consolidation, run by hand every month or two and at year end (see
-# tools/README.md, "Sync & backfill"). The refresh looks back on
-# `created`, and ESA is reprocessing old years, so a live part can sit
-# under any year, not only the current one. YEARS unset (the usual run)
-# folds every year from 2015 to now whose published live.parquet holds
-# rows: one HEAD per year (s2_build.published_part, retried) and a
-# footer read of each live found (s2_build.published_rows); a probe that
-# cannot answer stops the job before anything is folded. YEARS=Y1,Y2
-# names the years by hand. For each year:
+# The daily refresh (refresh-daily.yml) appends to one live file per
+# month of a year, year=YYYY/live-MM.parquet, at zstd 3, and never
+# consolidates Collection 1; this job is the consolidation, run by hand
+# every month or two and at year end (see tools/README.md, "Sync &
+# backfill"). The refresh looks back on `created`, and ESA is
+# reprocessing old years, so a live part can sit under any year, not only
+# the current one. The names a year's tail can have come from
+# s2_build.live_part_names(): the twelve monthly parts, plus the single
+# live.parquet the collection published before them, which stays in the
+# bucket at zero rows because the catalog never deletes.
 #
-#   1. HEAD the year's published live.parquet; skip the year when it is
-#      not published or holds no rows.
-#   2. Download live.parquet and, when published, items.parquet to
-#      $PUBLISH/fold/in/year=YYYY/ (on /u; /tmp is too small). A year with
-#      no published items.parquet is folded from live alone only when the
-#      backfill never fetched it (no $SLICES/YYYY-*.parquet): a year whose
-#      backfill is fetched but not uploaded stops the job.
-#   3. s2_build.py --collection sentinel-2-c1-l2a over both: dedupe by id
-#      keeping the highest s2:generation_time, sort (_tile, datetime),
-#      uniform 6,144-row groups, zstd 18, gpio check.
-#   4. Write a zero-row live.parquet with the same schema
-#      (s2_build.write_empty_part, what consolidate-month.yml publishes).
-#   5. Upload items.parquet, then the empty live.parquet (--force: a fold
-#      replaces both). The order matters: a reader that sees the new
-#      items and the old live sees some scenes twice, which dedupe on id
-#      removes; one that saw the empty live before the new items would
-#      see a hole.
+# YEARS unset (the usual run) folds every year from 2015 to now whose
+# published live parts hold rows between them: one HEAD per candidate
+# name per year (s2_build.published_part, retried) and a footer read of
+# each part found (s2_build.published_rows); a probe that cannot answer
+# stops the job before anything is folded. YEARS=Y1,Y2 names the years by
+# hand. For each year:
+#
+#   1. HEAD every live name of the year; skip the year when none is
+#      published with rows.
+#   2. Download each live part that holds rows and, when published,
+#      items.parquet to $PUBLISH/fold/in/year=YYYY/ (on /u; /tmp is too
+#      small). A year with no published items.parquet is folded from live
+#      alone only when the backfill never fetched it (no
+#      $SLICES/YYYY-*.parquet): a year whose backfill is fetched but not
+#      uploaded stops the job.
+#   3. s2_build.py --collection sentinel-2-c1-l2a over all of them: dedupe
+#      by id keeping the highest s2:generation_time, sort (_tile,
+#      datetime), uniform 6,144-row groups, zstd 18, gpio check.
+#   4. Write a zero-row replacement for each live part it folded, with the
+#      same schema (s2_build.write_empty_part, what consolidate-month.yml
+#      publishes).
+#   5. Upload items.parquet, then the emptied live parts (--force: a fold
+#      replaces all of them). The order matters: a reader that sees the new
+#      items and the old live parts sees some scenes twice, which dedupe on
+#      id removes; one that saw an empty live part before the new items
+#      would see a hole.
 #   6. Move the new items.parquet to $PUBLISH/sentinel-2-c1-l2a/year=YYYY/
 #      so the copy on /u matches the bucket (audit_year.sbatch reads it).
 #
@@ -43,9 +51,9 @@
 # detects the size mismatch and falls back to the footer), but regenerate
 # it the same day. Needs the source-coop AWS profile (README.md).
 #
-# Timing: the daily refresh rewrites live.parquet at 03:42 UTC. A fold
-# whose window (the download in step 2 to the upload in step 5) crosses
-# that moment puts the empty live over a live the refresh had just
+# Timing: the daily refresh rewrites the live parts it touched at 03:42
+# UTC. A fold whose window (the download in step 2 to the upload in step
+# 5) crosses that moment puts an empty part over one the refresh had just
 # rewritten, so that day's `created` slice drops out of live. The next
 # refresh's five-day lookback fetches those items again, so the loss
 # heals itself within a day; a fold that starts after 04:00 UTC and ends
@@ -75,30 +83,38 @@ if [ -z "${YEARS:-}" ]; then
     YEARS="$(date -u +%Y)"
     echo "dry-run: YEARS unset; taking the current year ($YEARS) instead of probing the bucket"
   else
-    # Every year with a published, non-empty live: the list this run
-    # folds. published_part stops on a HEAD that is not 200 or 404, and
-    # published_rows on a footer it cannot read, so an unanswered probe
-    # stops the job here, before any download.
-    YEARS="$(python3 - "$REPO" "$BASE" <<'EOF'
+    # Every year whose live parts hold rows between them: the list this
+    # run folds. The candidate names come from live_part_names(), so this
+    # cannot drift from the refresh that writes them. published_part stops
+    # on a HEAD that is not 200 or 404, and published_rows on a footer it
+    # cannot read, so an unanswered probe stops the job here, before any
+    # download.
+    YEARS="$(python3 - "$REPO" "$BASE" "$COLLECTION" <<'EOF'
 import sys
 from datetime import datetime, timezone
 import duckdb
-repo, base = sys.argv[1], sys.argv[2]
+repo, base, collection = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, f"{repo}/tools")
-from s2_build import published_part, published_rows
+import s2_collections as cols
+from s2_build import live_part_names, published_part, published_rows
+config = cols.get(collection)
 con = duckdb.connect()
 years = []
 for y in range(2015, datetime.now(timezone.utc).year + 1):
-    if not published_part(base, y, "live.parquet"):
-        continue
-    n = published_rows(con, f"{base}/year={y}/live.parquet")
-    print(f"year={y}: live.parquet holds {n:,} row(s)", file=sys.stderr)
-    if n:
+    rows = 0
+    for stem in live_part_names(config):
+        name = f"{stem}.parquet"
+        if not published_part(base, y, name):
+            continue
+        n = published_rows(con, f"{base}/year={y}/{name}")
+        print(f"year={y}: {name} holds {n:,} row(s)", file=sys.stderr)
+        rows += n
+    if rows:
         years.append(str(y))
 print(",".join(years))
 EOF
 )"
-    [ -n "$YEARS" ] || { echo "no year has a published live.parquet with rows; nothing to fold"; exit 0; }
+    [ -n "$YEARS" ] || { echo "no year has a published live part with rows; nothing to fold"; exit 0; }
     echo "YEARS unset; folding every year with rows in live: $YEARS"
   fi
 fi
@@ -121,17 +137,39 @@ rows_in() {
   python3 -c "import duckdb,sys; print(duckdb.connect().execute('SELECT num_rows FROM parquet_file_metadata(?)', [sys.argv[1]]).fetchone()[0])" "$1"
 }
 
+# Every live name a year can hold, from the builder: live.parquet plus the
+# twelve live-MM.parquet of the monthly tail. A hand-typed list here would
+# drift from the refresh that writes them.
+LIVE_NAMES="$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1] + "/tools")
+import s2_collections as cols
+from s2_build import live_part_names
+print(" ".join(f"{stem}.parquet"
+                for stem in live_part_names(cols.get(sys.argv[2]))))' \
+  "$REPO" "$COLLECTION")"
+echo "live part name(s) probed per year: $LIVE_NAMES"
+
 FOLDED=()
 for Y in ${YEARS//,/ }; do
-  LIVE_URL="$BASE/year=$Y/live.parquet"; ITEMS_URL="$BASE/year=$Y/items.parquet"
-  if ! published "$LIVE_URL"; then echo "year=$Y: no live.parquet published; nothing to fold"; continue; fi
-  run mkdir -p "$IN/year=$Y" "$OUT"
-  run curl -fSL --retry 5 --retry-all-errors -o "$IN/year=$Y/live.parquet" "$LIVE_URL"
-  if [ "$DRY_RUN" != 1 ]; then
-    N=$(rows_in "$IN/year=$Y/live.parquet")
-    if [ "$N" -eq 0 ]; then echo "year=$Y: live.parquet has no rows; nothing to fold"; rm -f "$IN/year=$Y/live.parquet"; continue; fi
-    echo "year=$Y: live.parquet holds $N row(s)"
-  fi
+  ITEMS_URL="$BASE/year=$Y/items.parquet"
+  # The live parts of this year that hold rows: each one downloaded, each
+  # one emptied and re-uploaded at the end. A part that is not published,
+  # or holds no rows (a month already folded), is left alone.
+  PARTS=()
+  for NAME in $LIVE_NAMES; do
+    if ! published "$BASE/year=$Y/$NAME"; then continue; fi
+    run mkdir -p "$IN/year=$Y" "$OUT"
+    run curl -fSL --retry 5 --retry-all-errors -o "$IN/year=$Y/$NAME" "$BASE/year=$Y/$NAME"
+    if [ "$DRY_RUN" != 1 ]; then
+      N=$(rows_in "$IN/year=$Y/$NAME")
+      if [ "$N" -eq 0 ]; then echo "year=$Y: $NAME has no rows; nothing to fold from it"; rm -f "$IN/year=$Y/$NAME"; continue; fi
+      echo "year=$Y: $NAME holds $N row(s)"
+    fi
+    PARTS+=("$NAME")
+  done
+  if [ "${#PARTS[@]}" -eq 0 ]; then echo "year=$Y: no live part with rows; nothing to fold"; continue; fi
+  echo "year=$Y: folding ${PARTS[*]}"
   if published "$ITEMS_URL"; then
     run curl -fSL --retry 5 --retry-all-errors -o "$IN/year=$Y/items.parquet" "$ITEMS_URL"
   elif compgen -G "$SLICES/$Y-*.parquet" > /dev/null; then
@@ -147,21 +185,25 @@ for Y in ${YEARS//,/ }; do
   run rm -f "$OUT/year=$Y/items.parquet"
   run python3 "$REPO/tools/s2_build.py" --collection "$COLLECTION" \
     --sources "$IN/year=$Y" --years "$Y" --out "$OUT" --memory "$MEMORY"
-  # The empty live: the schema of the part just written, zero rows.
-  run python3 - "$REPO" "$OUT/year=$Y" "$Y" <<'EOF'
+  # The empty live parts, one per part folded: the schema of the year file
+  # just written, zero rows.
+  run python3 - "$REPO" "$OUT/year=$Y" "$Y" "${PARTS[@]}" <<'EOF'
 import sys
 from pathlib import Path
 repo, year_dir, year = sys.argv[1], Path(sys.argv[2]), int(sys.argv[3])
 sys.path.insert(0, f"{repo}/tools")
 from s2_build import connect, write_empty_part
 con = connect("2GB", year_dir)
-write_empty_part(con, year_dir / "items.parquet", year_dir / "live.parquet", year)
+for name in sys.argv[4:]:
+    write_empty_part(con, year_dir / "items.parquet", year_dir / name, year)
 EOF
-  # Parts before live, each verified by size after the put.
+  # The year file before the live parts, each verified by size after the put.
   run python3 "$REPO/tools/rails/upload.py" --data-dir "$FOLD/out" --key-prefix "$KEY_PREFIX" \
     --force "$COLLECTION/year=$Y/items.parquet"
-  run python3 "$REPO/tools/rails/upload.py" --data-dir "$FOLD/out" --key-prefix "$KEY_PREFIX" \
-    --force "$COLLECTION/year=$Y/live.parquet"
+  for NAME in "${PARTS[@]}"; do
+    run python3 "$REPO/tools/rails/upload.py" --data-dir "$FOLD/out" --key-prefix "$KEY_PREFIX" \
+      --force "$COLLECTION/year=$Y/$NAME"
+  done
   run mkdir -p "$PUBLISH/$COLLECTION/year=$Y"
   run mv -f "$OUT/year=$Y/items.parquet" "$PUBLISH/$COLLECTION/year=$Y/items.parquet"
   run rm -rf "$IN/year=$Y" "$OUT/year=$Y"

@@ -62,7 +62,7 @@ from make_items import (  # noqa: E402
 from publish import load_config  # noqa: E402
 from s2_build import (  # noqa: E402
     ROW_GROUP, TILE_SORT_FROM, ZONE_PARTS, ZONE_PARTS_8, ZONE_SPLIT_8_FROM,
-    ZONE_SPLIT_FROM, sort_key,
+    ZONE_SPLIT_FROM, live_part_names, sort_key,
 )
 from s2_collections import CollectionConfig  # noqa: E402
 
@@ -147,7 +147,8 @@ def zone_parts_text() -> str:
 def year_file_text(config: CollectionConfig) -> str:
     """The layout of a collection that never zone-splits, in prose, from
     the config that defines it: one items.parquet per year, the row-group
-    rule of its mode at its target, and the tail."""
+    rule of its mode at its target, and the tail -- one live.parquet, or one
+    live file per month where config.monthly_live says so."""
     target = config.row_group_size or ROW_GROUP
     if config.row_group_mode == "month_aligned":
         groups = (f"whose row groups are cut on month boundaries at "
@@ -157,9 +158,20 @@ def year_file_text(config: CollectionConfig) -> str:
         groups = (f"in uniform row groups of about {target:,} rows, so a "
                   f"tile's run is a small number of groups and a tile lookup "
                   f"reads only those")
-    return (f"Every year is one items.parquet, {groups}. Any year may add "
-            f"live.parquet, the tail fetched daily since the last fold, "
-            f"which the periodic fold merges back into the year file. There "
+    if config.monthly_live:
+        names = live_part_names(config)
+        tail = (f"Any year may add one live file per month of it, "
+                f"{names[1]}.parquet to {names[-1]}.parquet, the tail "
+                f"fetched daily since the last fold, which the periodic fold "
+                f"merges back into the year file: a day of refresh rewrites "
+                f"only the months it fetched. A year refreshed before those "
+                f"parts existed may also carry an empty live.parquet, which "
+                f"held the whole tail as one file.")
+    else:
+        tail = ("Any year may add live.parquet, the tail fetched daily since "
+                "the last fold, which the periodic fold merges back into the "
+                "year file.")
+    return (f"Every year is one items.parquet, {groups}. {tail} There "
             f"is no zone= directory and no zone split: every part sits in "
             f"year=YYYY/ and matches partition:glob.")
 
@@ -361,7 +373,8 @@ def description(config: CollectionConfig, rows: int, span: str) -> str:
         f"ESA's reprocessing is still running, so old years keep gaining "
         f"scenes with recent `created` timestamps; the daily refresh looks "
         f"back on `created`, not `datetime`, and appends what it finds to "
-        f"the year's live.parquet. Contains modified Copernicus Sentinel "
+        f"the live part of the month each scene was acquired in. Contains "
+        f"modified Copernicus Sentinel "
         f"data. Read the [agent guide](AGENTS.md) before querying: "
         f"`s2:dark_features_percentage` is NULL from processing baseline "
         f"05.11, `processing:software` and `assets` are JSON strings, not "
