@@ -6,9 +6,10 @@ the same rows, on both collections, with the committed client and the candidate.
 
 This is the gate for a change to apps/explorer/search.js. measure_search.py
 drives `sceneSearch` directly; this loads `apps/explorer/index.html` itself in
-chrome-headless-shell, lets it build its map, its stats and its month picker,
-and then fires the same map click a user's mouse fires, so the whole page --
-partUrls, the HEAD probes, warmPart, runQuery, the result cards -- runs.
+chrome-headless-shell, lets it build its map, its stats and its year select,
+and then fires the same map click a user's mouse fires -- the click is the
+search -- so the whole page -- partUrls, the HEAD probes, warmPart,
+startSearch, the result cards -- runs.
 
 Two served variants of the app, from the same repository files:
 
@@ -106,7 +107,7 @@ else {
       throw new Error(`timed out waiting for ${what}`);
     };
     // The page is ready enough when its map exists; the window comes from
-    // this driver, not from the month picker, so the case is deterministic.
+    // this driver, not from the year select, so the case is deterministic.
     await until("the map", () => w.__map);
     // Wait for the hit index itself, not for a click to happen to land. The
     // app translates a click into an MGRS tile through `hitIndex`, which fills
@@ -127,13 +128,11 @@ else {
       $(id).value = v;
       $(id).dispatchEvent(new w.Event("input", { bubbles: true }));
     }
-    // The app ignores a click that names no tile, so fire until it takes —
-    // and the signal that it took is the hint the click handler writes
-    // ("Tile 31UFT."), NOT the run button. runQuery disables that button in
-    // its own first synchronous statement and only re-enables it when the
-    // search is over, so waiting on it means firing another click every
-    // 250 ms through the whole search, and a dozen overlapping searches is
-    // not what this is measuring.
+    // A tile click IS the search: there is no run button to poll. The app
+    // ignores a click that names no tile, so fire until it takes, and the
+    // signal that it took is the hint the click handler writes ("Tile
+    // 31UFT."). Once the hint names a tile the fire loop below stops, and
+    // the driver waits next on the plan text landing in #sql.
     const tileHint = () => $("query").querySelector(".hint")?.textContent || "";
     let fired = 0;
     await until("a tile under the click", () => {
@@ -145,8 +144,8 @@ else {
       return false;
     }, 120000);
     say(`  clicked after ${fired} attempt(s): ${tileHint().trim()}`);
-    // runQuery writes the plan into #sql when it is done, and the cards into
-    // #results; a search that found nothing writes a .hint instead.
+    // The search writes the plan into #sql when it is done, and the cards
+    // into #results; a search that found nothing writes a .hint instead.
     try {
       await until("the search to finish", () =>
         ($("sql").textContent || "").includes("range-read plan")

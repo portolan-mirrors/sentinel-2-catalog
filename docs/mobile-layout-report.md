@@ -81,6 +81,10 @@ Two smaller edits follow from that:
 every call above is a no-op and `data-snap` is never written. That is what
 keeps the desktop hero scroll in `runQuery()` working.
 
+[`runQuery()` no longer exists: the year redesign replaced it with
+`startSearch()`, and a tile click is the whole search. The scroll and
+`setSnap` behavior described above still applies to that function.]
+
 ## Verification
 
 Headless Chrome (Playwright's `chrome-headless-shell`, ANGLE + SwiftShader,
