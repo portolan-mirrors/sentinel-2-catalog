@@ -17,6 +17,11 @@
 // the geotransform it is one more overview level, warped whole into a single
 // image over the scene's bounds before any tile has been read.
 //
+// A mid-resolution rung uses the same warp again (Task 25): one whole TCI
+// overview level, near 1372 px, is a sharper preview than the thumbnail over
+// the identical bounds — the scrub bar upgrades to it while the user flips,
+// and a commit still loads the full tiles.
+//
 // Any other band goes the same way (Task 28): every band is its own COG in
 // the scene directory (B02.tif, B08.tif, SCL.tif, ...), on its own 10, 20
 // or 60 m grid. A composite reads one window per distinct band, warps each
@@ -231,10 +236,12 @@ function jpegNodataMask(data, w, h, white) {
 // thumbnail's nodata colour (see jpegNodataMask).
 // The preview's pixel size: PREVIEW on the long side by the scene's
 // on-screen shape (longitude shrinks by cos(lat)).
-function previewSize([west, south, east, north]) {
+// `long` is the long side asked for — PREVIEW for a thumbnail warp, the
+// overview level's own width for the mid-resolution rung below.
+function previewSize([west, south, east, north], long = PREVIEW) {
   const aspect = ((east - west) * Math.cos(((south + north) / 2) * Math.PI / 180)) / (north - south);
-  return [Math.round(aspect >= 1 ? PREVIEW : PREVIEW * aspect),
-    Math.round(aspect >= 1 ? PREVIEW / aspect : PREVIEW)];
+  return [Math.round(aspect >= 1 ? long : long * aspect),
+    Math.round(aspect >= 1 ? long / aspect : long)];
 }
 export function previewImage(cog, bitmap, { white = false } = {}) {
   const [west, south, east, north] = cog.bounds;
@@ -252,6 +259,46 @@ export function previewImage(cog, bitmap, { white = false } = {}) {
   const grid = controlGrid(cog, { west, south, east, north }, W, H);
   return warp(grid, { data, w: bitmap.width, h: bitmap.height, bands: 4,
     scale: cog.w / bitmap.width, x0: 0, y0: 0, nodata: (k) => mask[k >> 2] === 1 }, W, H);
+}
+
+// The rung between the thumbnail preview and the full tiles (Task 25). The
+// TCI's own overview pyramid is the ladder: each level is independently
+// range-readable, so one of them read WHOLE — the same read sceneOverview
+// makes per band, and the same warp previewImage ends with — is a sharper
+// preview over the very same bounds, placed by the same control grid. The
+// only difference from previewImage is the source: these are the COG's own
+// pixels, so nodata is the TCI's black (cogNodata) and not a JPEG's smeared
+// flat colour, and no shape check is needed because the level IS the image.
+//
+// The level: the smallest whose long side reaches `targetPx`, or the largest
+// there is when none does. Budget — a 10,980 px TCI's pyramid is 5490 / 2745
+// / 1372 / 686 / 343, so the default 1200 lands on the 1372 level: a few
+// hundred KB of range reads (the headers are already in the block cache from
+// the scrub preload's openCog) for a 1372 x 1372 RGBA result of ~7.5 MB.
+// Asking for more than a rung's worth steps to the next level up and
+// multiplies both numbers by four (1372 -> 2745), so a caller that raises
+// targetPx must re-budget its own resident cap (app.js's SCRUB_HD_MAX).
+const HD_TARGET = 1200;
+function overviewAtLeast(cog, targetPx) {
+  let best = null, largest = null;
+  for (const l of cog.levels) {
+    const long = Math.max(l.w, l.h);
+    if (long >= targetPx && (!best || long < Math.max(best.w, best.h))) best = l;
+    if (!largest || long > Math.max(largest.w, largest.h)) largest = l;
+  }
+  return best ?? largest;
+}
+export async function tciOverviewImage(cog, targetPx = HD_TARGET, signal) {
+  const lvl = overviewAtLeast(cog, targetPx);
+  if (!lvl) return null;
+  const [west, south, east, north] = cog.bounds;
+  // The output long side is the level's own, so the warp neither upsamples
+  // the level nor throws away pixels it just paid for.
+  const [W, H] = previewSize(cog.bounds, Math.max(lvl.w, lvl.h));
+  const raster = await lvl.image.readRasters({ interleave: true, signal });
+  const grid = controlGrid(cog, { west, south, east, north }, W, H);
+  return warp(grid, { data: raster, w: raster.width, h: raster.height,
+    bands: cog.bands, scale: lvl.scale, x0: 0, y0: 0, nodata: cogNodata(raster) }, W, H);
 }
 
 // The deck.gl layer for an opened COG: one TileLayer, clipped to the scene's

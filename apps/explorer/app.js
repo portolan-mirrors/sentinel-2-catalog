@@ -40,7 +40,7 @@ import { PMTiles, Protocol } from "https://esm.sh/pmtiles@3.2.0";
 import { parse } from "https://esm.sh/@loaders.gl/core@4.5.1";
 import { MVTLoader } from "https://esm.sh/@loaders.gl/mvt@4.5.1";
 import { cogTileLayer, previewImage, previewLayer, openScene, sceneCog, loadOverviews,
-  sceneIndexStats, bandPreviewImage, bandTileLayer } from "./cog.js";
+  sceneIndexStats, bandPreviewImage, bandTileLayer, tciOverviewImage } from "./cog.js";
 import { BANDS, MASK_BANDS, bandInfo, bandTitle, fixedRange, INDICES, SCL_CLASSES, PRESETS,
   bandsOf, HIST_BINS } from "./bands.js";
 import { dayRange, valueRange } from "./rangeslider.js";
@@ -2193,12 +2193,21 @@ function thumbBitmapFor(row) {
 // full footprint square, and nodata is masked the same way. The map below
 // caches the warp per scene id, so the cost — one ~64 KiB TCI header read —
 // falls once per scene the user pauses on, not once per drag frame.
+// An entry is {img, cog, thumb, hd}: `img` is what goes on the map and `hd`
+// says which rung it is on. The thumbnail warp is kept as `thumb` even after
+// the upgrade below replaces `img`, so a downgrade costs nothing — it is the
+// same object the entry was born with, not a second copy.
 const scrubPreviews = new Map();
 // Settled builds only — a cache entry can be a promise still in flight, and
 // that is not "ready" for the track coloring below. Ids are stable, so this
 // is never cleared on its own; it loses an id only when scrubPreviews evicts
 // that same id (the cap below), keeping the two maps' membership aligned.
 const scrubReady = new Set();
+// The subset whose `img` is the mid-resolution overview (Task 25). A member
+// is always a scrubReady member too: nothing is upgraded before its
+// thumbnail warp exists. Insertion-ordered, which is what the HD cap below
+// evicts by.
+const scrubReadyHd = new Set();
 const SCRUB_PREVIEWS_MAX = 120;
 function scrubPreviewFor(row) {
   const id = String(row.id);
@@ -2212,7 +2221,7 @@ function scrubPreviewFor(row) {
         const white = /\/thumbnail\.jpg$/i.test(new URL(row.thumbnail_url).pathname);
         const img = previewImage(cog, bitmap, { white });
         if (img) scrubReady.add(id);
-        return img ? { img, cog } : null;
+        return img ? { img, cog, thumb: img, hd: false } : null;
       } catch {
         // A missing/odd thumbnail_url (sceneDirOf) or a failed header read
         // (sceneCog) resolves to null rather than rejecting, so an awaiter
@@ -2225,6 +2234,7 @@ function scrubPreviewFor(row) {
       const evicted = scrubPreviews.keys().next().value;
       scrubPreviews.delete(evicted);
       scrubReady.delete(evicted);
+      scrubReadyHd.delete(evicted);
     }
   }
   return scrubPreviews.get(id);
@@ -2261,12 +2271,22 @@ function paintScrubTrack() {
     const view = currentView();
     if (!view.length) { scrub.style.setProperty("--scrub-fill", "none"); return; }
     const len = view.length;
-    const loaded = view.map((r) => scrubReady.has(String(r.id)));
+    // Three states per index, not two (Task 25): 0 nothing yet, 1 the
+    // thumbnail warp is ready, 2 the mid-resolution overview is. The HD set
+    // is checked first because it is a subset of scrubReady. Runs merge on
+    // equal state exactly as they did on equal loadedness, so the span
+    // formula and the shared hard stops are untouched — only the number of
+    // distinct colours a run can take changed.
+    const state = view.map((r) => {
+      const id = String(r.id);
+      return scrubReadyHd.has(id) ? 2 : scrubReady.has(id) ? 1 : 0;
+    });
+    const tone = ["transparent", "var(--scrub-loaded)", "var(--scrub-hd)"];
     const stops = [];
     for (let start = 0; start < len;) {
       let end = start;
-      while (end + 1 < len && loaded[end + 1] === loaded[start]) end++;
-      const color = loaded[start] ? "var(--scrub-loaded)" : "transparent";
+      while (end + 1 < len && state[end + 1] === state[start]) end++;
+      const color = tone[state[start]];
       const from = (start / len) * 100;
       const to = ((end + 1) / len) * 100;
       stops.push(`${color} ${from}%`, `${color} ${to}%`);
@@ -2306,6 +2326,100 @@ async function prefetchScrubStack() {
       paintScrubTrack();
     }
   }));
+  if (seq !== prefetchSeq) return;
+  await upgradeScrubStack(order, seq);
+}
+
+// The second rung (Task 25). The whole thumbnail pass lands first and this
+// runs after it, one scene at a time: flipping fast over every position in
+// the view is the thing the scrub bar is for, and a 1372-px overview read is
+// several hundred KB against a thumbnail's dozens, so letting the two passes
+// share the browser's six connections would trade the fast flip for the
+// sharp one. Sequential, outward from the same position, under the same
+// prefetchSeq — a new search or view-key change abandons this queue within
+// one await exactly as it does the thumbnail pass.
+//
+// The cap is on resident HD images, not on reads: `order` is outward from the
+// shown position, so the first SCRUB_HD_MAX rows of it are the nearest ones,
+// and capScrubHd below prunes what earlier queues (a different position, a
+// different filter) left behind. A ~1372 x 1372 RGBA image is ~7.5 MB, so 20
+// of them is ~150 MB worst case — the same order as the COG plane cache's
+// ~100 MB, and on top of the thumbnail warps the 120-entry cache already
+// holds (~4 MB each at 1024 px, and a downgrade hands one of those back).
+const SCRUB_HD_MAX = 20;
+// The entry whose `img` the current scrubLayer was built from, or null. Only
+// ever read together with `scrubLayer`, which every clear path nulls — so a
+// stale value here cannot make the upgrade below put a layer back on a map
+// that has moved on.
+let scrubShown = null;
+async function upgradeScrubStack(order, seq) {
+  for (let n = 0; n < order.length && n < SCRUB_HD_MAX; n++) {
+    if (seq !== prefetchSeq) return;
+    await upgradeScrubPreview(order[n], seq);
+  }
+}
+
+async function upgradeScrubPreview(row, seq) {
+  const id = String(row.id);
+  if (scrubReadyHd.has(id)) return;
+  const p = scrubPreviewFor(row);
+  const entry = await p.catch(() => null);
+  if (seq !== prefetchSeq || !entry || entry.hd) return;
+  let img = null;
+  try {
+    img = await tciOverviewImage(entry.cog);
+  } catch {
+    // A range read that fails leaves the thumbnail rung in place: the track
+    // keeps the subdued tone for this position and nothing retries it.
+    return;
+  }
+  if (seq !== prefetchSeq || !img) return;
+  // The entry may have been evicted (and perhaps rebuilt) under the read:
+  // only the live promise's own entry may be swapped, or the HD set would
+  // claim an id whose cache entry no longer exists.
+  if (scrubPreviews.get(id) !== p) return;
+  entry.img = img;
+  entry.hd = true;
+  scrubReadyHd.add(id);
+  capScrubHd();
+  paintScrubTrack();
+  // If this scene's thumbnail warp is what the map is showing right now — a
+  // drag preview, or the bridge a commit left up — rebuild the layer under
+  // the same id so deck.gl swaps the bitmap in place instead of adding a
+  // second layer. The two conditions are read here, after every await, not
+  // remembered from before one: scrubLayer is null whenever a hand-off or a
+  // gesture end has taken the preview off, and scrubShown has already moved
+  // on if the drag went to another scene. A previewIndex still in flight for
+  // another row lands after this and overwrites both, which is correct.
+  if (scrubLayer && scrubShown === entry) {
+    scrubLayer = previewLayer(img, entry.cog, scrubLayer.id);
+    render();
+  }
+}
+
+// Downgrade-evict the oldest HD images over the cap: back to the thumbnail
+// warp the entry kept, or — if the entry is gone from the cache entirely —
+// just out of the set. A deck.gl layer already built from an evicted HD
+// image holds its own reference, so a downgrade never blanks or coarsens
+// what is on the map; it only stops the cache from handing that image out
+// again.
+function capScrubHd() {
+  while (scrubReadyHd.size > SCRUB_HD_MAX) {
+    const oldest = scrubReadyHd.values().next().value;
+    scrubReadyHd.delete(oldest);
+    const p = scrubPreviews.get(oldest);
+    if (!p) continue;
+    // The cache holds promises, and this one settled long before its id could
+    // enter scrubReadyHd — so the entry arrives on the very next microtask,
+    // not after any I/O. The set membership is re-read there all the same: a
+    // fresh upgrade of this same id in between must win over the downgrade.
+    p.then((entry) => {
+      if (!entry || !entry.hd || scrubReadyHd.has(oldest)) return;
+      entry.img = entry.thumb;
+      entry.hd = false;
+      paintScrubTrack();
+    }).catch(() => null);
+  }
 }
 
 let scrubSeq = 0;
@@ -2324,7 +2438,11 @@ async function previewIndex(i) {
   // whatever the scrub layer already shows — never a raw, unwarped bitmap;
   // that mismatch is the jitter this warp exists to remove.
   if (p) {
+    // p.img is whichever rung this entry has reached — the thumbnail warp, or
+    // the mid-resolution overview if the upgrade queue has already got here.
+    // No second lookup: the upgrade replaced the entry's own img in place.
     scrubLayer = previewLayer(p.img, p.cog, "scrub-preview");
+    scrubShown = p;
     scrubReady.add(String(row.id));
   }
   render();
@@ -2879,6 +2997,7 @@ async function startSearch(tile, year, { flyFirst = true } = {}) {
   cardNodes = new Map();
   scrubPreviews.clear();
   scrubReady.clear();
+  scrubReadyHd.clear();
   paintScrubTrack();
   S.search = { tile, year, rows: got.rows, at: Date.now() };
   S.shown = 15;

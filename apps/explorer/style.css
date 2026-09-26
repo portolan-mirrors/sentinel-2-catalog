@@ -5,9 +5,13 @@
   --dim: #93a2c0;
   --line: #24304d;
   --accent: #6ea8ff;
-  /* The scrub track's "loaded" fill (Task 23): a subdued accent so the
-     ready/not-ready read comes from coverage, not from a bright new hue. */
+  /* The scrub track's two loaded tones: one hue, two strengths, so the read
+     is still coverage and not a new colour. --scrub-loaded (Task 23) is the
+     subdued mix for a position whose thumbnail warp is ready; --scrub-hd
+     (Task 25) is the full accent, for one that has the mid-resolution
+     overview behind it and will flip sharp. */
   --scrub-loaded: color-mix(in srgb, var(--accent) 45%, transparent);
+  --scrub-hd: var(--accent);
   /* A .dayrange thumb's rendered box, both engines. A thumb's CENTER travels
      between half this width and (track width − half this width), never the
      track's own edges, so anything drawn to line up with a handle — the
